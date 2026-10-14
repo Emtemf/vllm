@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
+
 from typing import TYPE_CHECKING
 
 import torch
@@ -16,6 +18,7 @@ from vllm.forward_context import (
     is_forward_context_available,
     set_forward_context,
 )
+from vllm.logger import init_logger
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     KVConnectorOutput,
@@ -24,6 +27,8 @@ from vllm.v1.outputs import (
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
+
+logger = init_logger(__name__)
 
 
 class KVConnector:
@@ -68,11 +73,15 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
         # TODO: sort out KV Connectors' use of forward_context
+        t0 = time.perf_counter()
         if is_forward_context_available():
             self.kv_connector.start_load_kv(get_forward_context())
         else:
             with set_forward_context(None, self.vllm_config):
                 self.kv_connector.start_load_kv(get_forward_context())
+        # TTFT breakdown: load timing; forward window opens here.
+        self._ttft_load_kv_time = time.perf_counter() - t0
+        self._ttft_forward_start = time.perf_counter()
 
     def post_forward(
         self, finished_req_ids: set[str], wait_for_save: bool = True
@@ -81,8 +90,20 @@ class ActiveKVConnector(KVConnector):
             return None
 
         output = KVConnectorOutput()
+        # TTFT breakdown: worker-side KV connector timings. The v2 model
+        # runner splits the KV lifecycle across pre_forward/post_forward
+        # instead of the v1 context manager, so measure here. forward spans
+        # pre_forward end to post_forward start (model forward + drafting).
+        output.worker_load_kv_time = getattr(self, "_ttft_load_kv_time", 0.0)
+        output.worker_forward_time = (
+            time.perf_counter() - self._ttft_forward_start
+            if getattr(self, "_ttft_forward_start", None) is not None
+            else 0.0
+        )
+        t5 = time.perf_counter()
         if wait_for_save:
             self.kv_connector.wait_for_save()
+        output.worker_save_kv_time = time.perf_counter() - t5
         output.finished_sending, output.finished_recving = (
             self.kv_connector.get_finished(finished_req_ids)
         )
@@ -93,6 +114,14 @@ class ActiveKVConnector(KVConnector):
             self.kv_connector.build_connector_worker_meta()
         )
         self.kv_connector.clear_connector_metadata()
+        logger.info(
+            "[TTFT_DEBUG][Worker] load=%.6f forward=%.6f save=%.6f "
+            "(v2_model_runner, wait_for_save=%s)",
+            output.worker_load_kv_time,
+            output.worker_forward_time,
+            output.worker_save_kv_time,
+            wait_for_save,
+        )
         return output
 
     def no_forward(self, scheduler_output: "SchedulerOutput") -> ModelRunnerOutput:

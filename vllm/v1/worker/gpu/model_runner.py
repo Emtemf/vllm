@@ -1596,6 +1596,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Post-step KV connector related operations.
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
         model_runner_output.kv_connector_output = kv_connector_output
+        # TTFT breakdown: copy timing to top-level fields so they survive
+        # Worker→EngineCore serialization.
+        if kv_connector_output is not None:
+            model_runner_output.worker_load_kv_time = kv_connector_output.worker_load_kv_time
+            model_runner_output.worker_forward_time = kv_connector_output.worker_forward_time
+            model_runner_output.worker_save_kv_time = kv_connector_output.worker_save_kv_time
 
         return async_output
 
@@ -1632,6 +1638,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_id_to_index={req_id: i for i, req_id in enumerate(input_batch.req_ids)},
             kv_connector_output=kv_connector_output,
         )
+        # TTFT breakdown: copy timing to top-level fields so they survive
+        # Worker→EngineCore serialization.
+        if kv_connector_output is not None:
+            model_runner_output.worker_load_kv_time = kv_connector_output.worker_load_kv_time
+            model_runner_output.worker_forward_time = kv_connector_output.worker_forward_time
+            model_runner_output.worker_save_kv_time = kv_connector_output.worker_save_kv_time
+
         async_output = AsyncPoolingOutput(
             model_runner_output=model_runner_output,
             pooler_output=pooler_output,
