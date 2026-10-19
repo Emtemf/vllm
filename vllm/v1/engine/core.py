@@ -645,7 +645,7 @@ class EngineCore:
         logger.info(
             "[TTFT_DEBUG][EngineCore] load=%.6f forward=%.6f save=%.6f "
             "sched_hash=%.6f sched_ext=%.6f sched_alloc=%.6f sched_overhead=%.6f "
-            "num_new=%d num_total=%d update=%.6f",
+            "num_new=%d num_total=%d num_tokens=%d update=%.6f",
             _worker_load, _worker_forward, _worker_save,
             scheduler_output.schedule_hash_time,
             scheduler_output.schedule_external_lookup_time,
@@ -653,6 +653,7 @@ class EngineCore:
             scheduler_output.schedule_overhead_time,
             scheduler_output.num_scheduled_new_reqs,
             scheduler_output.num_total_scheduled_reqs,
+            scheduler_output.total_num_scheduled_tokens,
             _update_per_req,
         )
 
