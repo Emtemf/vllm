@@ -223,6 +223,9 @@ class EngineCoreOutput(
     save_kv_time: float = 0.0
     # EngineCore update_from_output time (per-step, divided by num_total_scheduled_reqs).
     update_time: float = 0.0
+    # TTFT breakdown: chunked-prefill diagnostics.
+    ttft_num_scheduled_tokens: int = 0
+    ttft_num_steps: int = 0
 
     @property
     def finished(self) -> bool:

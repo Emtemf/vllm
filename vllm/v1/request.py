@@ -208,6 +208,9 @@ class Request:
         self.ttft_load_kv_time = 0.0
         self.ttft_forward_time = 0.0
         self.ttft_save_kv_time = 0.0
+        # TTFT breakdown: chunked-prefill diagnostics (final-chunk snapshot).
+        self.ttft_num_scheduled_tokens = 0
+        self.ttft_num_steps = 0
 
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0

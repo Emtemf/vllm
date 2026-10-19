@@ -1820,6 +1820,8 @@ class Scheduler(SchedulerInterface):
                 request.ttft_load_kv_time += _step_load
                 request.ttft_forward_time += _step_forward
                 request.ttft_save_kv_time += _step_save
+                request.ttft_num_scheduled_tokens += num_tokens_scheduled
+                request.ttft_num_steps += 1
 
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = (
@@ -2008,6 +2010,8 @@ class Scheduler(SchedulerInterface):
                         load_kv_time=request.ttft_load_kv_time,
                         forward_time=request.ttft_forward_time,
                         save_kv_time=request.ttft_save_kv_time,
+                        ttft_num_scheduled_tokens=request.ttft_num_scheduled_tokens,
+                        ttft_num_steps=request.ttft_num_steps,
                     )
                 )
             else:

@@ -437,7 +437,7 @@ class IterationStats:
                 "[TTFT][BREAKDOWN] req=%s ttft=%.6f "
                 "hash=%.6f ext_lookup=%.6f alloc=%.6f overhead=%.6f "
                 "load_kv=%.6f forward=%.6f save_kv=%.6f update=%.6f "
-                "residual=%.6f",
+                "residual=%.6f tokens=%d steps=%d",
                 output.request_id,
                 first_token_latency,
                 output.hash_and_local_cache_time,
@@ -449,6 +449,8 @@ class IterationStats:
                 output.save_kv_time,
                 output.update_time,
                 first_token_latency - breakdown_sum,
+                output.ttft_num_scheduled_tokens,
+                output.ttft_num_steps,
             )
         else:
             itl = engine_core_timestamp - req_stats.last_token_ts
