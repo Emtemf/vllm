@@ -755,12 +755,6 @@ def _check_enough_kv_cache_memory(
     estimate_max_model_len: Callable[[int], int],
 ):
     if available_memory <= 0:
-        logger.error(
-            "[KV_MEMORY] 容量检查失败 max_model_len=%d 可用KV预算=%sGiB "
-            "（预算非正；查看同次启动各rank的显存分账）",
-            max_model_len,
-            format_gib(available_memory),
-        )
         raise ValueError(
             "No available memory for the cache blocks. "
             "Try increasing `gpu_memory_utilization` when initializing the engine "
@@ -780,16 +774,6 @@ def _check_enough_kv_cache_memory(
                 "Based on the available memory, "
                 f"the estimated maximum model length is {estimated_max_len}. "
             )
-        logger.error(
-            "[KV_MEMORY] 容量检查失败 max_model_len=%d "
-            "需要KV=%sGiB 可用KV=%sGiB 缺口=%sGiB 估计可支持长度=%d "
-            "（单worker容量检查，不是整机HBM总量；未自动修改配置）",
-            max_model_len,
-            format_gib(needed_memory),
-            format_gib(available_memory),
-            format_gib(needed_memory - available_memory),
-            estimated_max_len,
-        )
 
         raise ValueError(
             f"To serve at least one request with the model's max seq len "
