@@ -425,6 +425,160 @@ def _setup_remote_kv_resume(num_prompt_tokens: int, matched_tokens: int):
     return scheduler
 
 
+def test_ttft_async_admission_costs_stay_with_request(monkeypatch):
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+
+    scheduler = create_scheduler(
+        enable_prefix_caching=True,
+        use_kv_connector=mock_kv(matched_tokens=32, is_async=True),
+        block_size=16,
+    )
+    remote, local = create_requests(
+        num_requests=2,
+        num_tokens=64,
+        max_tokens=20,
+        block_size=16,
+        req_ids=["remote", "local"],
+    )
+    clock = [0.0]
+    get_computed_blocks = scheduler.kv_cache_manager.get_computed_blocks_for_connector
+    allocate_slots = scheduler.kv_cache_manager.allocate_slots
+
+    def timed_hash(request):
+        clock[0] += 1.0 if request is remote else 2.0
+        return get_computed_blocks(request)
+
+    def timed_lookup(request, num_local_tokens):
+        clock[0] += 3.0 if request is remote else 5.0
+        return (32, True) if request is remote else (0, False)
+
+    def timed_allocate(request, *args, **kwargs):
+        clock[0] += 7.0 if request is remote else 11.0
+        return allocate_slots(request, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.time.perf_counter", lambda: clock[0]
+    )
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.time.monotonic", lambda: clock[0]
+    )
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager, "get_computed_blocks_for_connector", timed_hash
+    )
+    monkeypatch.setattr(
+        scheduler.connector, "get_num_new_matched_tokens", timed_lookup
+    )
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", timed_allocate)
+    scheduler.add_request(remote)
+    scheduler.add_request(local)
+
+    admission = scheduler.schedule()
+    assert remote.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+    assert admission.num_scheduled_tokens == {"local": 64}
+    assert admission.schedule_hash_time == 3.0
+    assert admission.schedule_external_lookup_time == 8.0
+    assert admission.schedule_allocate_slots_time == 18.0
+    assert remote.ttft_hash_and_local_cache_time == 1.0
+    assert remote.ttft_external_lookup_time == 3.0
+    assert remote.ttft_allocate_slots_time == 7.0
+    assert remote.ttft_num_steps == 0
+    outputs = scheduler.update_from_output(
+        admission,
+        create_model_runner_output(
+            [local], token_id=1000, finished_recving={"remote"}
+        ),
+    )
+    local_output = outputs[local.client_index].outputs[0]
+    assert local_output.hash_and_local_cache_time == 2.0
+    assert local_output.external_lookup_time == 5.0
+    assert local_output.allocate_slots_time == 11.0
+
+    # The completed async load resumes with a nonzero computed prefix and no
+    # repeated lookup. Only this request's second allocation is added.
+    resumed = scheduler.schedule()
+    assert resumed.num_scheduled_tokens["remote"] == 32
+    outputs = scheduler.update_from_output(
+        resumed, create_model_runner_output([local, remote], token_id=1000)
+    )
+    remote_output = next(
+        output
+        for output in outputs[remote.client_index].outputs
+        if output.request_id == "remote"
+    )
+    assert remote_output.hash_and_local_cache_time == 1.0
+    assert remote_output.external_lookup_time == 3.0
+    assert remote_output.allocate_slots_time == 14.0
+    assert remote_output.ttft_num_scheduled_tokens == 32
+    assert remote_output.ttft_num_steps == 1
+    assert local.ttft_allocate_slots_time == 11.0
+
+
+@pytest.mark.parametrize("failure", ["lookup_pending", "allocation_failed"])
+def test_ttft_admission_retry_keeps_attempt_costs(monkeypatch, failure):
+    from tests.v1.kv_connector.unit.utils import create_model_runner_output
+
+    scheduler = create_scheduler(
+        use_kv_connector=mock_kv(matched_tokens=0, is_async=False)
+    )
+    (request,) = create_requests(num_requests=1, num_tokens=16)
+    clock = [0.0]
+    attempts = [0]
+    get_computed_blocks = scheduler.kv_cache_manager.get_computed_blocks_for_connector
+    allocate_slots = scheduler.kv_cache_manager.allocate_slots
+
+    def timed_hash(request):
+        clock[0] += 1.0
+        return get_computed_blocks(request)
+
+    def timed_lookup(request, num_local_tokens):
+        clock[0] += 2.0
+        attempts[0] += 1
+        if failure == "lookup_pending" and attempts[0] == 1:
+            return None, False
+        return 0, False
+
+    def timed_allocate(request, *args, **kwargs):
+        clock[0] += 3.0
+        if failure == "allocation_failed" and attempts[0] == 1:
+            return None
+        return allocate_slots(request, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.time.perf_counter", lambda: clock[0]
+    )
+    monkeypatch.setattr(
+        "vllm.v1.core.sched.scheduler.time.monotonic", lambda: clock[0]
+    )
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager, "get_computed_blocks_for_connector", timed_hash
+    )
+    monkeypatch.setattr(
+        scheduler.connector, "get_num_new_matched_tokens", timed_lookup
+    )
+    monkeypatch.setattr(scheduler.kv_cache_manager, "allocate_slots", timed_allocate)
+    scheduler.add_request(request)
+
+    failed = scheduler.schedule()
+    assert not failed.num_scheduled_tokens
+    assert request.ttft_hash_and_local_cache_time == 1.0
+    assert request.ttft_external_lookup_time == 2.0
+    assert request.ttft_allocate_slots_time == (
+        3.0 if failure == "allocation_failed" else 0.0
+    )
+
+    retried = scheduler.schedule()
+    outputs = scheduler.update_from_output(
+        retried, create_model_runner_output([request], token_id=1000)
+    )
+    output = outputs[request.client_index].outputs[0]
+    assert output.hash_and_local_cache_time == 2.0
+    assert output.external_lookup_time == 4.0
+    assert output.allocate_slots_time == (
+        6.0 if failure == "allocation_failed" else 3.0
+    )
+    assert output.ttft_num_steps == 1
+
+
 def test_throttle_prefills_excludes_fully_transferred_remote_kv():
     """A remote-KV resume whose whole prompt was transferred (no local prefill
     left, e.g. the decode side of P/D disaggregation) must NOT be throttled by

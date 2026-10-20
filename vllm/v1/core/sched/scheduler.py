@@ -587,7 +587,10 @@ class Scheduler(SchedulerInterface):
                         num_new_tokens,
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
-                    _step_allocate_slots_time += time.perf_counter() - _t_alloc
+                    _allocate_slots_time = time.perf_counter() - _t_alloc
+                    _step_allocate_slots_time += _allocate_slots_time
+                    if not request.output_token_ids:
+                        request.ttft_allocate_slots_time += _allocate_slots_time
 
                     if new_blocks is not None:
                         # The request can be scheduled.
@@ -773,7 +776,10 @@ class Scheduler(SchedulerInterface):
                             # Marconi shared-prefix junction to pin; 0 if none.
                             request.shared_prefix_boundary,
                         ) = self.kv_cache_manager.get_computed_blocks(request)
-                    _step_hash_time += time.perf_counter() - _t_hash
+                    _hash_time = time.perf_counter() - _t_hash
+                    _step_hash_time += _hash_time
+                    if not request.output_token_ids:
+                        request.ttft_hash_and_local_cache_time += _hash_time
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -790,7 +796,10 @@ class Scheduler(SchedulerInterface):
                                 request, block_aligned_local
                             )
                         )
-                        _step_external_lookup_time += time.perf_counter() - _t_ext
+                        _external_lookup_time = time.perf_counter() - _t_ext
+                        _step_external_lookup_time += _external_lookup_time
+                        if not request.output_token_ids:
+                            request.ttft_external_lookup_time += _external_lookup_time
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -996,7 +1005,10 @@ class Scheduler(SchedulerInterface):
                     reserved_blocks=reserved_blocks,
                     has_scheduled_reqs=bool(self.running),
                 )
-                _step_allocate_slots_time += time.perf_counter() - _t_alloc
+                _allocate_slots_time = time.perf_counter() - _t_alloc
+                _step_allocate_slots_time += _allocate_slots_time
+                if not request.output_token_ids:
+                    request.ttft_allocate_slots_time += _allocate_slots_time
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
@@ -1223,7 +1235,9 @@ class Scheduler(SchedulerInterface):
         # TTFT breakdown: total schedule time and its non-attributed overhead.
         _schedule_total_time = time.monotonic() - scheduled_timestamp
         _num_total_scheduled_reqs = (
-            len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs)
+            len(scheduled_new_reqs)
+            + len(scheduled_resumed_reqs)
+            + len(scheduled_running_reqs)
         )
         _schedule_overhead_time = (
             _schedule_total_time
@@ -1406,6 +1420,18 @@ class Scheduler(SchedulerInterface):
 
         Discards the last sampled output token from the prior input chunk.
         """
+
+        # Each input chunk starts a new TTFT measurement, even when its
+        # computed prefix and KV cache are retained from the previous chunk.
+        session.ttft_hash_and_local_cache_time = 0.0
+        session.ttft_external_lookup_time = 0.0
+        session.ttft_allocate_slots_time = 0.0
+        session.ttft_schedule_overhead_time = 0.0
+        session.ttft_load_kv_time = 0.0
+        session.ttft_forward_time = 0.0
+        session.ttft_save_kv_time = 0.0
+        session.ttft_num_scheduled_tokens = 0
+        session.ttft_num_steps = 0
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
@@ -1764,11 +1790,9 @@ class Scheduler(SchedulerInterface):
         # to avoid expensive operations inside the loop.
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
-        # TTFT breakdown: step-level timings, attributed to every scheduled
-        # request and accumulated per-request while it is still prefilling.
-        _step_hash = scheduler_output.schedule_hash_time
-        _step_ext = scheduler_output.schedule_external_lookup_time
-        _step_alloc = scheduler_output.schedule_allocate_slots_time
+        # TTFT breakdown: scheduler overhead and worker timings retain batch
+        # attribution. Request-local lookup/allocation costs accrue in schedule,
+        # including admissions that only initiate an asynchronous remote load.
         _step_overhead = scheduler_output.schedule_overhead_time
         _step_load = model_runner_output.worker_load_kv_time
         _step_forward = model_runner_output.worker_forward_time
@@ -1813,9 +1837,6 @@ class Scheduler(SchedulerInterface):
             # still prefilling (before its first output token), so chunked
             # prefill totals are captured on the final chunk's output.
             if not request.output_token_ids:
-                request.ttft_hash_and_local_cache_time += _step_hash
-                request.ttft_external_lookup_time += _step_ext
-                request.ttft_allocate_slots_time += _step_alloc
                 request.ttft_schedule_overhead_time += _step_overhead
                 request.ttft_load_kv_time += _step_load
                 request.ttft_forward_time += _step_forward
@@ -1951,6 +1972,17 @@ class Scheduler(SchedulerInterface):
                 new_token_ids or pooler_output is not None or stopped
             )
             if should_emit_output:
+                # A queued streaming update can reset these in
+                # _handle_stopped_request before this chunk's output is built.
+                ttft_hash_time = request.ttft_hash_and_local_cache_time
+                ttft_external_lookup_time = request.ttft_external_lookup_time
+                ttft_allocate_slots_time = request.ttft_allocate_slots_time
+                ttft_schedule_overhead_time = request.ttft_schedule_overhead_time
+                ttft_load_kv_time = request.ttft_load_kv_time
+                ttft_forward_time = request.ttft_forward_time
+                ttft_save_kv_time = request.ttft_save_kv_time
+                ttft_num_scheduled_tokens = request.ttft_num_scheduled_tokens
+                ttft_num_steps = request.ttft_num_steps
                 prefill_stats = request.take_prefill_stats()
                 if prefill_stats is not None:
                     prefill_stats.finalize(
@@ -2003,15 +2035,15 @@ class Scheduler(SchedulerInterface):
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         # TTFT breakdown: per-request accumulated totals.
-                        hash_and_local_cache_time=request.ttft_hash_and_local_cache_time,
-                        external_lookup_time=request.ttft_external_lookup_time,
-                        allocate_slots_time=request.ttft_allocate_slots_time,
-                        schedule_overhead_time=request.ttft_schedule_overhead_time,
-                        load_kv_time=request.ttft_load_kv_time,
-                        forward_time=request.ttft_forward_time,
-                        save_kv_time=request.ttft_save_kv_time,
-                        ttft_num_scheduled_tokens=request.ttft_num_scheduled_tokens,
-                        ttft_num_steps=request.ttft_num_steps,
+                        hash_and_local_cache_time=ttft_hash_time,
+                        external_lookup_time=ttft_external_lookup_time,
+                        allocate_slots_time=ttft_allocate_slots_time,
+                        schedule_overhead_time=ttft_schedule_overhead_time,
+                        load_kv_time=ttft_load_kv_time,
+                        forward_time=ttft_forward_time,
+                        save_kv_time=ttft_save_kv_time,
+                        ttft_num_scheduled_tokens=ttft_num_scheduled_tokens,
+                        ttft_num_steps=ttft_num_steps,
                     )
                 )
             else:

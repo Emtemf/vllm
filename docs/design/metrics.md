@@ -40,6 +40,18 @@ In v1, an extensive set of metrics are exposed via a Prometheus-compatible `/met
 
 These are documented under [Inferencing and Serving -> Production Metrics](../usage/metrics.md).
 
+### TTFT breakdown logging
+
+The instrumentation branch emits `[TTFT][BREAKDOWN]` at the first output token.
+Local-cache lookup, external lookup, and KV allocation durations belong to the
+request that performs each operation, including asynchronous admissions and
+retries. Scheduler overhead and worker load/forward/save durations retain
+batch-level attribution; the breakdown is not an isolated device profile.
+
+Each streaming input chunk starts fresh timing, token, and step accumulators,
+while the previous chunk's output retains its completed timing snapshot.
+Instrumentation preserves abort processing before synchronous output updates.
+
 ### Grafana Dashboard
 
 vLLM also provides [a reference example](../../examples/observability/prometheus_grafana/README.md) for how to collect and store these metrics using Prometheus and visualize them using a Grafana dashboard.

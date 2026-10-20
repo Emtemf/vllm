@@ -157,6 +157,19 @@ class TestStreamingScheduler(unittest.TestCase):
             prompt_token_ids=[1, 2, 3],
         )
         session.num_computed_tokens = len(session.prompt_token_ids)
+        timing_fields = (
+            "ttft_hash_and_local_cache_time",
+            "ttft_external_lookup_time",
+            "ttft_allocate_slots_time",
+            "ttft_schedule_overhead_time",
+            "ttft_load_kv_time",
+            "ttft_forward_time",
+            "ttft_save_kv_time",
+            "ttft_num_scheduled_tokens",
+            "ttft_num_steps",
+        )
+        for value, field in enumerate(timing_fields, 1):
+            setattr(session, field, value)
 
         new_request = DummyRequest(
             request_id="session",
@@ -171,6 +184,77 @@ class TestStreamingScheduler(unittest.TestCase):
         assert session._all_token_ids == [1, 2, 3, 4, 5, 6]
         assert session.sampling_params.max_tokens == 10
         assert session.status == RequestStatus.WAITING
+        assert session.num_computed_tokens == 3
+        for field in timing_fields:
+            assert getattr(session, field) == 0
+
+    def test_ttft_queued_chunk_preserves_completed_output(self):
+        scheduler = create_scheduler()
+        session = DummyRequest(
+            request_id="session",
+            prompt_token_ids=[1, 2, 3],
+        )
+        scheduler.add_request(session)
+        scheduler_output = scheduler.schedule()
+        timing_fields = (
+            "hash_and_local_cache_time",
+            "external_lookup_time",
+            "allocate_slots_time",
+            "schedule_overhead_time",
+            "load_kv_time",
+            "forward_time",
+            "save_kv_time",
+        )
+        for value, field in enumerate(timing_fields, 1):
+            setattr(session, f"ttft_{field}", float(value))
+        session.ttft_num_scheduled_tokens = 100
+        session.ttft_num_steps = 3
+        scheduler_output.schedule_overhead_time = 0.25
+        scheduler.add_request(
+            DummyRequest(request_id="session", prompt_token_ids=[4, 5])
+        )
+        model_output = ModelRunnerOutput(
+            req_ids=["session"],
+            req_id_to_index={"session": 0},
+            sampled_token_ids=[[STOP_TOKEN]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+            worker_load_kv_time=0.5,
+            worker_forward_time=0.75,
+            worker_save_kv_time=1.0,
+        )
+
+        outputs = scheduler.update_from_output(scheduler_output, model_output)
+        output = outputs[session.client_index].outputs[0]
+        expected = [1.0, 2.0, 3.0, 4.25, 5.5, 6.75, 8.0]
+        assert [getattr(output, field) for field in timing_fields] == expected
+        assert output.ttft_num_scheduled_tokens == 103
+        assert output.ttft_num_steps == 4
+        assert session.status == RequestStatus.WAITING
+        assert session.num_computed_tokens == 3
+        for field in timing_fields:
+            assert getattr(session, f"ttft_{field}") == 0.0
+        assert session.ttft_num_scheduled_tokens == 0
+        assert session.ttft_num_steps == 0
+
+        # The retained prefix does not bypass the new chunk's fresh TTFT state.
+        resumed = scheduler.schedule()
+        assert resumed.num_scheduled_tokens == {"session": 2}
+        allocation_time = session.ttft_allocate_slots_time
+        resumed.schedule_overhead_time = 4.0
+        model_output.sampled_token_ids = [[10]]
+        model_output.worker_load_kv_time = 1.0
+        model_output.worker_forward_time = 2.0
+        model_output.worker_save_kv_time = 3.0
+        outputs = scheduler.update_from_output(resumed, model_output)
+        next_output = outputs[session.client_index].outputs[0]
+        assert [
+            getattr(next_output, field) for field in timing_fields
+        ] == [0.0, 0.0, allocation_time, 4.0, 1.0, 2.0, 3.0]
+        assert next_output.ttft_num_scheduled_tokens == 2
+        assert next_output.ttft_num_steps == 1
+        assert [getattr(output, field) for field in timing_fields] == expected
 
     def test_update_request_as_session_with_multimodal(self):
         scheduler = create_scheduler()

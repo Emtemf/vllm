@@ -605,12 +605,15 @@ class EngineCore:
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
+        self._process_aborts_queue()
         _t_update_start = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
         _update_time = time.perf_counter() - _t_update_start
-        self._attach_ttft_breakdown(scheduler_output, model_output, engine_core_outputs, _update_time)
+        self._attach_ttft_breakdown(
+            scheduler_output, model_output, engine_core_outputs, _update_time
+        )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -772,7 +775,9 @@ class EngineCore:
             scheduler_output, model_output
         )
         _update_time = time.perf_counter() - _t_update_start
-        self._attach_ttft_breakdown(scheduler_output, model_output, engine_core_outputs, _update_time)
+        self._attach_ttft_breakdown(
+            scheduler_output, model_output, engine_core_outputs, _update_time
+        )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
