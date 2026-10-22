@@ -20,6 +20,7 @@ from vllm.utils.network_utils import get_ip
 from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.worker_base import WorkerWrapperBase
+from vllm.v1.worker.ttft_utils import diagnostic_span
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -161,7 +162,8 @@ try:
                 return scheduler_output, grammar_output, output
 
             if isinstance(output, AsyncModelRunnerOutput):
-                output = output.get_output()
+                with diagnostic_span("worker_output"):
+                    output = output.get_output()
             if not self._is_last_rank():
                 # Case where there are no scheduled requests
                 # but may still be finished requests.

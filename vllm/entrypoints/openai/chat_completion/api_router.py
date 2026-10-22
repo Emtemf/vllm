@@ -37,6 +37,8 @@ def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
     return request.app.state.openai_serving_chat_batch
 
 
+# LEARNING_PATH 3: This decorator is equivalent to Spring's `@PostMapping`.
+# The handler omits `-> ...`; return annotations are optional in Python.
 @router.post(
     "/v1/chat/completions",
     dependencies=[Depends(validate_json_request)],
@@ -54,10 +56,13 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )
+    # LEARNING_PATH 4: Resolve the long-lived service from FastAPI app state.
     handler = chat(raw_request)
     if handler is None:
         raise NotImplementedError("The model does not support Chat Completions API")
 
+    # LEARNING_PATH 5: Controller -> service. `await` suspends this coroutine
+    # until the asynchronous service call produces its response object.
     generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):

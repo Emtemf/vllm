@@ -431,7 +431,7 @@ class IterationStats:
                 + output.load_kv_time
                 + output.forward_time
                 + output.save_kv_time
-                + output.update_time
+                + output.ttft_update_time
             )
             logger.info(
                 "[TTFT][BREAKDOWN] req=%s ttft=%.6f "
@@ -447,7 +447,7 @@ class IterationStats:
                 output.load_kv_time,
                 output.forward_time,
                 output.save_kv_time,
-                output.update_time,
+                output.ttft_update_time,
                 first_token_latency - breakdown_sum,
                 output.ttft_num_scheduled_tokens,
                 output.ttft_num_steps,

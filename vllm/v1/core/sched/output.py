@@ -275,6 +275,8 @@ class SchedulerOutput:
     schedule_overhead_time: float = 0.0
     num_scheduled_new_reqs: int = 0
     num_total_scheduled_reqs: int = 0
+    # Diagnostic correlation only; never used to make scheduling decisions.
+    ttft_step_id: str | None = None
 
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":

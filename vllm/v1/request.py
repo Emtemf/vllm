@@ -211,6 +211,9 @@ class Request:
         # TTFT breakdown: chunked-prefill diagnostics (final-chunk snapshot).
         self.ttft_num_scheduled_tokens = 0
         self.ttft_num_steps = 0
+        # Legacy TTFT breakdown: engine-side update time accumulated across
+        # prefill steps, attached on the final prefill chunk's output.
+        self.ttft_update_time = 0.0
 
         # The number of times this request has been preempted by the scheduler.
         self.num_preemptions = 0
@@ -234,6 +237,8 @@ class Request:
         # If True, request should be aborted immediately after being added to
         # the scheduler so the connector's request_finished hook runs.
         self.abort_immediately = abort_immediately
+        # Diagnostic-only frontend correlation; never scheduling state.
+        self.ttft_frontend_id: str | None = None
 
     @classmethod
     def from_engine_core_request(
@@ -260,6 +265,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            ttft_frontend_id=request.ttft_frontend_id,
         )
 
     def append_output_token_ids(

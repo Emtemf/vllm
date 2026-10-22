@@ -214,6 +214,8 @@ class OpenAIServingChat(GenerateBaseServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
+        # LEARNING_PATH 6: Service -> renderer. Render/tokenize begins across
+        # this boundary; no model execution has happened yet.
         return await self.online_renderer.render_chat(request)
 
     async def create_chat_completion(
@@ -249,6 +251,7 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
+        # LEARNING_PATH 7: Enter request preprocessing through the method above.
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result

@@ -16,6 +16,7 @@ from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.worker.ttft_utils import worker_call
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -343,12 +344,19 @@ class WorkerWrapperBase:
                 req_data.mm_features
             )
 
+    @worker_call("worker_execute")
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         self._apply_mm_cache(scheduler_output)
 
         return self.worker.execute_model(scheduler_output)
+
+    @worker_call("worker_sample")
+    def sample_tokens(
+        self, grammar_output: GrammarOutput | None
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        return self.worker.sample_tokens(grammar_output)
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache

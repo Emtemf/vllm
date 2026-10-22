@@ -85,6 +85,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
@@ -593,7 +594,11 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        with (
+            ttft_diag.scope(step_id=scheduler_output.ttft_step_id),
+            ttft_diag.span("core_execute", step_id=scheduler_output.ttft_step_id),
+        ):
+            future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -607,9 +612,13 @@ class EngineCore:
         # during the model execution.
         self._process_aborts_queue()
         _t_update_start = time.perf_counter()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        with (
+            ttft_diag.scope(step_id=scheduler_output.ttft_step_id),
+            ttft_diag.span("core_update", step_id=scheduler_output.ttft_step_id),
+        ):
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
         _update_time = time.perf_counter() - _t_update_start
         self._attach_ttft_breakdown(
             scheduler_output, model_output, engine_core_outputs, _update_time
@@ -660,6 +669,17 @@ class EngineCore:
             _update_per_req,
         )
 
+        # Requests whose first token has not been emitted yet keep accruing
+        # update time. This runs BEFORE the emit loop below so a request
+        # finishing its prefill this step (output carries the first token,
+        # tokens already appended by update_from_output) is excluded from
+        # further accrual, and its final share is folded into the emitted
+        # total instead of the (already-snapshotted) accumulator.
+        for _req_id in scheduler_output.num_scheduled_tokens:
+            _request = self.scheduler.requests.get(_req_id)
+            if _request is not None and not _request.output_token_ids:
+                _request.ttft_update_time += _update_per_req
+
         _num_attached = 0
         for _outputs in engine_core_outputs.values() if engine_core_outputs else []:
             for _eco in _outputs.outputs:
@@ -667,6 +687,14 @@ class EngineCore:
                 # set by Scheduler.update_from_output; only update_time is
                 # per-step and attached here.
                 _eco.update_time = _update_per_req
+                # Legacy TTFT breakdown: the scheduler snapshot on this output
+                # predates this step's share, so add it for requests that were
+                # still prefilling (ttft_num_steps counted this step).
+                _request = self.scheduler.requests.get(_eco.request_id)
+                if _request is not None and _request.ttft_num_steps:
+                    _eco.ttft_update_time = (
+                        _request.ttft_update_time + _update_per_req
+                    )
                 _num_attached += 1
 
         if _num_attached > 0:

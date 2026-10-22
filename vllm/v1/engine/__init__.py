@@ -144,6 +144,9 @@ class EngineCoreRequest(
     # request_finished hook. Used to free P-side prefill blocks when a
     # KV-transfer request is rejected on the D node before engine admission.
     abort_immediately: bool = False
+    # Diagnostic-only correlation with frontend render inputs; never used to
+    # make scheduling decisions.
+    ttft_frontend_id: str | None = None
 
     @property
     def params(self) -> SamplingParams | PoolingParams:
@@ -223,6 +226,8 @@ class EngineCoreOutput(
     save_kv_time: float = 0.0
     # EngineCore update_from_output time (per-step, divided by num_total_scheduled_reqs).
     update_time: float = 0.0
+    # Accumulated update time across prefill steps (TTFT breakdown).
+    ttft_update_time: float = 0.0
     # TTFT breakdown: chunked-prefill diagnostics.
     ttft_num_scheduled_tokens: int = 0
     ttft_num_steps: int = 0

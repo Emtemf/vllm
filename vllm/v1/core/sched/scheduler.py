@@ -62,6 +62,7 @@ from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 
 logger = init_logger(__name__)
 
@@ -472,6 +473,9 @@ class Scheduler(SchedulerInterface):
         # For logging.
         scheduled_timestamp = time.monotonic()
 
+        # Diagnostic-only step correlation; identifiers are never state.
+        _diag_enabled = ttft_diag.enabled()
+        _diag_step_id = ttft_diag.new_id("step") if _diag_enabled else None
         # TTFT breakdown: step-level timing accumulators (seconds).
         _step_hash_time = 0.0
         _step_external_lookup_time = 0.0
@@ -1274,6 +1278,7 @@ class Scheduler(SchedulerInterface):
             schedule_overhead_time=_schedule_overhead_time,
             num_scheduled_new_reqs=_num_scheduled_new_reqs,
             num_total_scheduled_reqs=_num_total_scheduled_reqs,
+            ttft_step_id=_diag_step_id,
         )
 
         # NOTE(Kuntai): this function is designed for multiple purposes:
@@ -1295,6 +1300,28 @@ class Scheduler(SchedulerInterface):
         # write KV and have their output processed later in update_from_output).
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
+
+        if _diag_enabled:
+            ttft_diag.emit(
+                "step_plan",
+                step_id=_diag_step_id,
+                num_scheduled_tokens=total_num_scheduled_tokens,
+                num_new_reqs=_num_scheduled_new_reqs,
+                num_total_reqs=_num_total_scheduled_reqs,
+            )
+            for _diag_req_id, _diag_tokens in num_scheduled_tokens.items():
+                _diag_request = self.requests.get(_diag_req_id)
+                ttft_diag.emit(
+                    "request_step",
+                    step_id=_diag_step_id,
+                    request_id=_diag_req_id,
+                    scheduled_tokens=_diag_tokens,
+                    frontend_id=(
+                        _diag_request.ttft_frontend_id
+                        if _diag_request is not None
+                        else None
+                    ),
+                )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -1432,6 +1459,7 @@ class Scheduler(SchedulerInterface):
         session.ttft_save_kv_time = 0.0
         session.ttft_num_scheduled_tokens = 0
         session.ttft_num_steps = 0
+        session.ttft_update_time = 0.0
 
         # Current streaming input behaviour: Keep only computed output tokens
         # (discard final sampled output token).
@@ -1983,6 +2011,7 @@ class Scheduler(SchedulerInterface):
                 ttft_save_kv_time = request.ttft_save_kv_time
                 ttft_num_scheduled_tokens = request.ttft_num_scheduled_tokens
                 ttft_num_steps = request.ttft_num_steps
+                ttft_update_time = request.ttft_update_time
                 prefill_stats = request.take_prefill_stats()
                 if prefill_stats is not None:
                     prefill_stats.finalize(
@@ -2044,6 +2073,7 @@ class Scheduler(SchedulerInterface):
                         save_kv_time=ttft_save_kv_time,
                         ttft_num_scheduled_tokens=ttft_num_scheduled_tokens,
                         ttft_num_steps=ttft_num_steps,
+                        ttft_update_time=ttft_update_time,
                     )
                 )
             else:
@@ -2340,6 +2370,14 @@ class Scheduler(SchedulerInterface):
                 self.connector.on_new_request(request)
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+        if ttft_diag.enabled():
+            ttft_diag.emit(
+                "request_wait",
+                request_id=request.request_id,
+                frontend_id=request.ttft_frontend_id,
+                arrival_ns=time.perf_counter_ns(),
+                state="queued",
+            )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus
@@ -2400,6 +2438,13 @@ class Scheduler(SchedulerInterface):
                 self.failed_recving_kv_req_ids.discard(request.request_id)
 
             request.status = finished_status
+            if ttft_diag.enabled():
+                ttft_diag.emit(
+                    "request_core_end",
+                    request_id=request.request_id,
+                    frontend_id=request.ttft_frontend_id,
+                    status=finished_status.name,
+                )
             self._free_request(request, delay_free_blocks=delay_free_blocks)
 
         return valid_requests

@@ -391,6 +391,7 @@ class InputProcessor:
             data_parallel_rank=data_parallel_rank,
             trace_headers=trace_headers,
             resumable=resumable,
+            ttft_frontend_id=processed_inputs.get("ttft_frontend_id"),
         )
 
     def _validate_prompt_len(

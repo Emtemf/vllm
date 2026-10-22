@@ -54,6 +54,7 @@ from .inputs import (
     TokPrompt,
 )
 from .inputs.preprocess import extract_target_prompt
+from .diagnostics import mark_engine_input, trace_renderer
 from .params import ChatParams, TokenizeParams
 
 if TYPE_CHECKING:
@@ -956,6 +957,7 @@ class BaseRenderer(ABC, Generic[_T]):
             engine_input = self._process_singleton(prompt, skip_mm_cache=skip_mm_cache)
 
         engine_input["arrival_time"] = arrival_time
+        mark_engine_input(engine_input)
 
         return engine_input
 
@@ -978,10 +980,12 @@ class BaseRenderer(ABC, Generic[_T]):
             )
 
         engine_input["arrival_time"] = arrival_time
+        mark_engine_input(engine_input)
 
         return engine_input
 
     # Top-level methods
+    @trace_renderer("frontend_render", route="cmpl")
     def render_cmpl(
         self,
         prompts: Sequence[DictPrompt | bytes],
@@ -1013,6 +1017,7 @@ class BaseRenderer(ABC, Generic[_T]):
             for prompt in tok_prompts
         ]
 
+    @trace_renderer("frontend_render", route="cmpl")
     async def render_cmpl_async(
         self,
         prompts: Sequence[DictPrompt | bytes],
@@ -1048,6 +1053,7 @@ class BaseRenderer(ABC, Generic[_T]):
             )
         )
 
+    @trace_renderer("frontend_render", route="chat")
     def render_chat(
         self,
         conversations: Sequence[list["ChatCompletionMessageParam"]],
@@ -1092,6 +1098,7 @@ class BaseRenderer(ABC, Generic[_T]):
 
         return out_conversations, eng_prompts
 
+    @trace_renderer("frontend_render", route="chat")
     async def render_chat_async(
         self,
         conversations: Sequence[list["ChatCompletionMessageParam"]],

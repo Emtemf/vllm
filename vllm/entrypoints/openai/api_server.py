@@ -186,6 +186,8 @@ async def build_async_engine_client_from_engine_args(
             async_llm.shutdown(timeout=vllm_config.shutdown_timeout)
 
 
+# LEARNING_PATH 1: `-> FastAPI` is the optional return-type annotation.
+# Inputs are inside `(...)`; the returned value appears at `return app` below.
 def build_app(
     args: Namespace,
     supported_tasks: tuple["SupportedTask", ...] | None = None,
@@ -211,6 +213,8 @@ def build_app(
         app = FastAPI(lifespan=lifespan)
     app.state.args = args
 
+    # LEARNING_PATH 2: Register HTTP routers. This file assembles the app but
+    # does not implement `/v1/chat/completions` itself.
     from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
     register_vllm_serve_api_routers(app)

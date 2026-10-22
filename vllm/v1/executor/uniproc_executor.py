@@ -19,6 +19,7 @@ from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.worker_base import WorkerWrapperBase
+from vllm.v1.worker.ttft_utils import diagnostic_span
 
 logger = init_logger(__name__)
 
@@ -35,7 +36,8 @@ class AsyncOutputFuture(Future):
 
         if not super().done():
             try:
-                output = self.async_output.get_output()
+                with diagnostic_span("worker_output"):
+                    output = self.async_output.get_output()
                 self.set_result(output if self.single_value else [output])
             except Exception as e:
                 self.set_exception(e)

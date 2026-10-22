@@ -315,6 +315,8 @@ class ModelRunnerOutput:
     worker_load_kv_time: float = 0.0
     worker_forward_time: float = 0.0
     worker_save_kv_time: float = 0.0
+    # Correlates optional diagnostic events, including connector-only steps.
+    ttft_step_id: str | None = None
 
 
     @staticmethod

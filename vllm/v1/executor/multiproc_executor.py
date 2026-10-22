@@ -62,6 +62,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
+from vllm.v1.worker.ttft_utils import diagnostic_span
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -954,7 +955,8 @@ class WorkerProc:
         """
         if isinstance(output, AsyncModelRunnerOutput):
             try:
-                output = output.get_output()
+                with diagnostic_span("worker_output"):
+                    output = output.get_output()
             except Exception as e:
                 logger.exception("Error getting async model runner output")
                 output = e
