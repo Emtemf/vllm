@@ -37,6 +37,7 @@ from vllm.v1.metrics.stats import (
     RequestStateStats,
     SchedulerStats,
 )
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 
 # shared empty CPU tensor used as a placeholder pooling output
 EMPTY_CPU_TENSOR = torch.empty(0, device="cpu")
@@ -547,6 +548,12 @@ class OutputProcessor:
             stream_interval=self.stream_interval,
         )
         self.request_states[request_id] = req_state
+        if ttft_diag.enabled():
+            ttft_diag.emit(
+                "frontend_receive",
+                request_id=request_id,
+                frontend_id=request.ttft_frontend_id,
+            )
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
 
@@ -648,6 +655,19 @@ class OutputProcessor:
                         engine_core_output.prefill_stats.num_cache_creation_tokens
                     )
                 req_state.is_prefilling = False
+                if ttft_diag.enabled() and new_token_ids:
+                    ttft_diag.emit(
+                        "request_first_token",
+                        request_id=req_id,
+                        hash_s=engine_core_output.hash_and_local_cache_time,
+                        ext_lookup_s=engine_core_output.external_lookup_time,
+                        alloc_s=engine_core_output.allocate_slots_time,
+                        overhead_s=engine_core_output.schedule_overhead_time,
+                        load_kv_s=engine_core_output.load_kv_time,
+                        forward_s=engine_core_output.forward_time,
+                        save_kv_s=engine_core_output.save_kv_time,
+                        update_s=engine_core_output.ttft_update_time,
+                    )
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None
@@ -712,6 +732,12 @@ class OutputProcessor:
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
+        if ttft_diag.enabled():
+            ttft_diag.emit(
+                "request_end",
+                request_id=req_id,
+                external_request_id=req_state.external_req_id,
+            )
         self.request_states.pop(req_id)
 
         internal_ids = self.external_req_ids[req_state.external_req_id]

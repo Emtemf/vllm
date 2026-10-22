@@ -53,6 +53,7 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 
 logger = init_logger(__name__)
 
@@ -386,9 +387,14 @@ class AsyncLLM(EngineClient):
             request.reasoning_parser_kwargs = reasoning_parser_kwargs
 
         self.input_processor.assign_request_id(request)
-
+        if ttft_diag.enabled():
+            ttft_diag.emit(
+                "frontend_bind",
+                frontend_id=request.ttft_frontend_id,
+                request_id=request.request_id,
+                external_request_id=request.external_req_id,
+            )
         # We start the output_handler on the first call to add_request() so
-        # we can call __init__ before the event loop, which enables us
         # to handle startup failure gracefully in the OpenAI server.
         self._run_output_handler()
 
@@ -399,6 +405,12 @@ class AsyncLLM(EngineClient):
         params = request.params
 
         if is_pooling or params.n == 1:
+            if ttft_diag.enabled():
+                ttft_diag.emit(
+                    "frontend_submit",
+                    request_id=request.request_id,
+                    frontend_id=request.ttft_frontend_id,
+                )
             await self._add_request(request, prompt_text, None, 0, queue)
             return queue
 
