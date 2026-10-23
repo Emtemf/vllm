@@ -3,12 +3,14 @@
 
 import time
 from collections import defaultdict, deque
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import logger
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -452,6 +454,41 @@ class IterationStats:
                 output.ttft_num_scheduled_tokens,
                 output.ttft_num_steps,
             )
+            if ttft_diag.enabled():
+                # These are retained existing events, not necessarily the
+                # initial queue interval (QUEUED can be overwritten on requeue).
+                # Do not subtract frontend wall time from core monotonic time.
+                queued_mono = (
+                    req_stats.queued_ts if req_stats.queued_ts > 0.0 else None
+                )
+                scheduled_mono = (
+                    req_stats.scheduled_ts if req_stats.scheduled_ts > 0.0 else None
+                )
+                queue_wait = (
+                    scheduled_mono - queued_mono
+                    if queued_mono is not None
+                    and scheduled_mono is not None
+                    and scheduled_mono >= queued_mono
+                    else None
+                )
+                with suppress(Exception):
+                    logger.info(
+                        "[TTFT][QUEUE] req=%s frontend_arrival_wall_s=%s "
+                        "frontend_iteration_wall_s=%s "
+                        "core_retained_queued_mono_s=%s "
+                        "core_retained_first_scheduled_mono_s=%s "
+                        "core_first_token_output_mono_s=%s "
+                        "queue_wait_s=%s reason=%s",
+                        output.request_id,
+                        req_stats.arrival_time,
+                        self.iteration_timestamp,
+                        queued_mono,
+                        scheduled_mono,
+                        req_stats.first_token_ts,
+                        queue_wait,
+                        "available" if queue_wait is not None
+                        else "unavailable_or_requeued",
+                    )
         else:
             itl = engine_core_timestamp - req_stats.last_token_ts
             self.inter_token_latencies_iter.append(itl)

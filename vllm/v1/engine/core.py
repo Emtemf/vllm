@@ -84,6 +84,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     fault_tolerant_wrapper,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -592,25 +593,41 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        with ttft_diag.span("engine_schedule", path="sync") as schedule_diag:
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            diagnostic_fields = ttft_diag.batch_fields(scheduler_output)
+            if schedule_diag is not None:
+                schedule_diag.update(diagnostic_fields)
+        with ttft_diag.scope(path="sync", **diagnostic_fields):
+            with ttft_diag.span("engine_execute_submit"):
+                future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+            with ttft_diag.span("engine_grammar"):
+                grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
+            with ttft_diag.span(
+                "engine_execute_wait", path="sync", **diagnostic_fields
+            ):
+                model_output = future.result()
             if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+                with ttft_diag.span("engine_sample", path="sync", **diagnostic_fields):
+                    model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
-        _t_update_start = time.perf_counter()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
+        with ttft_diag.span("engine_update", path="sync", **diagnostic_fields):
+            _t_update_start = time.perf_counter()
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
+            _update_time = time.perf_counter() - _t_update_start
+        self._attach_ttft_breakdown(
+            scheduler_output, model_output, engine_core_outputs, _update_time
         )
-        _update_time = time.perf_counter() - _t_update_start
-        self._attach_ttft_breakdown(scheduler_output, model_output, engine_core_outputs, _update_time)
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
@@ -709,8 +726,19 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-            with self.log_error_detail(scheduler_output):
+            with ttft_diag.span("engine_schedule", path="batch_queue") as schedule_diag:
+                scheduler_output = self.scheduler.schedule(
+                    self._should_throttle_prefills()
+                )
+                diagnostic_fields = ttft_diag.batch_fields(scheduler_output)
+                if schedule_diag is not None:
+                    schedule_diag.update(diagnostic_fields)
+            with (
+                self.log_error_detail(scheduler_output),
+                ttft_diag.span(
+                    "engine_execute_submit", path="batch_queue", **diagnostic_fields
+                ),
+            ):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
@@ -724,12 +752,18 @@ class EngineCore:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
-                        scheduler_output
-                    )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
+                    with ttft_diag.span(
+                        "engine_grammar", path="batch_queue", **diagnostic_fields
+                    ):
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                    with ttft_diag.span(
+                        "engine_sample_submit", path="batch_queue", **diagnostic_fields
+                    ):
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
@@ -738,6 +772,11 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                if ttft_diag.enabled():
+                    ttft_diag.emit(
+                        "engine_batch_queued", queue_depth=len(batch_queue),
+                        **diagnostic_fields,
+                    )
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -753,26 +792,36 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        diagnostic_fields = ttft_diag.batch_fields(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
+            with ttft_diag.span(
+                "engine_result_wait", path="batch_queue", **diagnostic_fields
+            ):
+                model_output = future.result()
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
-                exec_model_fut.result()
+                with ttft_diag.span(
+                    "engine_execute_error_wait", path="batch_queue", **diagnostic_fields
+                ):
+                    exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        _t_update_start = time.perf_counter()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
+        with ttft_diag.span("engine_update", path="batch_queue", **diagnostic_fields):
+            _t_update_start = time.perf_counter()
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
+            _update_time = time.perf_counter() - _t_update_start
+        self._attach_ttft_breakdown(
+            scheduler_output, model_output, engine_core_outputs, _update_time
         )
-        _update_time = time.perf_counter() - _t_update_start
-        self._attach_ttft_breakdown(scheduler_output, model_output, engine_core_outputs, _update_time)
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
@@ -792,10 +841,23 @@ class EngineCore:
                     )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
-            grammar_output = self.scheduler.get_grammar_bitmask(
+            deferred_diagnostic_fields = ttft_diag.batch_fields(
                 deferred_scheduler_output
             )
-            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+            with ttft_diag.span(
+                "engine_grammar", path="batch_queue", deferred=True,
+                **deferred_diagnostic_fields,
+            ):
+                grammar_output = self.scheduler.get_grammar_bitmask(
+                    deferred_scheduler_output
+                )
+            with ttft_diag.span(
+                "engine_sample_submit", path="batch_queue", deferred=True,
+                **deferred_diagnostic_fields,
+            ):
+                future = self.model_executor.sample_tokens(
+                    grammar_output, non_block=True
+                )
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed

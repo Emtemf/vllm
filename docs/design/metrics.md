@@ -254,6 +254,54 @@ record:
 - End-to-end latency - the interval between frontend `arrival_time`
   and the frontend receiving the final token.
 
+### Optional Backend TTFT Diagnostics
+
+Set `VLLM_TTFT_DIAGNOSTICS=1` before starting every engine and worker process
+to emit `[TTFT_DIAG]` lines at INFO through `vllm.ttft_diagnostics`. The flag
+defaults off. Existing `arrival_time`, first-token metrics, and
+[TTFT][BREAKDOWN] calculations are unchanged; no frontend events are added.
+
+Each line is greppable `key=value` text (not JSON), one event per line:
+
+```text
+[TTFT_DIAG] event=engine_execute_wait request_ids=A,B path=sync duration_ns=123456 status=ok version=1 host=... pid=... run_id=... mono_ns=... wall_ns=...
+```
+
+Values are single space-free tokens so `grep 'event=engine_execute_wait'` and
+column tools work directly. Sequences are comma-joined with no spaces
+(`request_ids=A,B`); an empty sequence is `[]`; a missing value is `null`
+(never zero); booleans are `true`/`false`. A value containing a space, `=`,
+quote, or comma is wrapped in double quotes with `\` and `"` escaped.
+
+Engine events distinguish scheduling, execute submission, waiting for results,
+grammar construction, sampling, and output updates in both synchronous and
+batch-queue paths. Worker events cover multimodal-cache preparation, execute,
+sample, and asynchronous output materialization. Each queued output retains
+its own request membership, including when another thread materializes it.
+Sample-side membership may become known only when its actual output is
+available; it is not inferred from a preceding execute call returning `None`.
+Compiled-Ray paths that bypass the worker wrapper are not covered by worker
+events.
+
+Pair an `event_start` with its `event` using `span_id`. Point events do not
+reuse the enclosing span ID. Records include process/run identity, host,
+monotonic and wall timestamps; `request_ids` denotes shared batch membership,
+not exclusive per-request attribution. Cross-host monotonic clocks cannot
+be subtracted. Nested spans, ranks, queue delays, and asynchronous operations
+can overlap and must not be summed to reconstruct TTFT or subtracted again
+from the legacy residual. These logs locate host-side waits, not device
+kernel durations; they add no device synchronization. Ingress, transport,
+and response serialization remain unmeasured.
+
+With existing request statistics enabled (`log_stats=True`), an adjacent
+`[TTFT][QUEUE]` line reports the retained core queued/scheduled/output
+timestamps and the existing frontend arrival/iteration wall timestamps.
+Only positive, ordered queued/scheduled values produce a queue duration;
+missing or requeued values are reported as unavailable, not zero. Retained
+timestamps do not promise an initial queue interval after streaming updates
+or requeueing. Core monotonic timestamps are never subtracted from frontend
+wall timestamps, and no statistics are enabled implicitly.
+
 ### KV Cache Residency Metrics
 
 We also emit a set of histograms that describe how long sampled KV cache
