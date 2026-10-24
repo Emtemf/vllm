@@ -302,6 +302,12 @@ timestamps do not promise an initial queue interval after streaming updates
 or requeueing. Core monotonic timestamps are never subtracted from frontend
 wall timestamps, and no statistics are enabled implicitly.
 
+Duration resolution follows the platform monotonic clock. On Linux servers it
+is nanosecond-scale; on Windows development machines the granularity is
+coarse (~15.6 ms), so short spans can legitimately report `duration_ns=0`.
+A zero duration is a clock-resolution artifact, never evidence that a stage
+was skipped.
+
 ### KV Cache Residency Metrics
 
 We also emit a set of histograms that describe how long sampled KV cache
