@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Opt-in host diagnostics, not an additive TTFT accounting model.
+"""Host diagnostics, on by default; not an additive TTFT accounting model.
 
-Set VLLM_TTFT_DIAGNOSTICS=1 before process startup. Monotonic timestamps
-are comparable only within a host clock domain; stages and ranks can overlap.
-No device synchronization is performed, and logging failures are non-fatal.
+Emitted unless VLLM_TTFT_DIAGNOSTICS=0 is set before process startup.
+Monotonic timestamps are comparable only within a host clock domain; stages
+and ranks can overlap. No device synchronization is performed, and logging
+failures are non-fatal.
 """
 
 import itertools
@@ -18,7 +19,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from typing import Any
 
-_ENABLED = os.environ.get("VLLM_TTFT_DIAGNOSTICS") == "1"
+_ENABLED = os.environ.get("VLLM_TTFT_DIAGNOSTICS", "1") != "0"
 _LOGGER = logging.getLogger("vllm.ttft_diagnostics")
 _RUN_ID = uuid.uuid4().hex if _ENABLED else ""
 _HOST = socket.gethostname() if _ENABLED else ""

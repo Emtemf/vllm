@@ -254,12 +254,15 @@ record:
 - End-to-end latency - the interval between frontend `arrival_time`
   and the frontend receiving the final token.
 
-### Optional Backend TTFT Diagnostics
+### Backend TTFT Diagnostics (On by Default)
 
-Set `VLLM_TTFT_DIAGNOSTICS=1` before starting every engine and worker process
-to emit `[TTFT_DIAG]` lines at INFO through `vllm.ttft_diagnostics`. The flag
-defaults off. Existing `arrival_time`, first-token metrics, and
+`[TTFT_DIAG]` lines are emitted at INFO through `vllm.ttft_diagnostics` by
+default. Set `VLLM_TTFT_DIAGNOSTICS=0` before starting every engine and worker
+process to disable them. Existing `arrival_time`, first-token metrics, and
 [TTFT][BREAKDOWN] calculations are unchanged; no frontend events are added.
+When enabled, expect roughly 0.3–0.5 ms per engine step of host-side timing
+and log-write overhead, and tens of extra log lines per request; size log
+rotation accordingly.
 
 Each line is greppable `key=value` text (not JSON), one event per line:
 
