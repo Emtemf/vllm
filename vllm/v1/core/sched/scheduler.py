@@ -1223,7 +1223,9 @@ class Scheduler(SchedulerInterface):
         # TTFT breakdown: total schedule time and its non-attributed overhead.
         _schedule_total_time = time.monotonic() - scheduled_timestamp
         _num_total_scheduled_reqs = (
-            len(scheduled_new_reqs) + len(scheduled_resumed_reqs) + len(scheduled_running_reqs)
+            len(scheduled_new_reqs)
+            + len(scheduled_resumed_reqs)
+            + len(scheduled_running_reqs)
         )
         _schedule_overhead_time = (
             _schedule_total_time
@@ -1773,14 +1775,17 @@ class Scheduler(SchedulerInterface):
         _step_load = model_runner_output.worker_load_kv_time
         _step_forward = model_runner_output.worker_forward_time
         _step_save = model_runner_output.worker_save_kv_time
-        if (
-            _step_forward == 0.0
-            and model_runner_output.kv_connector_output is not None
-        ):
+        if _step_forward == 0.0 and model_runner_output.kv_connector_output is not None:
             _kv = model_runner_output.kv_connector_output
             _step_load = _kv.worker_load_kv_time
             _step_forward = _kv.worker_forward_time
-            _step_save = _kv.worker_save_kv_time
+        # TTFT breakdown: KV-transfer-only step (no model execution). The
+        # forward value is the pure connector wait; attribute it to
+        # kv_transfer instead of forward so it stays visible per request.
+        _step_no_forward = model_runner_output.worker_no_forward_step
+        _step_kv_transfer = model_runner_output.worker_kv_transfer_time
+        if _step_no_forward:
+            _step_forward = 0.0
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
@@ -1820,6 +1825,8 @@ class Scheduler(SchedulerInterface):
                 request.ttft_load_kv_time += _step_load
                 request.ttft_forward_time += _step_forward
                 request.ttft_save_kv_time += _step_save
+                request.ttft_kv_transfer_time += _step_kv_transfer
+                request.ttft_no_forward_steps += 1 if _step_no_forward else 0
                 request.ttft_num_scheduled_tokens += num_tokens_scheduled
                 request.ttft_num_steps += 1
 
@@ -2010,6 +2017,8 @@ class Scheduler(SchedulerInterface):
                         load_kv_time=request.ttft_load_kv_time,
                         forward_time=request.ttft_forward_time,
                         save_kv_time=request.ttft_save_kv_time,
+                        kv_transfer_time=request.ttft_kv_transfer_time,
+                        ttft_no_forward_steps=request.ttft_no_forward_steps,
                         ttft_num_scheduled_tokens=request.ttft_num_scheduled_tokens,
                         ttft_num_steps=request.ttft_num_steps,
                     )

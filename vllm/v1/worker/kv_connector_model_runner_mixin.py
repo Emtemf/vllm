@@ -55,7 +55,18 @@ class KVConnectorModelRunnerMixin:
         ):
             pass
 
-        return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+        output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
+        # TTFT breakdown: this step ran KV transfers with no model execution.
+        # The unclaimed wait segment (wall minus load/sched/update) is
+        # attributed to kv_transfer so it no longer vanishes into residual.
+        # forward stays 0 by definition; save_kv stays 0 (wait_for_save=False).
+        if kv_connector_output is not None:
+            output.worker_no_forward_step = True
+            # Pure wait segment: the no-forward yield body is empty, so the
+            # whole t1..t2 span (worker_forward_time) is connector-side wait.
+            # load (t0..t1) stays attributed to load_kv; no overlap.
+            output.worker_kv_transfer_time = kv_connector_output.worker_forward_time
+        return output
 
     @staticmethod
     def maybe_get_kv_connector_output(
@@ -93,9 +104,7 @@ class KVConnectorModelRunnerMixin:
         if _pending_deferred_kv_output is not None:
             if _pending_deferred_kv_output.worker_save_kv_time < 0:
                 _pending_deferred_kv_output.worker_save_kv_time = save_time
-                logger.info(
-                    "[TTFT_DEBUG][Worker] deferred_save=%.6f", save_time
-                )
+                logger.info("[TTFT_DEBUG][Worker] deferred_save=%.6f", save_time)
             _pending_deferred_kv_output = None
         return save_time
 
@@ -152,8 +161,11 @@ class KVConnectorModelRunnerMixin:
             logger.info(
                 "[TTFT_DEBUG][Worker] load=%.6f forward=%.6f save=%.6f "
                 "(defer_finalize=%s, wait_for_save=%s)",
-                load_kv_time, forward_time, save_kv_time,
-                defer_finalize, wait_for_save,
+                load_kv_time,
+                forward_time,
+                save_kv_time,
+                defer_finalize,
+                wait_for_save,
             )
 
             output.finished_sending, output.finished_recving = (

@@ -433,12 +433,14 @@ class IterationStats:
                 + output.load_kv_time
                 + output.forward_time
                 + output.save_kv_time
+                + output.kv_transfer_time
                 + output.update_time
             )
             logger.info(
                 "[TTFT][BREAKDOWN] req=%s ttft=%.6f "
                 "hash=%.6f ext_lookup=%.6f alloc=%.6f overhead=%.6f "
                 "load_kv=%.6f forward=%.6f save_kv=%.6f update=%.6f "
+                "kv_transfer=%.6f no_forward_steps=%d "
                 "residual=%.6f tokens=%d steps=%d",
                 output.request_id,
                 first_token_latency,
@@ -450,6 +452,8 @@ class IterationStats:
                 output.forward_time,
                 output.save_kv_time,
                 output.update_time,
+                output.kv_transfer_time,
+                output.ttft_no_forward_steps,
                 first_token_latency - breakdown_sum,
                 output.ttft_num_scheduled_tokens,
                 output.ttft_num_steps,
@@ -458,9 +462,7 @@ class IterationStats:
                 # These are retained existing events, not necessarily the
                 # initial queue interval (QUEUED can be overwritten on requeue).
                 # Do not subtract frontend wall time from core monotonic time.
-                queued_mono = (
-                    req_stats.queued_ts if req_stats.queued_ts > 0.0 else None
-                )
+                queued_mono = req_stats.queued_ts if req_stats.queued_ts > 0.0 else None
                 scheduled_mono = (
                     req_stats.scheduled_ts if req_stats.scheduled_ts > 0.0 else None
                 )
@@ -486,7 +488,8 @@ class IterationStats:
                         scheduled_mono,
                         req_stats.first_token_ts,
                         queue_wait,
-                        "available" if queue_wait is not None
+                        "available"
+                        if queue_wait is not None
                         else "unavailable_or_requeued",
                     )
         else:

@@ -243,7 +243,6 @@ class KVConnectorOutput:
     worker_forward_time: float = 0.0
     worker_save_kv_time: float = 0.0
 
-
     def is_empty(self):
         return (
             not self.finished_sending
@@ -317,7 +316,11 @@ class ModelRunnerOutput:
     worker_load_kv_time: float = 0.0
     worker_forward_time: float = 0.0
     worker_save_kv_time: float = 0.0
-
+    # True when this step ran only KV transfers (no model execution).
+    worker_no_forward_step: bool = False
+    # Pure connector wait time of a KV-transfer-only step; excludes the
+    # load phase (t0..t1) which stays in worker_load_kv_time. No overlap.
+    worker_kv_transfer_time: float = 0.0
 
     @staticmethod
     def with_kv_conn_output_only(
