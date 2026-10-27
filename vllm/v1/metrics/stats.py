@@ -407,12 +407,14 @@ class IterationStats:
                 + output.load_kv_time
                 + output.forward_time
                 + output.save_kv_time
+                + output.kv_transfer_time
                 + output.update_time
             )
             logger.info(
                 "[TTFT][BREAKDOWN] req=%s ttft=%.6f "
                 "hash=%.6f ext_lookup=%.6f alloc=%.6f overhead=%.6f "
                 "load_kv=%.6f forward=%.6f save_kv=%.6f update=%.6f "
+                "kv_transfer=%.6f no_forward_steps=%d "
                 "residual=%.6f",
                 output.request_id,
                 req_stats.first_token_latency,
@@ -424,7 +426,8 @@ class IterationStats:
                 output.forward_time,
                 output.save_kv_time,
                 output.update_time,
-                req_stats.first_token_latency - breakdown_sum,
+                output.kv_transfer_time,
+                output.ttft_no_forward_steps,
             )
         else:
             itl = engine_core_timestamp - req_stats.last_token_ts

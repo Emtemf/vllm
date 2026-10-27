@@ -175,7 +175,11 @@ class Request:
         self.ttft_load_kv_time = 0.0
         self.ttft_forward_time = 0.0
         self.ttft_save_kv_time = 0.0
-
+        # KV-transfer-only steps (no model execution), seen in PD-mixed
+        # deployments. kv_transfer_time holds their pure wait segment;
+        # without it the time vanishes from the breakdown.
+        self.ttft_kv_transfer_time = 0.0
+        self.ttft_no_forward_steps = 0
         # The number of NaNs in logits. A value greater than 0
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0

@@ -206,6 +206,10 @@ class EngineCoreOutput(
     load_kv_time: float = 0.0
     forward_time: float = 0.0
     save_kv_time: float = 0.0
+    # KV-transfer-only steps: pure connector wait with no model execution
+    # (PD-mixed deployments). Zero on PD-separated runs.
+    kv_transfer_time: float = 0.0
+    ttft_no_forward_steps: int = 0
     # EngineCore update_from_output time (per-step, divided by num_total_scheduled_reqs).
     update_time: float = 0.0
 
