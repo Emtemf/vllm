@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Host diagnostics, on by default; not an additive TTFT accounting model.
+"""Host diagnostics, always on; not an additive TTFT accounting model.
 
-Emitted unless VLLM_TTFT_DIAGNOSTICS=0 is set before process startup.
+Emitted unconditionally (VLLM_TTFT_DIAGNOSTICS is no longer read; the
+env gate was removed so logs are always available).
 Monotonic timestamps are comparable only within a host clock domain; stages
 and ranks can overlap. No device synchronization is performed, and logging
 failures are non-fatal.
@@ -15,36 +16,34 @@ import re
 import socket
 import time
 import uuid
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
 
-_ENABLED = os.environ.get("VLLM_TTFT_DIAGNOSTICS", "1") != "0"
 _LOGGER = logging.getLogger("vllm.ttft_diagnostics")
-_RUN_ID = uuid.uuid4().hex if _ENABLED else ""
-_HOST = socket.gethostname() if _ENABLED else ""
+_RUN_ID = uuid.uuid4().hex
+_HOST = socket.gethostname()
 _COUNTER = itertools.count()
 _CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "ttft_diagnostics", default=None
 )
-_NOOP = nullcontext()
 
 
 def enabled() -> bool:
-    return _ENABLED
+    """Diagnostics are always on; kept for call-site compatibility."""
+    return True
 
 
 def new_id(kind: str) -> str:
     """Return a bounded ASCII identifier, unique across forked processes too."""
     kind = "".join(
-        c if c.isascii() and (c.isalnum() or c in "_-") else "_"
-        for c in kind[:64]
+        c if c.isascii() and (c.isalnum() or c in "_-") else "_" for c in kind[:64]
     )
     return f"{kind}-{_RUN_ID}-{os.getpid()}-{next(_COUNTER)}"[:256]
 
 
 def current() -> dict[str, Any]:
-    return (_CONTEXT.get() or {}).copy() if _ENABLED else {}
+    return (_CONTEXT.get() or {}).copy()
 
 
 # Greppable offline format: `[TTFT_DIAG] event=<name> key=value ...`.
@@ -65,17 +64,13 @@ def _render_value(value: Any) -> str:
         if not value:
             return "[]"
         items = (
-            sorted(value, key=repr)
-            if isinstance(value, (set, frozenset))
-            else value
+            sorted(value, key=repr) if isinstance(value, (set, frozenset)) else value
         )
         return ",".join(_render_value(v) for v in items)
     text = str(value)
     if _SAFE_VALUE.match(text):
         return text
-    escaped = (
-        text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-    )
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
     return '"' + escaped + '"'
 
 
@@ -89,8 +84,6 @@ def _format_line(event: str, record: dict[str, Any]) -> str:
 
 
 def emit(event: str, **fields: Any) -> None:
-    if not _ENABLED:
-        return
     try:
         record = current()
         # A point event is not the enclosing span's end event. Explicit span
@@ -125,7 +118,7 @@ def _scope(fields: dict[str, Any]):
 
 
 def scope(**fields: Any):
-    return _scope(fields) if _ENABLED else _NOOP
+    return _scope(fields)
 
 
 @contextmanager
@@ -155,13 +148,11 @@ def _span(event: str, fields: dict[str, Any]):
 
 
 def span(event: str, **fields: Any):
-    return _span(event, fields) if _ENABLED else _NOOP
+    return _span(event, fields)
 
 
 def batch_fields(scheduler_output: Any) -> dict[str, Any]:
     """Snapshot existing IDs only; never retain a mutable scheduler payload."""
-    if not _ENABLED:
-        return {}
     return {
         "request_ids": tuple(scheduler_output.num_scheduled_tokens),
         "finished_request_ids": tuple(sorted(scheduler_output.finished_req_ids)),
