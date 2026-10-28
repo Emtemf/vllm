@@ -603,8 +603,7 @@ class EngineCore:
                 future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
-            with ttft_diag.span("engine_grammar"):
-                grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -752,31 +751,21 @@ class EngineCore:
                 if not scheduler_output.pending_structured_output_tokens:
                     # We aren't waiting for any tokens, get any grammar output
                     # and sample immediately.
-                    with ttft_diag.span(
-                        "engine_grammar", path="batch_queue", **diagnostic_fields
-                    ):
-                        grammar_output = self.scheduler.get_grammar_bitmask(
-                            scheduler_output
-                        )
-                    with ttft_diag.span(
-                        "engine_sample_submit", path="batch_queue", **diagnostic_fields
-                    ):
-                        future = self.model_executor.sample_tokens(
-                            grammar_output, non_block=True
-                        )
+                    grammar_output = self.scheduler.get_grammar_bitmask(
+                        scheduler_output
+                    )
+                    future = self.model_executor.sample_tokens(
+                        grammar_output, non_block=True
+                    )
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
 
+
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
-                if ttft_diag.enabled():
-                    ttft_diag.emit(
-                        "engine_batch_queued", queue_depth=len(batch_queue),
-                        **diagnostic_fields,
-                    )
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -841,23 +830,12 @@ class EngineCore:
                     )
             # We now have the tokens needed to compute the bitmask for the
             # deferred request. Get the bitmask and call sample tokens.
-            deferred_diagnostic_fields = ttft_diag.batch_fields(
+            grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
-            with ttft_diag.span(
-                "engine_grammar", path="batch_queue", deferred=True,
-                **deferred_diagnostic_fields,
-            ):
-                grammar_output = self.scheduler.get_grammar_bitmask(
-                    deferred_scheduler_output
-                )
-            with ttft_diag.span(
-                "engine_sample_submit", path="batch_queue", deferred=True,
-                **deferred_diagnostic_fields,
-            ):
-                future = self.model_executor.sample_tokens(
-                    grammar_output, non_block=True
-                )
+            future = self.model_executor.sample_tokens(
+                grammar_output, non_block=True
+            )
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed

@@ -358,8 +358,7 @@ class WorkerWrapperBase:
             global_rank=self.global_rank,
         )
         with ttft_diag.scope(**diagnostic_fields):
-            with ttft_diag.span("worker_mm_cache"):
-                self._apply_mm_cache(scheduler_output)
+            self._apply_mm_cache(scheduler_output)
             with ttft_diag.span("worker_execute"):
                 output = self.worker.execute_model(scheduler_output)
         return self._ttft_trace_output(output, diagnostic_fields)
