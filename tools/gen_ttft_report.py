@@ -15,7 +15,13 @@ Deploy matching vLLM and vllm-ascend diagnostics and retain startup TTFT_THREAD
 records. Mooncake's original batch_put_from_multi_buffers API and native phase
 logs are sufficient; no trace API is required. A build exposing optional trace
 APIs may remain installed. Old logs without execution/thread identity stay
-incomplete. Save details and volume default to TP0, not summed parallel ranks.
+incomplete. All observed TP ranks are shown by default; --tp-rank filters timings.
+
+The table flattens every step and observed TP, retaining grouped put phases.
+Tokenizer candidates are selectable in the page; known warmups are disabled.
+Manual legacy selections are display-only and never deduct from residual.
+The second flat DIAG table preserves execution/TP intervals and missing evidence.
+Local same-thread uncovered time is diagnostic only, never a residual deduction.
 """
 
 from __future__ import annotations
@@ -332,7 +338,8 @@ def choose_request(data, requested):
 
 
 def execution(record):
-    return record.get("execution_id") or record.get("ttft_execution_id") or ""
+    value = record.get("execution_id") or record.get("ttft_execution_id") or ""
+    return "" if value in ("null", "None") else value
 
 
 def select_steps(data, request, breakdown, mode, warnings):
@@ -415,6 +422,24 @@ def interval(record):
 
 
 def span_start(data, completion):
+    if completion.get("compact") == "true":
+        bounds = interval(completion)
+        start_wall = integer(completion.get("start_wall_ns"))
+        start_tid = integer(completion.get("start_native_tid"))
+        if (
+            bounds is None
+            or start_wall is None
+            or start_tid is None
+            or start_tid != completion.get("_native_tid")
+        ):
+            return None
+        start = dict(completion)
+        start.update(
+            event=completion.get("event", "") + "_start",
+            wall_ns=start_wall,
+            _compact_start=True,
+        )
+        return start
     starts = [
         r
         for r in data["diag"]
@@ -473,6 +498,8 @@ def inside_put(batch, start, finish):
         if first_wall is None:
             return False
         return lower <= first_wall <= batch["_wall"] <= upper
+    if start.get("_compact_start"):
+        return False
     return start["_line"] < batch["_first_line"] <= batch["_line"] < finish["_line"]
 
 
@@ -580,15 +607,13 @@ def save_rows(data, request, end, steps, requested_rank, warnings):
             if s["_worker"] is not None
         }
     )
-    rank = 0 if requested_rank is None else requested_rank
-    candidates = [w for w in workers if w[0] == rank]
-    selected = candidates[0] if candidates else None
-    if selected and sum(w[0] == selected[0] for w in candidates) > 1:
-        raise ValueError("同一个 TP 有多个 Worker PID，保存时间来源有歧义。")
-    if requested_rank is not None and selected is None:
-        raise ValueError(f"没有找到 TP{requested_rank} 的 Worker 保存日志。")
-    if selected is None:
+    if not workers:
         warnings.append("没有已关联 Worker 保存记录，保存明细缺失，不代表零耗时。")
+    if any(sum(w[0] == rank for w in workers) > 1 for rank in {w[0] for w in workers}):
+        raise ValueError("同一个 TP 有多个 Worker PID，请先截取同一次运行的日志。")
+    displayed = [w for w in workers if requested_rank is None or w[0] == requested_rank]
+    if requested_rank is not None and not displayed:
+        raise ValueError(f"没有找到 TP{requested_rank} 的 Worker 保存日志。")
     phase_map, unassigned = associate_puts(data, saves)
     if unassigned:
         warnings.append(
@@ -606,40 +631,74 @@ def save_rows(data, request, end, steps, requested_rank, warnings):
         all_tasks = [
             s for s in saves if exec_id and execution(s) == exec_id and task_key(s)
         ]
-        tasks = [s for s in all_tasks if s["_worker"] == selected]
-        boundaries = [
-            w for w in waits if execution(w) == exec_id and w["_worker"] == selected
-        ]
-        empty = (
-            not tasks
-            and len(boundaries) == 1
-            and number(boundaries[0].get("join")) == 0
-            and number(boundaries[0].get("enqueue")) is not None
-            and number(boundaries[0].get("enqueue")) >= 0
-        )
-        phases = []
-        for phase in range(4):
-            values = [phase_map[s["_line"]]["phases"][phase] for s in tasks]
-            phases.append(
-                sum(values) if values and all(v is not None for v in values) else None
+        ranks = []
+        for worker in displayed or [None]:
+            tasks = [
+                s for s in all_tasks if worker is not None and s["_worker"] == worker
+            ]
+            boundaries = [
+                w for w in waits if execution(w) == exec_id and w["_worker"] == worker
+            ]
+            empty = (
+                not tasks
+                and len(boundaries) == 1
+                and number(boundaries[0].get("join")) == 0
+                and number(boundaries[0].get("enqueue")) is not None
+                and number(boundaries[0].get("enqueue")) >= 0
             )
+            phases = []
+            for phase in range(4):
+                values = [phase_map[s["_line"]]["phases"][phase] for s in tasks]
+                phases.append(
+                    sum(values)
+                    if values and all(v is not None for v in values)
+                    else None
+                )
+            ranks.append(
+                {
+                    "worker": worker,
+                    "values": [total(tasks, field) for field in SAVE] + phases,
+                    "put": total(tasks, "put"),
+                    "empty": empty,
+                }
+            )
+        all_empty = (
+            not all_tasks
+            and workers
+            and all(
+                any(
+                    w["_worker"] == candidate
+                    and execution(w) == exec_id
+                    and number(w.get("join")) == 0
+                    for w in waits
+                )
+                for candidate in workers
+            )
+        )
         keys, byte_count = (
-            (0, 0) if empty else (total(tasks, "keys"), total(tasks, "bytes"))
+            (0, 0)
+            if all_empty
+            else (total(all_tasks, "keys"), total(all_tasks, "bytes"))
         )
         rows.append(
             {
-                "values": [total(tasks, field) for field in SAVE]
-                + phases
-                + [keys, None if byte_count is None else byte_count / 1048576],
-                "put": total(tasks, "put"),
-                "empty": empty,
-                "tasks": all_tasks,
-                "phase_map": phase_map,
-                "waits": boundaries,
-                "unassigned_puts": unassigned,
+                "ranks": ranks,
+                "volume": [keys, None if byte_count is None else byte_count / 1048576],
             }
         )
-    return rows, selected, saves
+    return rows, displayed, saves
+
+
+def _tokenizer_matches_request(record, request):
+    names = ids(record)
+    if len(names) != 1:
+        return False
+    external = next(iter(names))
+    # InputProcessor.assign_request_id appends eight random hex characters.
+    return (
+        external == request
+        or re.fullmatch(re.escape(external) + r"-[0-9a-f]{8}", request) is not None
+    )
 
 
 def tokenizer_for_request(data, request, end, warnings):
@@ -647,7 +706,7 @@ def tokenizer_for_request(data, request, end, warnings):
         r
         for r in data["tok"]
         if r["_line"] < end
-        and ids(r) == {request}
+        and _tokenizer_matches_request(r, request)
         and r.get("purpose") == "business"
         and integer(r.get("n")) not in (None, 0)
     ]
@@ -659,7 +718,7 @@ def tokenizer_for_request(data, request, end, warnings):
                 r
                 for r in data["diag"]
                 if r.get("event") == name
-                and ids(r) == {request}
+                and _tokenizer_matches_request(r, request)
                 and r.get("purpose") == "business"
                 and r["_line"] < end
             ]
@@ -678,7 +737,7 @@ def tokenizer_for_request(data, request, end, warnings):
             r
             for r in data["diag"]
             if r.get("event") == name
-            and ids(r) == {request}
+            and _tokenizer_matches_request(r, request)
             and r.get("purpose") == "business"
             and r["_line"] < end
         ]
@@ -711,8 +770,8 @@ font:15px/1.65 'Segoe UI','Microsoft YaHei',sans-serif}h1{font-size:24px;margin:
 border:1px solid var(--border);background:#f0f7fc;margin:12px 0}
 .request b{margin-right:18px}
 .scroll{overflow-x:auto;max-width:100%;border:1px solid var(--border)}
-table{border-collapse:separate;border-spacing:0;width:100%;min-width:1650px;
-font:14px/1.6 ui-monospace,Consolas,monospace;white-space:nowrap}
+table{border-collapse:separate;border-spacing:0;width:100%;min-width:1800px;
+font:13px/1.6 ui-monospace,Consolas,monospace;white-space:nowrap}
 th,td{border-right:1px solid var(--border);border-bottom:1px solid var(--border);
 padding:8px;text-align:right}
 thead th{text-align:center;font-family:'Segoe UI',sans-serif}
@@ -720,10 +779,17 @@ th:first-child{position:sticky;left:0;text-align:left;background:var(--surface);
 .ec{background:var(--ec)}.wk{background:var(--wk)}.store{background:var(--store)}
 .put{background:var(--put)}.total td{text-align:center;font-weight:600}
 .missing{color:#697b89}
+.step-start>*{border-top:2px solid var(--border)}
+.rank{text-align:left;background:var(--store)}
 details{margin:12px 0;border:1px solid var(--border);padding:9px 14px}
 summary{cursor:pointer}li{margin:5px 0}.warning{border-left:4px solid #b77719;
 background:#fff8e8;padding:10px 16px;margin:12px 0;font-size:14px}
 code{overflow-wrap:anywhere}a{color:#215b8e}
+#diag-table{table-layout:fixed}
+#diag-table td,#diag-table th{white-space:normal;overflow-wrap:anywhere;
+text-align:left;vertical-align:top}
+#residual-evidence{min-width:800px;white-space:normal}
+#residual-evidence td{text-align:left;vertical-align:top;overflow-wrap:anywhere}
 """
 
 
@@ -735,340 +801,256 @@ def evidence(record):
     )
 
 
-def span_description(record):
-    bounds = interval(record)
-    duration = None if bounds is None else (bounds[1] - bounds[0]) / 1e9
-    status = "完整区间" if bounds is not None else "区间缺失/不一致"
-    identity = " · ".join(
-        f"{key}={record[key]}"
-        for key in (
-            "timing_scope",
-            "host",
-            "pid",
-            "run_id",
-            "native_tid",
-            "tp_rank",
-            "span_id",
-            "parent_span_id",
-            "start_ns",
-            "end_ns",
-            "status",
-        )
-        if key in record
-    )
-    return (
-        f"<li><b>{escape(record.get('event', 'span'))}</b>: {fmt(duration)} s · "
-        f"{status} · {escape(identity)}{evidence(record)}</li>"
-    )
+DIAG_ENGINE = (
+    "engine_schedule",
+    "engine_execute_submit",
+    "engine_execute_wait",
+    "engine_result_wait",
+    "engine_sample",
+    "engine_update",
+)
+DIAG_WORKER = (
+    "worker_execute",
+    "worker_sample",
+    "worker_output_materialize",
+    "worker_load",
+    "worker_forward",
+    "worker_save",
+)
 
 
-def visible_span(record, records):
-    if not record.get("event", "").endswith("_start"):
-        return True
-    return not any(
-        other.get("span_id") == record.get("span_id")
-        and record.get("span_id")
-        and same_clock(record, other)
-        and not other.get("event", "").endswith("_start")
-        for other in records
-    )
+def diag_domain(record):
+    """A process-local monotonic clock; absent identities never compare equal."""
+    domain = (record.get("host"), record.get("_pid"), record.get("run_id"))
+    return domain if all(v not in (None, "", "null", "None") for v in domain) else None
 
 
-def task_exclusive(data, parent, puts, save):
-    """Subtract complete same-task put descendants on the same clock/thread."""
-    bounds = interval(parent)
-    if bounds is None or parent["_thread"] is None or span_start(data, parent) is None:
-        return None
-    starts = [
+def interval_union(intervals):
+    """Measure an interval union, including overlapping/nested children once."""
+    merged = []
+    for start, finish in sorted(intervals):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(finish, merged[-1][1]))
+        else:
+            merged.append((start, finish))
+    return sum(finish - start for start, finish in merged)
+
+
+def diagnostic_table(data, request, steps, end):
+    """Summarize measured stage boundaries without claiming a critical path."""
+    selected = {
+        execution(step): f"step{i}" for i, step in enumerate(steps) if execution(step)
+    }
+    records = [
         r
         for r in data["diag"]
-        if r.get("event") == "store_backend_put_start"
-        and task_key(r) == task_key(parent)
-        and same_clock(r, parent)
-    ]
-    if len(starts) != len(puts):
-        return None
-    if not puts:
-        return (
-            (bounds[1] - bounds[0]) / 1e9
-            if (integer(save.get("keys")) == 0 and integer(save.get("bytes")) == 0)
-            else None
-        )
-    if total(puts, "count") != number(save.get("keys")):
-        return None
-    if total(puts, "bytes") != number(save.get("bytes")):
-        return None
-    windows = []
-    for child in puts:
-        window = interval(child)
-        if (
-            window is None
-            or not same_clock(parent, child)
-            or child["_thread"] != parent["_thread"]
-            or task_key(child) != task_key(parent)
-            or not parent.get("span_id")
-            or window[0] < bounds[0]
-            or window[1] > bounds[1]
-            or span_start(data, child) is None
-        ):
-            return None
-        windows.append(window)
-    covered = 0
-    cursor = bounds[0]
-    for start, end in sorted(windows):
-        covered += max(0, end - max(cursor, start))
-        cursor = max(cursor, end)
-    return (bounds[1] - bounds[0] - covered) / 1e9
-
-
-def worker_uncovered(data, parent):
-    """Return only proven same-thread gaps inside a complete Worker call."""
-    bounds = interval(parent)
-    if (
-        bounds is None
-        or parent["_thread"] is None
-        or span_start(data, parent) is None
-        or not execution(parent)
-    ):
-        return None
-    children = [
-        r
-        for r in data["diag"]
-        if execution(r) == execution(parent)
-        and same_clock(r, parent)
-        and r["_thread"] == parent["_thread"]
-        and r.get("event") in ("worker_load", "worker_forward", "worker_save")
+        if r["_line"] < end
+        and r.get("event") in DIAG_ENGINE + DIAG_WORKER
+        and (execution(r) in selected or request in ids(r))
         and interval(r) is not None
-        and bounds[0] <= interval(r)[0] <= interval(r)[1] <= bounds[1]
+        and diag_domain(r) is not None
+        and r.get("status") in (None, "ok")
     ]
-    if any(
-        sum(r.get("event") == event for r in children) != 1
-        for event in ("worker_load", "worker_forward")
-    ):
-        return None
-    for start in data["diag"]:
-        if (
-            start.get("event") in ("worker_load_start", "worker_save_start")
-            and execution(start) == execution(parent)
-            and same_clock(start, parent)
-            and start["_thread"] == parent["_thread"]
-            and bounds[0] <= (integer(start.get("start_ns")) or -1) <= bounds[1]
-            and not any(span_start(data, child) is start for child in children)
-        ):
+    groups = defaultdict(list)
+    for record in records:
+        groups[(execution(record), diag_domain(record))].append(record)
+
+    def unique(group, *events):
+        found = [r for r in group if r.get("event") in events]
+        return found[0] if len(found) == 1 else None
+
+    def duration(record):
+        return None if record is None else integer(record["duration_ns"]) / 1e9
+
+    def before(parent, child):
+        if parent is None or child is None:
             return None
-    covered, cursor = 0, bounds[0]
-    for start, end in sorted(interval(r) for r in children):
-        covered += max(0, end - max(cursor, start))
-        cursor = max(cursor, end)
-    return (bounds[1] - bounds[0] - covered) / 1e9
+        a, b = interval(parent), interval(child)
+        if not a[0] <= b[0] <= b[1] <= a[1]:
+            return None
+        return (b[0] - a[0]) / 1e9
 
-
-def hierarchy(data, request, steps, rows, raw_saves, end):
-    output = [
-        (
-            "<details open><summary>请求 → execution → TP / save task → put · "
-            f"{escape(request)}</summary>"
-        )
-    ]
-    associated = set()
-    for step, row in zip(steps, rows):
-        exec_id = execution(step)
-        if not exec_id:
-            continue
-        output.append(f"<details><summary>execution {escape(exec_id)}</summary>")
-        output.append(evidence(step))
-        spans = [
-            r
-            for r in data["diag"]
-            if execution(r) == exec_id and (not ids(r) or ids(r) == {request})
-        ]
-        engine_spans = [
-            r
-            for r in spans
-            if visible_span(r, spans)
-            and not r.get("event", "").startswith(("worker_", "store_"))
-        ]
-        output.append("<h3>Engine · shared_batch_host</h3><ul>")
-        output.extend(span_description(r) for r in engine_spans)
-        if not engine_spans:
-            output.append("<li>缺少 Engine 区间；不由总耗时均分。</li>")
-        output.append("</ul>")
-        workers = sorted(
-            {
-                r["_worker"]
-                for r in spans
-                + row["tasks"]
-                + [r for r in data["wfs"] if execution(r) == exec_id]
-                if r["_worker"] is not None
-            }
-        )
-        for worker in workers:
-            output.append(
-                f"<details><summary>TP{worker[0]} / PID {worker[1]}</summary><ul>"
+    rows = []
+    for (identity, domain), group in sorted(
+        groups.items(), key=lambda item: str(item[0])
+    ):
+        engine = any(r["event"] in DIAG_ENGINE for r in group)
+        execute = unique(group, "worker_execute")
+        load = unique(group, "worker_load")
+        forward = unique(group, "worker_forward")
+        save = unique(group, "worker_save")
+        sample = unique(group, "worker_sample")
+        if engine:
+            stages = [
+                ("schedule", unique(group, "engine_schedule")),
+                ("submit", unique(group, "engine_execute_submit")),
+                (
+                    "result_wait",
+                    unique(group, "engine_result_wait", "engine_execute_wait"),
+                ),
+                ("update", unique(group, "engine_update")),
+            ]
+            values = "；".join(f"{name}={fmt(duration(r))}" for name, r in stages)
+            own = [interval(r) for _, r in stages if r is not None]
+            gap = None
+            if len(own) == len(stages) and all(ids(r) == {request} for _, r in stages):
+                left, right = min(a for a, _ in own), max(b for _, b in own)
+                windows = [
+                    (max(left, a), min(right, b))
+                    for r in records
+                    if diag_domain(r) == domain and r["event"] in DIAG_ENGINE
+                    for a, b in [interval(r)]
+                    if a < right and b > left
+                ]
+                gap = (right - left - interval_union(windows)) / 1e9
+            note = (
+                "间隔已排除同进程其他轮次的已记录工作；不是 CPU 空闲或直接 residual。"
             )
-            worker_spans = [
-                r
-                for r in spans
-                if r["_worker"] == worker
-                and r.get("event", "").startswith("worker_")
-                and visible_span(r, spans)
-            ]
-            output.extend(span_description(r) for r in worker_spans)
-            for parent in worker_spans:
-                if parent.get("event") == "worker_execute":
-                    uncovered = worker_uncovered(data, parent)
-                    output.append(
-                        "<li>Worker 外层未被已观测 load/forward/save 区间覆盖："
-                        f"{fmt(uncovered)} s；仅限该方法内，不直接加到 residual。</li>"
-                    )
-            output.append("</ul>")
-            worker_waits = [
-                r
-                for r in data["wfs"]
-                if execution(r) == exec_id
-                and r["_worker"] == worker
-                and (not ids(r) or ids(r) == {request})
-            ]
-            for wait in worker_waits:
-                status = (
-                    "未执行保存：显式 enqueue=0/join=0"
-                    if (
-                        number(wait.get("enqueue")) == 0
-                        and number(wait.get("join")) == 0
-                        and not any(s["_worker"] == worker for s in row["tasks"])
-                    )
-                    else "已记录同步 wait_for_save；不可视为任务数/成本加总"
+            role = "EngineCore"
+        else:
+            values = "；".join(
+                f"{name}={fmt(duration(r))}"
+                for name, r in (
+                    ("execute", execute),
+                    ("load", load),
+                    ("forward", forward),
+                    ("save", save),
+                    ("sample", sample),
                 )
-                output.append(f"<p>{status}</p>{evidence(wait)}")
-            tasks = [s for s in row["tasks"] if s["_worker"] == worker]
-            if not tasks:
-                output.append(
-                    "<p>无已关联任务；仅显式无任务 join=0 边界可证明未执行，"
-                    "缺日志不等于零。</p>"
-                )
-            orphan_spans = [
-                r
-                for r in spans
-                if r["_worker"] == worker
-                and r.get("event", "").startswith("store_")
-                and not any(task_key(s) == task_key(r) for s in tasks)
-            ]
-            if orphan_spans:
-                output.append(
-                    "<details><summary>缺少保存汇总的 task/put 区间</summary><ul>"
-                )
-                output.extend(span_description(r) for r in orphan_spans)
-                output.append("</ul></details>")
-            for save in tasks:
-                associated.add(save["_line"])
-                match = row["phase_map"][save["_line"]]
-                task_spans = [
-                    r
-                    for r in spans
-                    if r.get("event") == "store_task" and task_key(r) == task_key(save)
-                ]
-                puts = [
-                    r
-                    for r in spans
-                    if r.get("event") == "store_backend_put"
-                    and task_key(r) == task_key(save)
-                ]
-                exclusive = (
-                    task_exclusive(data, task_spans[0], puts, save)
-                    if len(task_spans) == 1
-                    else None
-                )
-                output.append(
-                    f"<details><summary>save task {escape(save.get('task_id'))} · "
-                    f"{escape(match['status'])} · "
-                    f"keys={escape(save.get('keys', '—'))} · "
-                    f"bytes={escape(save.get('bytes', '—'))}</summary>"
-                    f"<p>put={fmt(number(save.get('put')))} s；"
-                    "task 扣除完整同线程 put 区间并集后 "
-                    f"{fmt(exclusive)} s（不可计算时为 —，不跨进程减时间戳）。</p>"
-                )
-                output.append(evidence(save))
-                output.append("<ul>")
-                output.extend(span_description(r) for r in task_spans)
-                output.extend(
-                    span_description(r)
-                    for r in spans
-                    if task_key(r) == task_key(save)
-                    and r.get("event", "").startswith("store_")
-                    and r.get("event", "").endswith("_start")
-                    and visible_span(r, spans)
-                )
-                output.append("</ul>")
-                for put in puts:
-                    batches = [b for b in match["batches"] if b.get("_put_span") is put]
-                    output.append(
-                        "<details><summary>put "
-                        f"group={escape(put.get('group_id', '—'))} · "
-                        f"native_tid={escape(put.get('native_tid', '—'))} · "
-                        f"{len(batches)} 条原生 BatchPutTiming</summary><ul>"
-                    )
-                    output.append(span_description(put))
-                    for batch in batches:
-                        phase_text = " / ".join(
-                            fmt(number(batch.get(p))) for p in PHASES
-                        )
-                        output.append(
-                            f"<li>原生阶段 μs: {phase_text} · "
-                            f"{escape(batch['_phase_status'])} · "
-                            f"源行 {escape(batch['_phase_lines'])} · "
-                            f"keys={escape(batch.get('keys', '—'))} "
-                            f"bytes={escape(batch.get('bytes', '—'))}"
-                            + "".join(
-                                evidence(source)
-                                for source in data["timing"]
-                                if source["_line"] in batch["_phase_lines"]
-                            )
-                            + "</li>"
-                        )
-                    if not batches:
-                        output.append(
-                            "<li>原生阶段缺失/歧义；"
-                            "已执行 put span 不等于原生耗时为零。</li>"
-                        )
-                    output.append("</ul></details>")
-                output.append("</details>")
-            output.append("</details>")
-        output.append("</details>")
-    unmatched = [s for s in raw_saves if s["_line"] not in associated]
-    output.append(
-        "<details><summary>未归属 execution/task 的保存证据："
-        f"{len(unmatched)}</summary>"
-    )
-    output.extend(evidence(r) for r in unmatched)
-    output.append("</details>")
-    request_spans = [
-        r for r in data["diag"] if ids(r) == {request} and not execution(r)
+            )
+            gap = before(execute, load)
+            rank = next((r["_worker"][0] for r in group if r["_worker"]), None)
+            role = "TP未知" if rank is None else f"TP{rank}"
+            note = "execute 开始至 load 开始的间隔，含输入准备及等待，不是纯 CPU 时间。"
+            if save is not None and save.get("deferred") == "true":
+                note += " save 在 execute 外延迟完成，不与 sample 重复相加。"
+        source = ", ".join(str(r["_line"]) for r in group)
+        cells = [
+            selected.get(identity, "未关联"),
+            role,
+            values,
+            fmt(gap),
+            note,
+            f"{domain[1]} / 行 {source}",
+        ]
+        rows.append("<tr>" + "".join(f"<td>{escape(v)}</td>" for v in cells) + "</tr>")
+    unassigned = [
+        r
+        for r in data["diag"]
+        if r["_line"] < end
+        and r.get("event") in ("worker_sample", "worker_output_materialize")
+        and execution(r) not in selected
+        and not ids(r)
+        and interval(r) is not None
     ]
-    output.append(
-        "<details><summary>请求级核心区间 / residual 诊断（不可任意相加）</summary><ul>"
+    if not rows:
+        rows.append('<tr><td colspan="6">关键边界缺失；不能按日志顺序补配。</td></tr>')
+    return (
+        "<h2>二、执行阶段与间隔</h2>"
+        '<p class="note">单位 s。每行来自同一 execution 和 host/PID/run；'
+        "— 表示缺失、重复或边界不成立，不是 0。不同 TP 不相加。"
+        "EngineCore 与 Worker 不使用各自起点拼成共同时间线。</p>"
+        '<div class="scroll"><table id="diag-table"><thead><tr>'
+        "<th>轮次</th><th>角色</th><th>已记录阶段耗时</th><th>阶段间隔</th>"
+        "<th>结论与边界</th><th>PID / 来源行</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div>"
+        + f'<p class="note">另有 {len(unassigned)} 条 sample/结果物化缺少执行归属，'
+        "未按顺序分配到轮次。它们不影响表一的保存任务关联，亦不冒充请求 residual。</p>"
     )
-    output.extend(
-        span_description(r) for r in request_spans if visible_span(r, data["diag"])
+
+
+def residual_evidence(breakdown, tokenizer, queue, queue_time):
+    """Deduct only existing request-accounting evidence, never DIAG candidates."""
+    original = number(breakdown.get("residual"))
+    parts = []
+    proven = []
+    arrival = number(breakdown.get("frontend_arrival_wall_s"))
+    first = number(breakdown.get("frontend_iteration_wall_s"))
+    ttft = number(breakdown.get("ttft"))
+    envelope = (
+        first - arrival
+        if arrival is not None and first is not None and first >= arrival
+        else None
     )
-    if not request_spans:
-        output.append("<li>旧日志缺少请求级区间，不据 log 顺序制造独占时间。</li>")
-    output.append("</ul></details>")
-    unassigned = (
-        rows[0]["unassigned_puts"] if rows else associate_puts(data, raw_saves)[1]
+    if envelope is not None:
+        parts.append(
+            (
+                "请求 TTFT 起止核对",
+                fmt(envelope),
+                (
+                    "frontend wall 起止；与 BREAKDOWN.ttft 差值 "
+                    f"{fmt(None if ttft is None else envelope - ttft)} s。"
+                    "这是请求范围核对，不额外扣减，不据此跨机器对齐。"
+                ),
+            )
+        )
+    for name in ("render", "tokenize"):
+        value = number(tokenizer.get(name))
+        valid = not tokenizer.get("_manual") and value is not None and value >= 0
+        if valid:
+            proven.append(value)
+        sources = tokenizer.get("_sources", [tokenizer.get("_line")])
+        reason = (
+            "唯一 business 请求预处理；已在 TTFT 内且不属于 BREAKDOWN 原分项；来源行 "
+            + ", ".join(map(str, sources))
+            if valid
+            else "缺少唯一业务请求的非负预处理证据；人工选择不作为扣减依据"
+        )
+        parts.append((name, fmt(value if valid else None), reason))
+    if queue_time is not None:
+        proven.append(queue_time)
+    parts.append(
+        (
+            "首次 Scheduler queue",
+            fmt(queue_time),
+            f"有效首次 QUEUED→SCHEDULED，来源行 {queue['_line']}"
+            if queue_time is not None
+            else "首次 queue 证据缺失、重复或有效性字段不满足；不是已知 0",
+        )
     )
-    output.append(
-        f"<details><summary>未唯一归属的原生 put：{len(unassigned)}</summary>"
+    unresolved = None if original is None else original - sum(proven)
+    rows = [
+        (
+            "原始 BREAKDOWN residual",
+            fmt(original),
+            f"保留原值，来源 {breakdown['_source']}:{breakdown['_line']}",
+        ),
+        *parts,
+        (
+            "阶段间隔的请求归因",
+            "见执行阶段表",
+            (
+                "EngineCore 间隔和 Worker 的 load 前时间已分别定位；"
+                "它们不是新的独立 TTFT 分项，不跨 TP 累加或直接从 residual 扣减。"
+                "sample 缺 execution 时仍不按顺序猜测。"
+            ),
+        ),
+        (
+            "已证明扣减后的仍未归因金额",
+            fmt(unresolved),
+            (
+                "仅减上方有效预处理/首次 queue；保留所有未证明 DIAG 候选。"
+                "负值不截断，应核对范围/舍入/关联；不是独占耗时或 NPU 时间。"
+            ),
+        ),
+    ]
+    return (
+        "<h2>三、请求 residual 证据对账</h2>"
+        '<p class="note">固定使用生成时核对的业务证据；'
+        "页面人工 Tokenizer 选择仅改变查看值。"
+        "即使首次 queue 缺失，仍展示已证明的预处理扣减及余下未归因金额，"
+        "不把缺失 queue 当作零；上方“剩余 residual”完整分解读数仍为 —。"
+        "DIAG 本地未覆盖不是请求 residual，"
+        "不能把各 TP、sample、保存等待相加后认领。</p>"
+        '<div class="scroll"><table id="residual-evidence"><thead><tr>'
+        "<th>项目</th><th>时间 (s)</th><th>证据与限制</th></tr></thead><tbody>"
+        + "".join(
+            "<tr>" + "".join(f"<td>{escape(value)}</td>" for value in row) + "</tr>"
+            for row in rows
+        )
+        + "</tbody></table></div>"
     )
-    output.extend(evidence(r) for r in unassigned)
-    output.append("</details>")
-    output.append(
-        "<p class='note'>TP 时间并行，仅逐 rank 展示，绝不相加为请求成本；"
-        "数据量可累加。区间 start_ns/end_ns 为同机单调时钟；"
-        "wall_ns 仅作原生日志关联桥。"
-        "独占值仅由相同 host/PID/run/原生线程和 task 的完整区间并集计算；"
-        "未完整覆盖时为缺失。所有来源可展开查看。</p></details>"
-    )
-    return "".join(output)
 
 
 def render(
@@ -1077,15 +1059,19 @@ def render(
     warnings = []
     request, bd = choose_request(data, req_filter)
     steps, end = select_steps(data, request, bd, mode, warnings)
-    saves, worker, raw_saves = save_rows(data, request, end, steps, tp_rank, warnings)
+    saves, workers, raw_saves = save_rows(data, request, end, steps, tp_rank, warnings)
     tok = tokenizer_for_request(data, request, bd["_line"], warnings)
+    diag_html = diagnostic_table(data, request, steps, end)
     if tokenizer_line is not None:
         candidates = [t for t in data["tok"] if t["_line"] == tokenizer_line]
         if (
             len(candidates) != 1
             or tokenizer_line >= bd["_line"]
             or candidates[0].get("purpose") in ("warmup", "unscoped")
-            or (ids(candidates[0]) and ids(candidates[0]) != {request})
+            or (
+                ids(candidates[0])
+                and not _tokenizer_matches_request(candidates[0], request)
+            )
         ):
             raise ValueError("--tokenizer-line 不是目标请求的可用 Tokenizer 证据。")
         if not tok:
@@ -1129,60 +1115,56 @@ def render(
         delta = ttft - sum(known_values) - residual
     body = []
     for index, (step, save) in enumerate(zip(steps, saves)):
-        cells = [
+        span = len(save["ranks"])
+        shared = [
             (
-                f'<th scope="row" title="{escape(execution(step) or "执行身份缺失")}">'
-                f"step{index}</th>"
+                f'<th scope="rowgroup" rowspan="{span}" '
+                f'title="{escape(execution(step) or "执行身份缺失")}">step{index}</th>'
             ),
-            '<td title="请求级 TTFT 仅在总计行展示"></td>',
-            '<td title="请求级 tokenizer 仅在总计行展示"></td>',
+            f'<td rowspan="{span}" title="请求级 TTFT 仅在总计行展示"></td>',
+            f'<td rowspan="{span}" title="请求级 tokenizer 仅在总计行展示"></td>',
         ]
-        values = [number(step.get(k)) for k in ENGINE] + save["values"]
-        for column, value in enumerate(values):
-            if column == 6:
-                wait = save["waits"][0] if len(save["waits"]) == 1 else {}
-                selected_tasks = [
-                    task for task in save["tasks"] if task["_worker"] == worker
-                ]
-                interface_values = [
-                    number(step.get("save")),
-                    number(wait.get("wait_for_save")),
-                    number(wait.get("enqueue")),
-                    number(wait.get("join")),
-                    total(selected_tasks, "total"),
-                ]
-                cells.extend(f"<td>{fmt(item)}</td>" for item in interface_values)
-            if 11 <= column <= 14 and (
-                save["empty"]
-                or (
-                    save["put"] is not None
-                    and any(v is None for v in save["values"][5:9])
-                )
-            ):
-                if column == 11:
-                    label = (
-                        "未执行保存（无任务、join=0）"
-                        if save["empty"]
-                        else f"{fmt(save['put'])} s（put 总耗时；四阶段未关联）"
-                    )
-                    cells.append(f'<td class="put" colspan="4">{label}</td>')
-                continue
-            if save["empty"] and 6 <= column <= 10:
-                cells.append('<td class="missing">未执行</td>')
-                continue
-            classes = "put" if 11 <= column <= 14 else ""
-            if value is None:
-                classes += " missing"
-            digits = 0 if column == 15 else 1 if column == 16 else 6
-            title = f"EngineCore 日志行 {step['_line']}" if column < 6 and step else ""
-            cells.append(
-                f'<td class="{classes.strip()}" title="{escape(title)}">'
-                f"{fmt(value, digits)}</td>"
+        for key in ENGINE:
+            shared.append(
+                f'<td rowspan="{span}" '
+                f'title="EngineCore 日志行 {step.get("_line", "—")}">'
+                f"{fmt(number(step.get(key)))}</td>"
             )
-        body.append("<tr>" + "".join(cells) + "</tr>")
-    worker_text = (
-        "未知 Worker" if worker is None else f"TP{worker[0]} / PID {worker[1]}"
-    )
+        for rank_index, rank in enumerate(save["ranks"]):
+            worker = rank["worker"]
+            label = "缺失" if worker is None else f"TP{worker[0]}"
+            source = "Worker 身份缺失" if worker is None else f"Worker PID {worker[1]}"
+            cells = list(shared) if rank_index == 0 else []
+            cells.append(f'<td class="rank" title="{escape(source)}">{label}</td>')
+            for column, value in enumerate(rank["values"]):
+                if column >= 5 and (
+                    rank["empty"]
+                    or (
+                        rank["put"] is not None
+                        and any(v is None for v in rank["values"][5:])
+                    )
+                ):
+                    if column == 5:
+                        label = (
+                            "未执行保存（无任务、join=0）"
+                            if rank["empty"]
+                            else f"{fmt(rank['put'])} s（put 总耗时；四阶段未关联）"
+                        )
+                        cells.append(f'<td class="put" colspan="4">{label}</td>')
+                    continue
+                if rank["empty"]:
+                    cells.append('<td class="missing">未执行</td>')
+                    continue
+                classes = "put" if column >= 5 else ""
+                if value is None:
+                    classes += " missing"
+                cells.append(f'<td class="{classes.strip()}">{fmt(value)}</td>')
+            if rank_index == 0:
+                for value, digits in zip(save["volume"], (0, 1)):
+                    cells.append(f'<td rowspan="{span}">{fmt(value, digits)}</td>')
+            row_class = ' class="step-start"' if rank_index == 0 else ""
+            body.append(f"<tr{row_class}>" + "".join(cells) + "</tr>")
+    worker_text = ", ".join(f"TP{w[0]} / PID {w[1]}" for w in workers) or "未知 Worker"
     key_total = total(raw_saves, "keys")
     byte_total = total(raw_saves, "bytes")
     data_summary = (
@@ -1205,11 +1187,67 @@ def render(
         and all(v is not None for v in residual_parts)
     ):
         remaining = residual - sum(residual_parts)
+    residual_html = residual_evidence(bd, tok, queue, queue_time)
     warning_html = ""
+    options = ['<option value="">待选择：确认目标请求的分词记录</option>']
+    if tok:
+        options.append(
+            '<option value="auto" selected '
+            f'data-render="{fmt(number(tok.get("render")))}" '
+            f'data-tokenize="{fmt(number(tok.get("tokenize")))}" '
+            f'data-source="{escape(tokenizer_source)}" '
+            f'data-remaining="{fmt(remaining)}" '
+            f'data-manual="{str(bool(tok.get("_manual"))).lower()}">'
+            + ("人工命令行选择" if tok.get("_manual") else "自动关联当前请求")
+            + "</option>"
+        )
+    for candidate in data["tok"]:
+        if candidate["_line"] >= bd["_line"]:
+            continue
+        purpose = candidate.get("purpose")
+        reason = (
+            "预热，不计入请求"
+            if purpose == "warmup"
+            else "无业务归属，禁止认领"
+            if purpose == "unscoped"
+            else "其他请求"
+            if ids(candidate) and not _tokenizer_matches_request(candidate, request)
+            else "无有效输入"
+            if integer(candidate.get("n")) in (None, 0)
+            else ""
+        )
+        label = (
+            f"行 {candidate['_line']} · render={fmt(number(candidate.get('render')))} s"
+            f" · tokenize={fmt(number(candidate.get('tokenize')))} s"
+            f" · {reason or '候选，人工确认'}"
+        )
+        options.append(
+            f'<option value="{candidate["_line"]}" '
+            f'data-render="{fmt(number(candidate.get("render")))}" '
+            f'data-tokenize="{fmt(number(candidate.get("tokenize")))}" '
+            f'data-source="{candidate["_line"]}" data-remaining="—"'
+            + (" disabled" if reason else "")
+            + f">{escape(label)}</option>"
+        )
     tokenizer_control = (
-        "Tokenizer 依据唯一 business 请求身份自动关联；warmup/unscoped 不参与。"
+        '<label for="tokenizer-select">Tokenizer 来源：</label>'
+        '<select id="tokenizer-select" disabled>' + "".join(options) + "</select>"
+        '<button id="tokenizer-apply" type="button" disabled>应用选择</button>'
+        '<br><output id="tokenizer-selection" aria-live="polite">'
+        f"当前显示：render={fmt(number(tok.get('render')))} s；"
+        f"tokenize={fmt(number(tok.get('tokenize')))} s；来源行 {tokenizer_source}"
+        "</output><br>"
+        '<span id="tokenizer-status">'
+        + (
+            "人工选择，仅供查看"
+            if tok.get("_manual")
+            else "已自动关联当前请求"
+            if tok
+            else "未关联，请核对候选"
+        )
+        + "</span>"
     )
-    hierarchy_html = hierarchy(data, request, steps, saves, raw_saves, end)
+    save_evidence = "".join(evidence(r) for r in raw_saves)
     queue_evidence = evidence(queue) if queue else "<p>QUEUE 证据缺失或多条歧义。</p>"
     tokenizer_evidence = "".join(
         evidence(r)
@@ -1234,57 +1272,70 @@ def render(
         transfer_summary = f"、kv_transfer={fmt(number(bd['kv_transfer']))} s"
     document = f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TTFT 逐 step 统计 · {escape(request)}</title><style>{CSS}</style></head><body>
-<h1>TTFT 逐 step 统计</h1>
+<title>TTFT 逐 step × TP 统计 · {escape(request)}</title>
+<style>{CSS}</style></head><body>
+<h1>TTFT 逐 step × TP 统计</h1>
 <div class="meta">请求 <code>{escape(request)}</code> · mode={escape(mode)} ·
 {len(steps)} steps ·
-保存耗时固定 {escape(worker_text)} · 时间 s，数据量 MiB</div>
+保存明细：{escape(worker_text)} · 时间 s，数据量 MiB</div>
 <div class="request">render
 <b><span id="render-value">{fmt(number(tok.get("render")))}</span> s</b>
 首次 Scheduler 排队 <b>{fmt(queue_time)} s</b>
 update <b>{fmt(number(bd.get("update")))} s</b>
 剩余 residual <b id="remaining-value">{fmt(remaining)} s</b><br>{data_summary}</div>
-<p>{tokenizer_control}</p>
+<div class="request">{tokenizer_control}</div>
+<p id="tokenizer-script-warning" class="warning">
+页面交互尚未启用，选择器暂不可用。请下载 HTML 后用 Chrome / Edge 直接打开并允许
+JavaScript，不要在禁用脚本的聊天或文件预览中操作。
+也可用 --tokenizer-line 指定来源行后重新生成报告；手工旧记录仍不扣减 residual。</p>
 <p class="note">请求分解：TTFT = render + tokenize + 首次排队 + schedule
 + load_kv + forward + save_kv + update
 {" + kv_transfer" if "kv_transfer" in bd else ""} + 剩余 residual。
 仅对唯一关联的预处理与有效首次排队作扣减；缺失时剩余值显示 —。
 原始 BREAKDOWN 及其对账保留在下方来源中。</p>
 {warning_html}
-<div class="scroll" tabindex="0" aria-label="逐 step 统计表，可横向滚动"><table><thead>
+<div class="scroll" tabindex="0" aria-label="逐 step × TP 统计表，可横向滚动">
+<table id="main-table"><thead>
 <tr><th>行</th><th>TTFT (s)</th><th>tokenizer (s)</th>
 <th colspan="4" class="ec">schedule (s)</th><th class="wk">start_load_kv (s)</th>
-<th class="wk">forward (s)</th><th class="wk">EngineCore save (s)</th>
-<th colspan="15" class="store">所选 TP 保存明细（嵌套计时，不另加到 TTFT）</th></tr>
+<th class="wk">forward (s)</th>
+<th colspan="12" class="store">wait_for_save (s)</th></tr>
 <tr class="total"><th>总计</th><td>{fmt(ttft)}</td>
 <td id="tokenizer-value">{fmt(number(tok.get("tokenize")))}</td>
 <td colspan="4">{fmt(schedule)}</td>
 <td>{fmt(number(bd.get("load_kv")))}</td><td>{fmt(number(bd.get("forward")))}</td>
-<td>{fmt(number(bd.get("save_kv")))}</td>
-<td colspan="15" class="store">BREAKDOWN.save_kv 是各轮 EngineCore save 累计；
-右侧明细固定 {escape(worker_text)}，不是请求分项之和。</td></tr>
+<td colspan="12" class="store">
+{fmt(number(bd.get("save_kv")))} · BREAKDOWN.save_kv</td></tr>
 <tr><th rowspan="2">执行轮次</th><th rowspan="2"></th><th rowspan="2"></th>
 <th rowspan="2" class="ec">hash</th>
 <th rowspan="2" class="ec">ext_lookup</th><th rowspan="2" class="ec">alloc</th>
 <th rowspan="2" class="ec">other</th><th rowspan="2" class="wk">load</th>
-<th rowspan="2" class="wk">forward</th><th rowspan="2" class="wk">save</th>
-<th rowspan="2">wait_for_save</th><th rowspan="2">enqueue</th>
-<th rowspan="2">join</th><th rowspan="2">task_total</th>
-<th rowspan="2" class="store">q_wait</th>
-<th rowspan="2" class="store">build_key</th><th rowspan="2" class="store">lookup</th>
-<th rowspan="2" class="store">prepare</th><th rowspan="2" class="store">sync</th>
-<th colspan="4" class="put">Mooncake put 阶段</th>
-<th rowspan="2" class="store">keys (所选TP)</th>
-<th rowspan="2" class="store">MiB (所选TP)</th></tr>
-<tr><th class="put">start</th><th class="put">submit</th><th class="put">wait</th>
-<th class="put">finalize</th></tr></thead><tbody>{"".join(body)}</tbody></table></div>
-<p class="note">TTFT/tokenizer 仅在总计行展示。save 累计取 EngineCore；
-保存接口、任务与 Mooncake 阶段是嵌套计时，不相互累加。
-保存时间和 keys/MiB 均固定 {escape(worker_text)}（默认 TP0）；
-只累计同 TP 的串行 put，不跨 TP 相加或逐列取最大值。
-其他 TP 及全部 TP 数据量保留在下方分层证据和摘要中。
-“—”表示缺失或无法关联，不表示 0。无任务但 enqueue 非零时仍展示实际接口开销。</p>
-{hierarchy_html}
+<th rowspan="2" class="wk">forward</th>
+<th rowspan="2" class="store">TP</th>
+<th rowspan="2" class="store"
+title="保存任务从入队到保存线程开始处理的等待；不是 Scheduler 排队或外层 join">
+q_wait</th>
+<th rowspan="2" class="store">build_key</th>
+<th rowspan="2" class="store">lookup</th>
+<th rowspan="2" class="store">prepare</th>
+<th rowspan="2" class="store">sync</th>
+<th colspan="4" class="put">put</th>
+<th rowspan="2" class="store">keys (全部TP)</th>
+<th rowspan="2" class="store">MiB (全部TP)</th></tr>
+<tr><th class="put">start</th>
+<th class="put">submit</th>
+<th class="put">wait</th>
+<th class="put">finalize</th>
+</tr></thead><tbody>{"".join(body)}</tbody></table></div>
+<p class="note">总计取请求级 BREAKDOWN；逐轮左侧取 EngineCore 记录；
+保存任务及 Mooncake 四阶段按 TP 独立分行，缺少某轮证据时保留缺失值；
+不跨 TP 相加或逐列取最大值。keys/MiB 汇总全部已记录 TP，每轮只展示一次，
+--tp-rank 仅筛选时间明细，不改变数据量统计。未出现的 TP 无法从日志推断。</p>
+<p class="note">
+wait_for_save 下方是保存相关明细，不代表各列相加等于外层接口时间。
+“—”表示缺失或无法关联，不表示 0。</p>
+{diag_html}
+{residual_html}
 <details><summary>数据来源与统计规则</summary><ul>
 <li>总计行、TTFT、原始 residual、update={fmt(number(bd.get("update")))} s
 {transfer_summary}
@@ -1300,10 +1351,43 @@ keys/bytes 必须同时对账。prefer_same_node 仅在同原生线程内配对�
 <li>Tokenizer 来源行 <span id="tokenizer-source">{tokenizer_source}</span>，
 QUEUE 来源行 {queue_source}。
 原始 residual={fmt(residual)} s；扣除已关联 render、tokenize、首次排队后为
-{fmt(remaining)} s。缺少任一扣减项时不声称已完成请求分解。</li>
+<span id="remaining-evidence">{fmt(remaining)}</span> s。
+人工候选只供查看，不作为已证明的 residual 扣减依据。</li>
 <li>QUEUE 仅有 initial_queue_valid=true、零 preemption、一次 QUEUED/SCHEDULED 时
 用于首次排队扣减；这不是请求累计排队量，旧日志无有效性证据则不扣减。</li>
-</ul>{queue_evidence}{tokenizer_evidence}</details></body></html>"""
+</ul>{queue_evidence}{tokenizer_evidence}{save_evidence}</details>
+<script>
+const tokenizerSelect = document.getElementById("tokenizer-select");
+function updateTokenizer() {{
+    const option = tokenizerSelect.selectedOptions[0];
+    if (!option || option.disabled) return;
+    document.getElementById("render-value").textContent = option.dataset.render || "—";
+    document.getElementById("tokenizer-value").textContent =
+        option.dataset.tokenize || "—";
+    document.getElementById("tokenizer-source").textContent =
+        option.dataset.source || "—";
+    document.getElementById("remaining-value").textContent =
+        option.dataset.remaining || "—";
+    document.getElementById("remaining-evidence").textContent =
+        option.dataset.remaining || "—";
+    document.getElementById("tokenizer-selection").textContent =
+        "当前显示：render=" + (option.dataset.render || "—") +
+        " s；tokenize=" + (option.dataset.tokenize || "—") +
+        " s；来源行 " + (option.dataset.source || "—");
+    document.getElementById("tokenizer-status").textContent =
+        !tokenizerSelect.value ? "未选择" :
+        tokenizerSelect.value === "auto" && option.dataset.manual !== "true"
+            ? "使用生成时已核对的记录"
+            : "人工选择，仅供查看；不据此扣减 residual";
+}}
+tokenizerSelect.addEventListener("input", updateTokenizer);
+tokenizerSelect.addEventListener("change", updateTokenizer);
+document.getElementById("tokenizer-apply").addEventListener("click", updateTokenizer);
+updateTokenizer();
+tokenizerSelect.disabled = false;
+document.getElementById("tokenizer-apply").disabled = false;
+document.getElementById("tokenizer-script-warning").hidden = true;
+</script></body></html>"""
     out.write_text(document, encoding="utf-8")
     print(f"OK -> {out} | req={request} steps={len(steps)} worker={worker_text}")
     print(
@@ -1320,7 +1404,7 @@ def main():
     parser.add_argument("--req", help="核对目标请求 ID；单请求日志可省略")
     parser.add_argument("--mode", choices=("prefill", "all"), default="prefill")
     parser.add_argument(
-        "--tp-rank", type=int, default=0, help="保存明细的 TP；默认 TP0"
+        "--tp-rank", type=int, help="仅显示指定 TP；默认平铺全部已识别 TP"
     )
     parser.add_argument(
         "--tokenizer-line",

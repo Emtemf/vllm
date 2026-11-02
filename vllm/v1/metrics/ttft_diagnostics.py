@@ -10,6 +10,9 @@ failures are non-fatal.
 
 Scheduler payloads carry execution_id through queued results. Batch host
 intervals overlap across ranks and must not be summed as request time.
+Spans emit one completion with monotonic bounds and start wall/thread provenance.
+Sample RPCs carry no execution ID; optional grammar IDs are only a batch subset.
+Actual output membership is available only after sampling/materialization.
 Deferred worker_save intervals retain the scope of their originating forward.
 The separate QUEUE record is subtractable only when initial_queue_valid=true;
 it never represents total queueing after requeue or preemption.
@@ -20,9 +23,10 @@ import logging
 import os
 import re
 import socket
+import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 from typing import Any
 
@@ -102,6 +106,7 @@ def emit(event: str, **fields: Any) -> None:
             event=event,
             host=_HOST,
             pid=os.getpid(),
+            native_tid=threading.get_native_id(),
             run_id=_RUN_ID,
             mono_ns=time.monotonic_ns(),
             wall_ns=time.time_ns(),
@@ -114,13 +119,19 @@ def emit(event: str, **fields: Any) -> None:
 
 @contextmanager
 def _scope(fields: dict[str, Any]):
-    context = current()
-    context.update(fields)
-    token = _CONTEXT.set(context)
+    token = None
+    try:
+        context = current()
+        context.update(fields)
+        token = _CONTEXT.set(context)
+    except Exception:
+        pass
     try:
         yield
     finally:
-        _CONTEXT.reset(token)
+        if token is not None:
+            with suppress(Exception):
+                _CONTEXT.reset(token)
 
 
 def scope(**fields: Any):
@@ -129,28 +140,49 @@ def scope(**fields: Any):
 
 @contextmanager
 def _span(event: str, fields: dict[str, Any]):
-    parent_span_id = (_CONTEXT.get() or {}).get("span_id")
-    span_id = new_id("span")
-    fields.update(span_id=span_id, start_ns=time.monotonic_ns())
-    if parent_span_id is not None:
-        fields["parent_span_id"] = parent_span_id
-    emit(event + "_start", **fields)
+    token = None
+    start_ns = None
+    try:
+        context = current()
+        parent_span_id = context.get("span_id")
+        span_id = new_id("span")
+        start_ns = time.monotonic_ns()
+        fields.update(
+            span_id=span_id,
+            start_ns=start_ns,
+            start_wall_ns=time.time_ns(),
+            start_native_tid=threading.get_native_id(),
+            compact=True,
+        )
+        if parent_span_id is not None:
+            fields["parent_span_id"] = parent_span_id
+        context["span_id"] = span_id
+        token = _CONTEXT.set(context)
+    except Exception:
+        start_ns = None
     status = "ok"
-    with scope(span_id=span_id):
+    try:
+        # Callers may add output membership after a scheduling operation.
+        yield fields
+    except BaseException:
+        status = "error"
+        raise
+    finally:
         try:
-            # Callers may add output membership after a scheduling operation.
-            yield fields
-        except BaseException:
-            status = "error"
-            raise
+            if start_ns is not None:
+                end_ns = time.monotonic_ns()
+                fields.update(
+                    end_ns=end_ns,
+                    duration_ns=end_ns - start_ns,
+                    status=status,
+                )
+                emit(event, **fields)
+        except Exception:
+            pass
         finally:
-            end_ns = time.monotonic_ns()
-            fields.update(
-                end_ns=end_ns,
-                duration_ns=end_ns - fields["start_ns"],
-                status=status,
-            )
-            emit(event, **fields)
+            if token is not None:
+                with suppress(Exception):
+                    _CONTEXT.reset(token)
 
 
 def span(event: str, **fields: Any):

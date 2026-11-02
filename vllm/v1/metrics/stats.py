@@ -449,7 +449,8 @@ class IterationStats:
                 "hash=%.6f ext_lookup=%.6f alloc=%.6f overhead=%.6f "
                 "load_kv=%.6f forward=%.6f save_kv=%.6f update=%.6f "
                 "kv_transfer=%.6f no_forward_steps=%d "
-                "residual=%.6f tokens=%d steps=%d",
+                "residual=%.6f tokens=%d steps=%d "
+                "frontend_arrival_wall_s=%s frontend_iteration_wall_s=%s",
                 output.request_id,
                 first_token_latency,
                 output.hash_and_local_cache_time,
@@ -465,6 +466,8 @@ class IterationStats:
                 first_token_latency - breakdown_sum,
                 output.ttft_num_scheduled_tokens,
                 output.ttft_num_steps,
+                req_stats.arrival_time,
+                self.iteration_timestamp,
             )
             if ttft_diag.enabled():
                 # Initial-only host interval, never total queueing. Missing or

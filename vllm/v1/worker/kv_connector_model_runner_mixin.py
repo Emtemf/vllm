@@ -130,8 +130,12 @@ class KVConnectorModelRunnerMixin:
         defer_finalize: bool = False,
     ) -> Generator[KVConnectorOutput, None, None]:
         output = KVConnectorOutput()
-        diagnostic_fields = ttft_diag.current()
-        diagnostic_fields.update(ttft_diag.batch_fields(scheduler_output))
+        diagnostic_fields = {}
+        try:
+            diagnostic_fields = ttft_diag.current()
+            diagnostic_fields.update(ttft_diag.batch_fields(scheduler_output))
+        except Exception:
+            pass
 
         # Update KVConnector with the KVConnector metadata forward().
         kv_connector = get_kv_transfer_group()
@@ -150,19 +154,16 @@ class KVConnectorModelRunnerMixin:
         ):
             kv_connector.start_load_kv(get_forward_context())
         t1 = time.perf_counter()
-        forward_start_ns = time.monotonic_ns()
         try:
-            yield output
+            with (
+                ttft_diag.scope(**diagnostic_fields),
+                ttft_diag.span("worker_forward"),
+            ):
+                try:
+                    yield output
+                finally:
+                    t2 = time.perf_counter()
         finally:
-            t2 = time.perf_counter()
-            forward_end_ns = time.monotonic_ns()
-            ttft_diag.emit(
-                "worker_forward",
-                **diagnostic_fields,
-                start_ns=forward_start_ns,
-                end_ns=forward_end_ns,
-                duration_ns=forward_end_ns - forward_start_ns,
-            )
             t5 = time.perf_counter()
             if wait_for_save and not defer_finalize:
                 with (

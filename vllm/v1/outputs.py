@@ -4,6 +4,7 @@
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from contextlib import suppress
 from copy import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, TypeAlias
@@ -358,7 +359,8 @@ class DiagnosticAsyncModelRunnerOutput(AsyncModelRunnerOutput):
     """Local-only diagnostic wrapper; never changes the serialized output.
 
     Capture each output's association before an executor queues it to another
-    thread. Shared/empty ModelRunnerOutputs themselves are never annotated.
+    thread; sample request membership is recovered only on materialization.
+    Shared/empty ModelRunnerOutputs themselves are never annotated.
     """
 
     def __init__(self, output: AsyncModelRunnerOutput, fields: dict):
@@ -368,19 +370,27 @@ class DiagnosticAsyncModelRunnerOutput(AsyncModelRunnerOutput):
         ttft_diag.emit("worker_output_pending", **self._fields)
 
     def get_output(self) -> ModelRunnerOutput:
+        materialize_fields = {"queued_ns": self._queued_ns}
+        with suppress(Exception):
+            materialize_fields["queue_delay_ns"] = (
+                time.monotonic_ns() - self._queued_ns
+            )
         with (
             ttft_diag.scope(**self._fields),
             ttft_diag.span(
-                "worker_output_materialize",
-                queued_ns=self._queued_ns,
-                queue_delay_ns=time.monotonic_ns() - self._queued_ns,
-            ),
+                "worker_output_materialize", **materialize_fields
+            ) as materialize_diag,
         ):
             output = self._output.get_output()
-            ttft_diag.emit(
-                "worker_output_ready",
-                output_request_ids=tuple(output.req_ids),
-            )
+            try:
+                output_request_ids = tuple(output.req_ids)
+                materialize_diag["output_request_ids"] = output_request_ids
+                if self._fields.get("association") == "unavailable":
+                    materialize_diag.update(
+                        request_ids=output_request_ids, association="output"
+                    )
+            except Exception:
+                pass
             return output
 
 
