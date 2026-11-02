@@ -20,8 +20,10 @@ incomplete. All observed TP ranks are shown by default; --tp-rank filters timing
 The table flattens every step and observed TP, retaining grouped put phases.
 Tokenizer candidates are selectable in the page; known warmups are disabled.
 Manual legacy selections are display-only and never deduct from residual.
-The second flat DIAG table preserves execution/TP intervals and missing evidence.
-Local same-thread uncovered time is diagnostic only, never a residual deduction.
+The second section draws step-ordered process-local interval timelines.
+Unidentified calls remain visible; timestamps alone never assign request/step.
+Frontend bounds classify starts only with same-host evidence and a matching TTFT.
+Unknown calls are not warmup by default. Overlap is context, not step ownership.
 """
 
 from __future__ import annotations
@@ -785,9 +787,12 @@ details{margin:12px 0;border:1px solid var(--border);padding:9px 14px}
 summary{cursor:pointer}li{margin:5px 0}.warning{border-left:4px solid #b77719;
 background:#fff8e8;padding:10px 16px;margin:12px 0;font-size:14px}
 code{overflow-wrap:anywhere}a{color:#215b8e}
-#diag-table{table-layout:fixed}
-#diag-table td,#diag-table th{white-space:normal;overflow-wrap:anywhere;
-text-align:left;vertical-align:top}
+.timeline-step{border-top:2px solid var(--border);margin-top:24px}
+.timeline-process{max-width:1000px;border:1px solid var(--border);
+padding:12px;margin:12px 0;--accent:#215b8e;--success:#3b7b51;--warning:#b77719}
+.timeline-process h4{margin:0}.timeline-process svg{display:block;width:100%}
+.timeline-evidence{min-width:800px;white-space:normal}
+.timeline-evidence td{text-align:left}
 #residual-evidence{min-width:800px;white-space:normal}
 #residual-evidence td{text-align:left;vertical-align:top;overflow-wrap:anywhere}
 """
@@ -825,139 +830,301 @@ def diag_domain(record):
     return domain if all(v not in (None, "", "null", "None") for v in domain) else None
 
 
-def interval_union(intervals):
-    """Measure an interval union, including overlapping/nested children once."""
-    merged = []
-    for start, finish in sorted(intervals):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(finish, merged[-1][1]))
-        else:
-            merged.append((start, finish))
-    return sum(finish - start for start, finish in merged)
+def request_window(data, request):
+    """Use frontend wall bounds only with a uniquely evidenced frontend host."""
+    matches = [r for r in data["bd"] if ids(r) == {request}]
+    if len(matches) != 1:
+        return None
+    bd = matches[0]
+    arrival = number(bd.get("frontend_arrival_wall_s"))
+    first = number(bd.get("frontend_iteration_wall_s"))
+    ttft = number(bd.get("ttft"))
+    if (
+        arrival is None
+        or first is None
+        or first < arrival
+        or ttft is None
+        or abs(first - arrival - ttft) > 0.00001
+    ):
+        return None
+    hosts = {
+        r.get("host")
+        for r in data["diag"]
+        if bd.get("_pid") is not None
+        and r.get("_pid") == bd["_pid"]
+        and r.get("host") not in (None, "", "null")
+    }
+    return {
+        "start": round(arrival * 1e9),
+        "end": round(first * 1e9),
+        "host": next(iter(hosts)) if len(hosts) == 1 else None,
+        "line": bd["_line"],
+    }
+
+
+def timeline_scope(record, window):
+    """Classify an observed start, never infer warmup or request ownership."""
+    if record.get("purpose") == "warmup":
+        return "显式 warmup"
+    if window is None:
+        return "请求边界缺失或与 TTFT 不一致；范围未知"
+    if window["host"] is None or record.get("host") != window["host"]:
+        return "无同主机证据；不与 frontend wall 比较"
+    start = integer(record.get("start_wall_ns"))
+    if start is None:
+        return "缺 start_wall_ns；范围未知"
+    if start < window["start"]:
+        return "起点早于请求 arrival；不据此认定预热"
+    if start > window["end"]:
+        return "起点晚于首 token"
+    return "起点在请求 TTFT 时间窗内；不单凭时间认领 step"
+
+
+def timeline_chart(records, origin, window, context):
+    """Draw every interval separately on a process-local monotonic axis."""
+    records = sorted(records, key=lambda r: (interval(r)[0], r["_line"]))
+    left = min(interval(r)[0] for r in records)
+    right = max(interval(r)[1] for r in records)
+    width = max(right - left, 1)
+    height = 54 + 30 * len(records)
+    pieces = [
+        (
+            f'<svg viewBox="0 0 1000 {height}" role="img" '
+            f'aria-label="{escape(context)} 单进程执行时间图">'
+        ),
+        (
+            '<text x="260" y="17" fill="var(--muted)" font-size="12">'
+            f"{(left - origin) / 1e6:.3f} ms</text>"
+        ),
+        (
+            '<text x="800" y="17" text-anchor="end" '
+            'fill="var(--muted)" font-size="12">'
+            f"{(right - origin) / 1e6:.3f} ms</text>"
+        ),
+        (
+            '<text x="990" y="17" text-anchor="end" '
+            'fill="var(--muted)" font-size="12">持续 ms</text>'
+        ),
+    ]
+    details = []
+    for i, record in enumerate(records):
+        start, finish = interval(record)
+        event = record["event"]
+        color = (
+            "--warning"
+            if event == "worker_save"
+            else "--success"
+            if event == "worker_forward"
+            else "--accent"
+        )
+        y = 30 + i * 30
+        x = 260 + (start - left) / width * 540
+        bar_width = (finish - start) / width * 540
+        a, b = (start - origin) / 1e6, (finish - origin) / 1e6
+        duration = (finish - start) / 1e6
+        label = event.removeprefix("worker_").removeprefix("engine_")
+        if record.get("_timeline_unassigned"):
+            label += " [step未知]"
+        title = (
+            f"{event}: {a:.6f} → {b:.6f} ms; duration={duration:.6f} ms; "
+            f"native_tid={record.get('_native_tid')}; 行 {record['_line']}; "
+            + timeline_scope(record, window)
+        )
+        pieces.extend(
+            [
+                (
+                    f'<text x="4" y="{y + 14}" fill="var(--fg)" '
+                    f'font-size="13">{escape(label)} · 行 {record["_line"]}</text>'
+                ),
+                (
+                    f'<rect x="{x:.3f}" y="{y}" width="{bar_width:.6f}" height="19" '
+                    f'fill="var({color})" opacity="0.65">'
+                    f"<title>{escape(title)}</title></rect>"
+                ),
+                (
+                    f'<line x1="{x:.3f}" x2="{x:.3f}" y1="{y}" y2="{y + 19}" '
+                    f'stroke="var({color})"><title>{escape(title)}</title></line>'
+                ),
+                (
+                    f'<text x="990" y="{y + 14}" text-anchor="end" '
+                    f'fill="var(--fg)" font-size="13">{duration:.3f}</text>'
+                ),
+            ]
+        )
+        annotation = timeline_scope(record, window)
+        if record.get("_timeline_unassigned"):
+            annotation += "；未与所选 step 关联，位置不代表执行归属"
+        annotation += f"；status={record.get('status', 'unknown')}"
+        if record.get("deferred") == "true":
+            annotation += "；延迟 save，保留原 execution，不与 sample 重复相加"
+        if not ids(record):
+            annotation += "；无请求身份，仅展示同进程上下文"
+        details.append(
+            "<tr>"
+            + "".join(
+                f"<td>{escape(v)}</td>"
+                for v in (
+                    event,
+                    f"{a:.6f} → {b:.6f}",
+                    f"{duration:.6f}",
+                    record.get("_native_tid"),
+                    annotation,
+                )
+            )
+            + "</tr>"
+        )
+    pieces.append("</svg>")
+    execute = [r for r in records if r["event"] == "worker_execute"]
+    load = [r for r in records if r["event"] == "worker_load"]
+    finding = ""
+    if len(execute) == len(load) == 1:
+        a, b = interval(execute[0]), interval(load[0])
+        if a[0] <= b[0] <= b[1] <= a[1]:
+            finding = (
+                f"<p>execute 开始 → load 开始：<b>{(b[0] - a[0]) / 1e6:.3f} ms</b>。"
+                "这是进入 load 前的区间，尚未细分内部工作，不是纯 CPU 或 residual。</p>"
+            )
+    return (
+        f'<section class="timeline-process"><h4>{escape(context)}</h4>'
+        + finding
+        + "".join(pieces)
+        + "<details><summary>精确起止、线程和请求范围（ms）</summary>"
+        '<div class="scroll"><table class="timeline-evidence"><thead><tr>'
+        "<th>事件</th><th>开始 → 结束</th><th>持续</th><th>native TID</th>"
+        "<th>范围与边界</th></tr></thead><tbody>"
+        + "".join(details)
+        + "</tbody></table></div>"
+        + "".join(evidence(r) for r in records)
+        + "</details></section>"
+    )
 
 
 def diagnostic_table(data, request, steps, end):
-    """Summarize measured stage boundaries without claiming a critical path."""
-    selected = {
-        execution(step): f"step{i}" for i, step in enumerate(steps) if execution(step)
-    }
-    records = [
+    """Show step-ordered timelines without discarding unidentified calls."""
+    selected = {execution(step): i for i, step in enumerate(steps) if execution(step)}
+    known = [
+        r
+        for r in data["diag"]
+        if r["_line"] < end
+        and r.get("event") in DIAG_ENGINE + DIAG_WORKER
+        and execution(r) in selected
+        and (not ids(r) or request in ids(r))
+        and interval(r) is not None
+        and diag_domain(r) is not None
+    ]
+    domains = {diag_domain(r) for r in known}
+    unassigned = [
+        dict(r, _timeline_unassigned=True)
+        for r in data["diag"]
+        if r["_line"] < end
+        and r.get("event") in DIAG_WORKER
+        and execution(r) not in selected
+        and (request in ids(r) or (not ids(r) and diag_domain(r) in domains))
+        and interval(r) is not None
+        and diag_domain(r) is not None
+    ]
+    missing = [
         r
         for r in data["diag"]
         if r["_line"] < end
         and r.get("event") in DIAG_ENGINE + DIAG_WORKER
         and (execution(r) in selected or request in ids(r))
-        and interval(r) is not None
-        and diag_domain(r) is not None
-        and r.get("status") in (None, "ok")
+        and (not ids(r) or request in ids(r))
+        and (interval(r) is None or diag_domain(r) is None)
     ]
-    groups = defaultdict(list)
-    for record in records:
-        groups[(execution(record), diag_domain(record))].append(record)
+    all_records = known + unassigned
+    origins = {
+        domain: min(interval(r)[0] for r in all_records if diag_domain(r) == domain)
+        for domain in {diag_domain(r) for r in all_records}
+    }
+    window = request_window(data, request)
+    if window is None:
+        boundary = "BREAKDOWN 缺少一致的 frontend 起止边界；请求时间范围未知。"
+    else:
+        start = datetime.fromtimestamp(window["start"] / 1e9, timezone.utc)
+        finish = datetime.fromtimestamp(window["end"] / 1e9, timezone.utc)
+        boundary = (
+            f"请求 arrival={start.isoformat(timespec='microseconds')}；"
+            f"首 token={finish.isoformat(timespec='microseconds')}；"
+            f"来源 BREAKDOWN 行 {window['line']}。"
+            "仅有同主机证据的 start_wall_ns 才与此窗比较；跨主机不校时。"
+        )
+    out = [
+        "<h2>二、逐 step 执行时间图</h2>",
+        f'<p class="note">{escape(boundary)}</p>',
+        (
+            '<p class="note">每个进程独立计时；同一 host/PID/run 的所有 step '
+            "共用零点（本节最早可用区间起点）。横轴为距该零点的 ms；"
+            "每张图按本组区间缩放，请比较刻度，不能比较不同图的条长。"
+            "不同进程不强行对齐。execute 包含 load/forward；"
+            "sample 可能包含延迟 save。嵌套时间不相加，不据此扣 residual。"
+            "标有 [step未知] 的重叠区间仅作同进程上下文展示，不是 step 关联。"
+            "“未关联”是身份不足，不等于预热，也不是没有耗时。</p>"
+        ),
+    ]
 
-    def unique(group, *events):
-        found = [r for r in group if r.get("event") in events]
-        return found[0] if len(found) == 1 else None
-
-    def duration(record):
-        return None if record is None else integer(record["duration_ns"]) / 1e9
-
-    def before(parent, child):
-        if parent is None or child is None:
-            return None
-        a, b = interval(parent), interval(child)
-        if not a[0] <= b[0] <= b[1] <= a[1]:
-            return None
-        return (b[0] - a[0]) / 1e9
-
-    rows = []
-    for (identity, domain), group in sorted(
-        groups.items(), key=lambda item: str(item[0])
-    ):
-        engine = any(r["event"] in DIAG_ENGINE for r in group)
-        execute = unique(group, "worker_execute")
-        load = unique(group, "worker_load")
-        forward = unique(group, "worker_forward")
-        save = unique(group, "worker_save")
-        sample = unique(group, "worker_sample")
-        if engine:
-            stages = [
-                ("schedule", unique(group, "engine_schedule")),
-                ("submit", unique(group, "engine_execute_submit")),
-                (
-                    "result_wait",
-                    unique(group, "engine_result_wait", "engine_execute_wait"),
-                ),
-                ("update", unique(group, "engine_update")),
-            ]
-            values = "；".join(f"{name}={fmt(duration(r))}" for name, r in stages)
-            own = [interval(r) for _, r in stages if r is not None]
-            gap = None
-            if len(own) == len(stages) and all(ids(r) == {request} for _, r in stages):
-                left, right = min(a for a, _ in own), max(b for _, b in own)
-                windows = [
-                    (max(left, a), min(right, b))
-                    for r in records
-                    if diag_domain(r) == domain and r["event"] in DIAG_ENGINE
-                    for a, b in [interval(r)]
-                    if a < right and b > left
-                ]
-                gap = (right - left - interval_union(windows)) / 1e9
-            note = (
-                "间隔已排除同进程其他轮次的已记录工作；不是 CPU 空闲或直接 residual。"
-            )
-            role = "EngineCore"
-        else:
-            values = "；".join(
-                f"{name}={fmt(duration(r))}"
-                for name, r in (
-                    ("execute", execute),
-                    ("load", load),
-                    ("forward", forward),
-                    ("save", save),
-                    ("sample", sample),
+    def charts(records, label):
+        groups = defaultdict(list)
+        for r in records:
+            groups[diag_domain(r)].append(r)
+        result = []
+        for domain, group in sorted(
+            groups.items(),
+            key=lambda item: (
+                0 if any(r["event"] in DIAG_ENGINE for r in item[1]) else 1,
+                next((r["_worker"][0] for r in item[1] if r["_worker"]), -1),
+                str(item[0]),
+            ),
+        ):
+            group = list(group)
+            if label != "未关联":
+                left = min(interval(r)[0] for r in group)
+                right = max(interval(r)[1] for r in group)
+                group.extend(
+                    r
+                    for r in unassigned
+                    if diag_domain(r) == domain
+                    and interval(r)[0] <= right
+                    and interval(r)[1] >= left
                 )
-            )
-            gap = before(execute, load)
             rank = next((r["_worker"][0] for r in group if r["_worker"]), None)
-            role = "TP未知" if rank is None else f"TP{rank}"
-            note = "execute 开始至 load 开始的间隔，含输入准备及等待，不是纯 CPU 时间。"
-            if save is not None and save.get("deferred") == "true":
-                note += " save 在 execute 外延迟完成，不与 sample 重复相加。"
-        source = ", ".join(str(r["_line"]) for r in group)
-        cells = [
-            selected.get(identity, "未关联"),
-            role,
-            values,
-            fmt(gap),
-            note,
-            f"{domain[1]} / 行 {source}",
-        ]
-        rows.append("<tr>" + "".join(f"<td>{escape(v)}</td>" for v in cells) + "</tr>")
-    unassigned = [
-        r
-        for r in data["diag"]
-        if r["_line"] < end
-        and r.get("event") in ("worker_sample", "worker_output_materialize")
-        and execution(r) not in selected
-        and not ids(r)
-        and interval(r) is not None
-    ]
-    if not rows:
-        rows.append('<tr><td colspan="6">关键边界缺失；不能按日志顺序补配。</td></tr>')
-    return (
-        "<h2>二、执行阶段与间隔</h2>"
-        '<p class="note">单位 s。每行来自同一 execution 和 host/PID/run；'
-        "— 表示缺失、重复或边界不成立，不是 0。不同 TP 不相加。"
-        "EngineCore 与 Worker 不使用各自起点拼成共同时间线。</p>"
-        '<div class="scroll"><table id="diag-table"><thead><tr>'
-        "<th>轮次</th><th>角色</th><th>已记录阶段耗时</th><th>阶段间隔</th>"
-        "<th>结论与边界</th><th>PID / 来源行</th></tr></thead><tbody>"
-        + "".join(rows)
-        + "</tbody></table></div>"
-        + f'<p class="note">另有 {len(unassigned)} 条 sample/结果物化缺少执行归属，'
-        "未按顺序分配到轮次。它们不影响表一的保存任务关联，亦不冒充请求 residual。</p>"
+            role = (
+                "EngineCore"
+                if any(r["event"] in DIAG_ENGINE for r in group)
+                else (f"TP{rank}" if rank is not None else "TP未知")
+            )
+            context = f"{label} · {role} · host={domain[0]} PID={domain[1]}"
+            result.append(timeline_chart(group, origins[domain], window, context))
+        return "".join(result)
+
+    for i, step in enumerate(steps):
+        group = [r for r in known if execution(r) == execution(step)]
+        opened = " open" if i == 0 else ""
+        out.append(
+            f'<details class="timeline-step" data-step="{i}"{opened}>'
+            f"<summary>step{i} · EngineCore 与各 TP 时间图</summary>"
+        )
+        out.append(
+            charts(group, f"step{i}") if group else "<p>本轮缺少有效 DIAG 边界。</p>"
+        )
+        out.append("</details>")
+    out.append(
+        '<section id="unassigned-timeline">'
+        f"<h3>未关联调用：{len(unassigned)} 条区间</h3>"
+        "<p>逐次保留开始、结束、耗时和来源；不按出现顺序补配到 step。"
+        "无请求身份的同进程记录仅供排查，不计入请求耗时。"
+        "即使起点早于 arrival，也不能单凭时间认定由预热 Tokenizer 触发。</p>"
     )
+    out.append(
+        charts(unassigned, "未关联") if unassigned else "<p>无可展示的未关联调用。</p>"
+    )
+    out.append("</section>")
+    if missing:
+        out.append(
+            f"<details><summary>{len(missing)} 条记录缺少有效时钟/区间，未绘图"
+            "</summary>" + "".join(evidence(r) for r in missing) + "</details>"
+        )
+    return "".join(out)
 
 
 def residual_evidence(breakdown, tokenizer, queue, queue_time):
@@ -1019,9 +1186,9 @@ def residual_evidence(breakdown, tokenizer, queue, queue_time):
         *parts,
         (
             "阶段间隔的请求归因",
-            "见执行阶段表",
+            "见逐 step 时间图",
             (
-                "EngineCore 间隔和 Worker 的 load 前时间已分别定位；"
+                "图示进程内实际区间位置，并突出 Worker 的 load 前时间；"
                 "它们不是新的独立 TTFT 分项，不跨 TP 累加或直接从 residual 扣减。"
                 "sample 缺 execution 时仍不按顺序猜测。"
             ),
