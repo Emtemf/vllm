@@ -20,8 +20,9 @@ incomplete. All observed TP ranks are shown by default; --tp-rank filters timing
 The table flattens every step and observed TP, retaining grouped put phases.
 Tokenizer candidates are selectable in the page; known warmups are disabled.
 Manual legacy selections are display-only and never deduct from residual.
-The second section draws step-ordered process-local interval timelines.
-Unidentified calls remain visible; timestamps alone never assign request/step.
+The second section decomposes parent intervals using observed child unions.
+Expand/collapse affects decomposition only; copy exports all step/TP ledgers.
+Timelines and raw logs are collapsed evidence, not the primary diagnosis.
 Frontend bounds classify starts only with same-host evidence and a matching TTFT.
 Unknown calls are not warmup by default. Overlap is context, not step ownership.
 """
@@ -795,6 +796,10 @@ padding:12px;margin:12px 0;--accent:#215b8e;--success:#3b7b51;--warning:#b77719}
 .timeline-evidence td{text-align:left}
 #residual-evidence{min-width:800px;white-space:normal}
 #residual-evidence td{text-align:left;vertical-align:top;overflow-wrap:anywhere}
+.diagnosis-table{min-width:1000px;white-space:normal}
+.diagnosis-table td{text-align:left;vertical-align:top}
+.diagnosis-table td:last-child{min-width:360px}
+#diagnosis-text{width:100%;height:22em;font:13px/1.5 monospace}
 """
 
 
@@ -999,6 +1004,338 @@ def timeline_chart(records, origin, window, context):
     )
 
 
+def uncovered_intervals(bounds, children):
+    """Subtract the union of child intervals; preserve exact gap endpoints."""
+    cursor, end = bounds
+    gaps = []
+    for start, finish in sorted(children):
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, finish)
+    if cursor < end:
+        gaps.append((cursor, end))
+    return gaps
+
+
+def measured_thread(record):
+    tid = record.get("_native_tid")
+    start_tid = integer(record.get("start_native_tid"))
+    if tid is None or start_tid is None or start_tid != tid:
+        return None
+    return tid
+
+
+def decomposition_fact(parent, children, expected, title, label, scope):
+    """Decompose only compatible, contained intervals, not arbitrary durations."""
+    bounds = interval(parent)
+    valid = bounds is not None and measured_thread(parent) is not None
+    valid = (
+        valid
+        and len(children) == expected
+        and all(
+            interval(r) is not None
+            and diag_domain(r) == diag_domain(parent)
+            and measured_thread(r) == measured_thread(parent)
+            and r.get("status") == "ok"
+            and bounds[0] <= interval(r)[0] <= interval(r)[1] <= bounds[1]
+            for r in children
+        )
+    )
+    valid = valid and parent.get("status") == "ok"
+    source = ", ".join(str(r["_line"]) for r in [parent, *children])
+    if not valid:
+        return dict(title=title, label=label, scope=scope, source=source, valid=False)
+    gaps = uncovered_intervals(bounds, [interval(r) for r in children])
+    missing = sum(b - a for a, b in gaps)
+    largest = max(gaps, key=lambda p: p[1] - p[0], default=None)
+    start_names = {bounds[0]: "外层开始"}
+    end_names = {bounds[1]: "外层结束"}
+    for r in children:
+        a, b = interval(r)
+        start_names[b] = r["event"] + " 结束"
+        end_names[a] = r["event"] + " 开始"
+    named = [
+        (start_names.get(a, "区间结束"), end_names.get(b, "区间开始"), (b - a) / 1e6)
+        for a, b in gaps
+    ]
+    hint = "检查列出的两个打点边界之间的调用路径；现有日志未证明具体函数耗时。"
+    if (
+        largest
+        and largest[0] == bounds[0]
+        and any(
+            r["event"] == "worker_load" and interval(r)[0] == largest[1]
+            for r in children
+        )
+    ):
+        hint = (
+            "优先检查 worker_base.WorkerWrapperBase.execute_model 调用的准备路径，"
+            "至 KVConnectorModelRunnerMixin 的 start_load_kv 调用前；"
+            "Ascend execute_model 的输入/metadata 准备及 forward context 为候选，"
+            "不是已证明某个函数独占这些时间。"
+        )
+    elif title.startswith("sample"):
+        hint = (
+            "检查 sample_tokens 内至 finalize_kv_connector 的路径；"
+            "draft token 处理为配置相关候选，不把差值直接归给 MTP。"
+        )
+    return dict(
+        title=title,
+        label=label,
+        scope=scope,
+        source=source,
+        valid=True,
+        total=(bounds[1] - bounds[0]) / 1e6,
+        covered=(bounds[1] - bounds[0] - missing) / 1e6,
+        missing=missing / 1e6,
+        gaps=named,
+        hint=hint,
+    )
+
+
+def diagnosis_report(data, request, steps, end):
+    """Produce a bounded evidence ledger; code hints are candidates, not profiling."""
+    records = [
+        r
+        for r in data["diag"]
+        if r["_line"] < end
+        and r.get("event") in DIAG_ENGINE + DIAG_WORKER
+        and (not ids(r) or request in ids(r))
+        and diag_domain(r) is not None
+    ]
+    facts = []
+    for i, step in enumerate(steps):
+        identity = execution(step)
+        if not identity:
+            continue
+        groups = defaultdict(list)
+        for r in records:
+            if execution(r) == identity:
+                groups[diag_domain(r)].append(r)
+        for domain, group in sorted(
+            groups.items(),
+            key=lambda item: (
+                0 if any(r["event"] in DIAG_ENGINE for r in item[1]) else 1,
+                next((r["_worker"][0] for r in item[1] if r["_worker"]), -1),
+                str(item[0]),
+            ),
+        ):
+            rank = next((r["_worker"][0] for r in group if r["_worker"]), None)
+            engine = any(r["event"] in DIAG_ENGINE for r in group)
+            label = f"step{i} / " + ("EngineCore" if engine else f"TP{rank}")
+            scope = f"host={domain[0]} PID={domain[1]} run={domain[2]}"
+            parents = [r for r in group if r["event"] == "worker_execute"]
+            if engine:
+                events = (
+                    ("engine_schedule",),
+                    ("engine_execute_submit",),
+                    ("engine_result_wait", "engine_execute_wait"),
+                    ("engine_update",),
+                )
+                stages = [[r for r in group if r["event"] in names] for names in events]
+                if all(
+                    len(s) == 1 and interval(s[0]) is not None for s in stages
+                ) and all(
+                    interval(r) is not None
+                    for r in records
+                    if r["event"] in DIAG_ENGINE and diag_domain(r) == domain
+                ):
+                    own = [s[0] for s in stages]
+                    parent = dict(
+                        own[0],
+                        start_ns=min(interval(r)[0] for r in own),
+                        end_ns=max(interval(r)[1] for r in own),
+                    )
+                    parent["duration_ns"] = parent["end_ns"] - parent["start_ns"]
+                    a, b = interval(parent)
+                    # Other steps can run while this queued execution waits.
+                    children = [
+                        dict(
+                            r,
+                            start_ns=max(a, interval(r)[0]),
+                            end_ns=min(b, interval(r)[1]),
+                            duration_ns=min(b, interval(r)[1]) - max(a, interval(r)[0]),
+                        )
+                        for r in records
+                        if r["event"] in DIAG_ENGINE
+                        and diag_domain(r) == domain
+                        and interval(r)[0] < b
+                        and interval(r)[1] > a
+                    ]
+                    facts.append(
+                        decomposition_fact(
+                            parent,
+                            children,
+                            len(children),
+                            "schedule 起点 → update 终点",
+                            label,
+                            scope,
+                        )
+                    )
+                else:
+                    facts.append(
+                        dict(
+                            title="EngineCore 阶段边界缺失或重复",
+                            label=label,
+                            scope=scope,
+                            source=", ".join(str(r["_line"]) for r in group),
+                            valid=False,
+                        )
+                    )
+                continue
+            if len(parents) == 1:
+                children = [
+                    r for r in group if r["event"] in ("worker_load", "worker_forward")
+                ]
+                children += [
+                    r
+                    for r in group
+                    if r["event"] == "worker_save" and r.get("deferred") == "false"
+                ]
+                expected = 2 + sum(r["event"] == "worker_save" for r in children)
+                # A duplicate load/forward must never masquerade as complete coverage.
+                if any(
+                    sum(r["event"] == e for r in children) != 1
+                    for e in ("worker_load", "worker_forward")
+                ):
+                    expected = -1
+                facts.append(
+                    decomposition_fact(
+                        parents[0],
+                        children,
+                        expected,
+                        "execute − load/forward/同步 save",
+                        label,
+                        scope,
+                    )
+                )
+            else:
+                facts.append(
+                    dict(
+                        title="execute 边界缺失或重复",
+                        label=label,
+                        scope=scope,
+                        source=", ".join(str(r["_line"]) for r in group),
+                        valid=False,
+                    )
+                )
+            for save in [
+                r
+                for r in group
+                if r["event"] == "worker_save" and r.get("deferred") == "true"
+            ]:
+                candidates = [
+                    r
+                    for r in records
+                    if r["event"] == "worker_sample"
+                    and diag_domain(r) == domain
+                    and measured_thread(r) is not None
+                    and measured_thread(r) == measured_thread(save)
+                    and interval(r) is not None
+                    and interval(save) is not None
+                    and interval(r)[0]
+                    <= interval(save)[0]
+                    <= interval(save)[1]
+                    <= interval(r)[1]
+                    and (not execution(r) or execution(r) == identity)
+                ]
+                if len(candidates) == 1:
+                    facts.append(
+                        decomposition_fact(
+                            candidates[0],
+                            [save],
+                            1,
+                            "sample − 此次延迟 save（包含关系）",
+                            label,
+                            scope,
+                        )
+                    )
+                else:
+                    facts.append(
+                        dict(
+                            title="sample 包含关系缺失或多义",
+                            label=label,
+                            scope=scope,
+                            source=str(save["_line"]),
+                            valid=False,
+                        )
+                    )
+    rows, summaries = (
+        [],
+        [
+            "TTFT_DIAG_LEDGER_V1：局部分解，非 residual；TP/嵌套区间不相加。",
+            "源码提示按配套打点边界解释，须核对部署版本；候选不等于函数级测量。",
+        ],
+    )
+    bd = next((r for r in data.get("bd", []) if ids(r) == {request}), {})
+    summaries.append(
+        f"request={request} steps={len(steps)} TTFT_s={bd.get('ttft', 'unknown')} "
+        f"BREAKDOWN_residual_s={bd.get('residual', 'unknown')}"
+    )
+    for fact in facts:
+        heading = fact["label"] + " · " + fact["title"]
+        if not fact["valid"]:
+            message = heading + "：证据不足，未计算；来源行 " + fact["source"]
+            rows.append(f"<tr><td>{escape(message)}</td><td colspan='4'>—</td></tr>")
+            summaries.append(message)
+            continue
+        gaps = sorted(fact["gaps"], key=lambda p: p[2], reverse=True)
+        largest = (
+            f"{gaps[0][0]} → {gaps[0][1]}：{gaps[0][2]:.3f} ms"
+            if gaps
+            else "无未覆盖区间"
+        )
+        text = (
+            f"{heading}：外层 {fact['total']:.3f} ms；"
+            f"已覆盖 {fact['covered']:.3f} ms；未覆盖 {fact['missing']:.3f} ms；"
+            f"最大：{largest}；来源行 {fact['source']}；{fact['scope']}"
+        )
+        summaries.extend([text, "  检查方向：" + fact["hint"]])
+        summaries.extend(f"  {a} → {b}：{v:.6f} ms" for a, b, v in fact["gaps"])
+        detail = (
+            '<details class="diagnosis-detail"><summary>分解及代码检查方向</summary>'
+            + "".join(
+                f"<p>{escape(a)} → {escape(b)}：{v:.6f} ms</p>"
+                for a, b, v in fact["gaps"]
+            )
+            + f"<p>{escape(fact['hint'])}</p>"
+            + f"<p>来源行 {escape(fact['source'])}</p></details>"
+        )
+        rows.append(
+            "<tr>"
+            + "".join(
+                f"<td>{v}</td>"
+                for v in (
+                    escape(heading),
+                    f"{fact['total']:.3f}",
+                    f"{fact['covered']:.3f}",
+                    f"<b>{fact['missing']:.3f}</b>",
+                    escape(largest) + detail,
+                )
+            )
+            + "</tr>"
+        )
+    summary = escape("\n".join(summaries))
+    return (
+        '<section id="diagnosis"><h2>二、逐层分解：时间剩在哪两个边界之间</h2>'
+        "<p>单位 ms。默认先看“未覆盖”和“最大区间”。计算区间并集，不重复减嵌套时间；"
+        "差值包含日志开销等，不等于 CPU 空闲或请求 residual，也不证明请求独占。"
+        "sample 行只证明包含该 save，不认领整个 sample 的 step。</p>"
+        '<button type="button" id="expand-diagnosis">展开全部分解</button> '
+        '<button type="button" id="collapse-diagnosis">收起全部分解</button> '
+        '<button type="button" id="copy-diagnosis">复制诊断摘要</button>'
+        '<span id="diagnosis-copy-status" role="status"></span>'
+        '<details id="diagnosis-export">'
+        "<summary>查看/手动复制诊断摘要（全部 step/TP）</summary>"
+        '<textarea id="diagnosis-text" readonly aria-label="诊断摘要">'
+        f"{summary}</textarea>"
+        '</details><div class="scroll"><table class="diagnosis-table"><thead><tr>'
+        "<th>step / TP / 分解层</th><th>外层 ms</th><th>已覆盖 ms</th>"
+        "<th>未覆盖 ms</th><th>最大区间 / 检查方向</th></tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table></div></section>"
+    )
+
+
 def diagnostic_table(data, request, steps, end):
     """Show step-ordered timelines without discarding unidentified calls."""
     selected = {execution(step): i for i, step in enumerate(steps) if execution(step)}
@@ -1050,7 +1387,12 @@ def diagnostic_table(data, request, steps, end):
             "仅有同主机证据的 start_wall_ns 才与此窗比较；跨主机不校时。"
         )
     out = [
-        "<h2>二、逐 step 执行时间图</h2>",
+        diagnosis_report(data, request, steps, end),
+        (
+            '<details id="timeline-evidence">'
+            "<summary>时间图与原始日志证据（按需展开）</summary>"
+        ),
+        "<h3>逐 step 执行时间图</h3>",
         f'<p class="note">{escape(boundary)}</p>',
         (
             '<p class="note">每个进程独立计时；同一 host/PID/run 的所有 step '
@@ -1124,6 +1466,7 @@ def diagnostic_table(data, request, steps, end):
             f"<details><summary>{len(missing)} 条记录缺少有效时钟/区间，未绘图"
             "</summary>" + "".join(evidence(r) for r in missing) + "</details>"
         )
+    out.append("</details>")
     return "".join(out)
 
 
@@ -1524,6 +1867,25 @@ QUEUE 来源行 {queue_source}。
 用于首次排队扣减；这不是请求累计排队量，旧日志无有效性证据则不扣减。</li>
 </ul>{queue_evidence}{tokenizer_evidence}{save_evidence}</details>
 <script>
+document.getElementById("expand-diagnosis").addEventListener("click", () => {{
+    document.querySelectorAll(".diagnosis-detail").forEach(el => el.open = true);
+}});
+document.getElementById("collapse-diagnosis").addEventListener("click", () => {{
+    document.querySelectorAll(".diagnosis-detail").forEach(el => el.open = false);
+}});
+document.getElementById("copy-diagnosis").addEventListener("click", async () => {{
+    const text = document.getElementById("diagnosis-text");
+    const status = document.getElementById("diagnosis-copy-status");
+    try {{
+        await navigator.clipboard.writeText(text.value);
+        status.textContent = "已复制全部 step/TP 诊断摘要（不含原始日志）";
+    }} catch (_) {{
+        document.getElementById("diagnosis-export").open = true;
+        text.focus();
+        text.select();
+        status.textContent = "请按 Ctrl+C 复制已选中的摘要";
+    }}
+}});
 const tokenizerSelect = document.getElementById("tokenizer-select");
 function updateTokenizer() {{
     const option = tokenizerSelect.selectedOptions[0];
