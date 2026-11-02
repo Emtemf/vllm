@@ -21,7 +21,7 @@ The table flattens every step and observed TP, retaining grouped put phases.
 Tokenizer candidates are selectable in the page; known warmups are disabled.
 Manual legacy selections are display-only and never deduct from residual.
 The second section decomposes parent intervals using observed child unions.
-Expand/collapse affects decomposition only; copy exports all step/TP ledgers.
+Copy exports categorized observations with a 500,000-byte UTF-8 hard limit.
 Timelines and raw logs are collapsed evidence, not the primary diagnosis.
 Frontend bounds classify starts only with same-host evidence and a matching TTFT.
 Unknown calls are not warmup by default. Overlap is context, not step ownership.
@@ -1092,6 +1092,147 @@ def decomposition_fact(parent, children, expected, title, label, scope):
     )
 
 
+DIAG_EXPORT_LIMIT = 500_000
+
+
+def bounded_diagnosis_text(lines, limit=DIAG_EXPORT_LIMIT):
+    """Limit UTF-8 bytes without splitting a line or silently omitting evidence."""
+    full = "\n".join(lines)
+    if len(full.encode("utf-8")) <= limit:
+        return full, 0
+    marker = "\n[大小限制] 已省略 {} 行；完整记录保留在 HTML 分解证据中。"
+    reserve = len(marker.format(len(lines)).encode("utf-8"))
+    if limit < reserve:
+        raise ValueError("诊断文本上限不足以容纳省略说明")
+    kept = []
+    size = 0
+    for line in lines:
+        cost = len(line.encode("utf-8")) + (1 if kept else 0)
+        if size + cost > limit - reserve:
+            break
+        kept.append(line)
+        size += cost
+    omitted = len(lines) - len(kept)
+    text = "\n".join(kept)
+    if omitted:
+        text += marker.format(omitted)
+    return text, omitted
+
+
+def categorized_diagnosis(facts, request, bd):
+    """Group observed boundary costs, never infer Python/native/device shares."""
+    categories = {
+        "执行准备": (
+            "execute 入口至 load 入口；检查输入/metadata 准备及 forward context 路径。",
+            "不能据此判断纯 Python 耗时；可能包含 native 调用、设备同步或等待。",
+        ),
+        "模型调用区间之外的衔接/收尾": (
+            "load→forward 之间和 forward→execute 返回；检查边界间的处理与日志开销。",
+            "不是模型内部的 Python/C++/算子分解。",
+        ),
+        "sample 中此次保存之外的工作": (
+            "sample 减此次延迟 save；检查采样/draft/finalize 之前的路径。",
+            "仅有同线程包含关系，未证明整个 sample 的 step 归属；不直接归因 MTP。",
+        ),
+        "EngineCore 阶段间隔": (
+            "检查列出的阶段边界之间；已扣除同线程其他轮次的已记录工作。",
+            "不是额外 Worker 等待，不可与 Worker 时间相加。",
+        ),
+    }
+    groups = defaultdict(list)
+    invalid = []
+    for fact in facts:
+        if not fact["valid"]:
+            invalid.append(fact)
+            continue
+        parts = defaultdict(list)
+        if fact["title"].startswith("execute"):
+            for a, b, value in fact["gaps"]:
+                name = (
+                    "执行准备"
+                    if a == "外层开始" and b == "worker_load 开始"
+                    else "模型调用区间之外的衔接/收尾"
+                )
+                parts[name].append((a, b, value))
+        else:
+            name = (
+                "sample 中此次保存之外的工作"
+                if fact["title"].startswith("sample")
+                else "EngineCore 阶段间隔"
+            )
+            parts[name] = fact["gaps"]
+        for name, gaps in parts.items():
+            groups[name].append((fact, sum(v for _, _, v in gaps), gaps))
+    lines = [
+        "TTFT_DIAG_FINDINGS_V2（单位 ms；区间分类不是执行语言分类）",
+        (
+            f"request={request} TTFT_s={bd.get('ttft', 'unknown')} "
+            f"residual_s={bd.get('residual', 'unknown')}"
+        ),
+        "不跨 TP 相加，不与嵌套区间相加，不把这些局部值直接扣减 residual。",
+        "Python 入口至返回可含 C++/算子/同步；DIAG 不支持语言或设备占比分摊。",
+    ]
+    sections = []
+    for name, (direction, boundary) in categories.items():
+        entries = groups[name]
+        lines.extend([name, "检查：" + direction, "限制：" + boundary])
+        if not entries:
+            sections.append(f"<h3>{name}</h3><p>没有可证明的非零区间或证据不足。</p>")
+            lines.append("无可展示的区间；不据此认定请求开销为 0。")
+            continue
+        step_groups = defaultdict(list)
+        for entry in entries:
+            match = re.match(r"step(\d+)", entry[0]["label"])
+            step_groups[int(match[1])].append(entry)
+        worst = max(entries, key=lambda e: e[1])
+        lead = (
+            f"最大观察值：{worst[0]['label']}，{worst[1]:.3f} ms。"
+            "这是检查优先级线索，不等于已证明它阻塞了整个请求。"
+        )
+        lines.append(lead)
+        rows = []
+        for step, observed in sorted(step_groups.items()):
+            low = min(e[1] for e in observed)
+            high = max(observed, key=lambda e: e[1])
+            message = (
+                f"step{step}：{len(observed)} 条；范围 {low:.3f}～{high[1]:.3f} ms；"
+                f"最大 {high[0]['label']}；来源行 {high[0]['source']}"
+            )
+            lines.append(message)
+            # Preserve per-TP numbers once, without repeating code hints or raw logs.
+            lines.extend(
+                f"  {f['label']} {value:.6f} ms；行 {f['source']}；{f['scope']}"
+                for f, value, _ in observed
+            )
+            rows.append(
+                "<tr>"
+                + "".join(
+                    f"<td>{escape(v)}</td>"
+                    for v in (
+                        f"step{step}",
+                        str(len(observed)),
+                        f"{low:.3f}～{high[1]:.3f}",
+                        high[0]["label"],
+                        high[0]["source"],
+                    )
+                )
+                + "</tr>"
+            )
+        sections.append(
+            f"<h3>{name}</h3><p><b>{escape(lead)}</b></p>"
+            f"<p>{escape(direction)} {escape(boundary)}</p>"
+            '<div class="scroll"><table class="diagnosis-table"><thead><tr>'
+            "<th>step</th><th>观察数</th><th>耗时范围 ms（不跨 TP 求和）</th>"
+            "<th>最大观察位置</th><th>来源行</th></tr></thead><tbody>"
+            + "".join(rows)
+            + "</tbody></table></div>"
+        )
+    lines.append(f"证据不足的分解：{len(invalid)} 条（不填 0、不猜原因）。")
+    lines.extend(f"{f['label']} {f['title']}；行 {f['source']}" for f in invalid)
+    sections.append(f"<p>另有 {len(invalid)} 条分解证据不足，见完整计算证据。</p>")
+    return "".join(sections), lines
+
+
 def diagnosis_report(data, request, steps, end):
     """Produce a bounded evidence ledger; code hints are candidates, not profiling."""
     records = [
@@ -1259,24 +1400,13 @@ def diagnosis_report(data, request, steps, end):
                             valid=False,
                         )
                     )
-    rows, summaries = (
-        [],
-        [
-            "TTFT_DIAG_LEDGER_V1：局部分解，非 residual；TP/嵌套区间不相加。",
-            "源码提示按配套打点边界解释，须核对部署版本；候选不等于函数级测量。",
-        ],
-    )
+    rows = []
     bd = next((r for r in data.get("bd", []) if ids(r) == {request}), {})
-    summaries.append(
-        f"request={request} steps={len(steps)} TTFT_s={bd.get('ttft', 'unknown')} "
-        f"BREAKDOWN_residual_s={bd.get('residual', 'unknown')}"
-    )
     for fact in facts:
         heading = fact["label"] + " · " + fact["title"]
         if not fact["valid"]:
             message = heading + "：证据不足，未计算；来源行 " + fact["source"]
             rows.append(f"<tr><td>{escape(message)}</td><td colspan='4'>—</td></tr>")
-            summaries.append(message)
             continue
         gaps = sorted(fact["gaps"], key=lambda p: p[2], reverse=True)
         largest = (
@@ -1284,13 +1414,6 @@ def diagnosis_report(data, request, steps, end):
             if gaps
             else "无未覆盖区间"
         )
-        text = (
-            f"{heading}：外层 {fact['total']:.3f} ms；"
-            f"已覆盖 {fact['covered']:.3f} ms；未覆盖 {fact['missing']:.3f} ms；"
-            f"最大：{largest}；来源行 {fact['source']}；{fact['scope']}"
-        )
-        summaries.extend([text, "  检查方向：" + fact["hint"]])
-        summaries.extend(f"  {a} → {b}：{v:.6f} ms" for a, b, v in fact["gaps"])
         detail = (
             '<details class="diagnosis-detail"><summary>分解及代码检查方向</summary>'
             + "".join(
@@ -1314,25 +1437,30 @@ def diagnosis_report(data, request, steps, end):
             )
             + "</tr>"
         )
-    summary = escape("\n".join(summaries))
+    findings, lines = categorized_diagnosis(facts, request, bd)
+    text, omitted = bounded_diagnosis_text(lines)
+    size = len(text.encode("utf-8"))
+    summary = escape(text)
     return (
-        '<section id="diagnosis"><h2>二、逐层分解：时间剩在哪两个边界之间</h2>'
-        "<p>单位 ms。默认先看“未覆盖”和“最大区间”。计算区间并集，不重复减嵌套时间；"
-        "差值包含日志开销等，不等于 CPU 空闲或请求 residual，也不证明请求独占。"
-        "sample 行只证明包含该 save，不认领整个 sample 的 step。</p>"
-        '<button type="button" id="expand-diagnosis">展开全部分解</button> '
+        '<section id="diagnosis"><h2>二、重点检查哪里</h2>'
+        "<p>以下按代码边界归类，不是 Python/C++/算子占比。"
+        "先看每类的最大观察位置与检查方向；计算过程和时间图按需展开。</p>"
+        + findings
+        + '<button type="button" id="expand-diagnosis">展开全部分解</button> '
         '<button type="button" id="collapse-diagnosis">收起全部分解</button> '
         '<button type="button" id="copy-diagnosis">复制诊断摘要</button>'
         '<span id="diagnosis-copy-status" role="status"></span>'
         '<details id="diagnosis-export">'
-        "<summary>查看/手动复制诊断摘要（全部 step/TP）</summary>"
+        f"<summary>查看/手动复制分类摘要 · {size:,} / 500,000 UTF-8 字节"
+        f" · 省略 {omitted} 行</summary>"
         '<textarea id="diagnosis-text" readonly aria-label="诊断摘要">'
         f"{summary}</textarea>"
-        '</details><div class="scroll"><table class="diagnosis-table"><thead><tr>'
+        '</details><details id="ledger-evidence"><summary>完整逐层计算证据</summary>'
+        '<div class="scroll"><table class="diagnosis-table"><thead><tr>'
         "<th>step / TP / 分解层</th><th>外层 ms</th><th>已覆盖 ms</th>"
         "<th>未覆盖 ms</th><th>最大区间 / 检查方向</th></tr></thead><tbody>"
         + "".join(rows)
-        + "</tbody></table></div></section>"
+        + "</tbody></table></div></details></section>"
     )
 
 
@@ -1868,17 +1996,24 @@ QUEUE 来源行 {queue_source}。
 </ul>{queue_evidence}{tokenizer_evidence}{save_evidence}</details>
 <script>
 document.getElementById("expand-diagnosis").addEventListener("click", () => {{
+    document.getElementById("ledger-evidence").open = true;
     document.querySelectorAll(".diagnosis-detail").forEach(el => el.open = true);
 }});
 document.getElementById("collapse-diagnosis").addEventListener("click", () => {{
+    document.getElementById("ledger-evidence").open = false;
     document.querySelectorAll(".diagnosis-detail").forEach(el => el.open = false);
 }});
 document.getElementById("copy-diagnosis").addEventListener("click", async () => {{
     const text = document.getElementById("diagnosis-text");
     const status = document.getElementById("diagnosis-copy-status");
+    const size = new TextEncoder().encode(text.value).length;
+    if (size > 500000) {{
+        status.textContent = "摘要超过 500,000 字节，已阻止复制；请重新生成报告";
+        return;
+    }}
     try {{
         await navigator.clipboard.writeText(text.value);
-        status.textContent = "已复制全部 step/TP 诊断摘要（不含原始日志）";
+        status.textContent = "已复制分类摘要：" + size + " UTF-8 字节（上限 500,000）";
     }} catch (_) {{
         document.getElementById("diagnosis-export").open = true;
         text.focus();
