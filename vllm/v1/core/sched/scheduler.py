@@ -54,6 +54,7 @@ from vllm.v1.core.sched.request_queue import (
 from vllm.v1.core.sched.utils import check_stop, remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
@@ -1235,6 +1236,7 @@ class Scheduler(SchedulerInterface):
         )
 
         scheduler_output = SchedulerOutput(
+            ttft_execution_id=ttft_diag.new_id("execution"),
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,

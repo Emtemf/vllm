@@ -208,6 +208,8 @@ class Request:
         self.ttft_load_kv_time = 0.0
         self.ttft_forward_time = 0.0
         self.ttft_save_kv_time = 0.0
+        # EngineCore adds each completed pre-first-token update exactly once.
+        self.ttft_update_time = 0.0
         # TTFT breakdown: KV-transfer-only steps (no model execution), seen
         # in PD-mixed deployments. kv_transfer_time holds their pure wait
         # segment; without it the time vanishes from the breakdown.

@@ -7,6 +7,12 @@ env gate was removed so logs are always available).
 Monotonic timestamps are comparable only within a host clock domain; stages
 and ranks can overlap. No device synchronization is performed, and logging
 failures are non-fatal.
+
+Scheduler payloads carry execution_id through queued results. Batch host
+intervals overlap across ranks and must not be summed as request time.
+Deferred worker_save intervals retain the scope of their originating forward.
+The separate QUEUE record is subtractable only when initial_queue_valid=true;
+it never represents total queueing after requeue or preemption.
 """
 
 import itertools
@@ -154,6 +160,7 @@ def span(event: str, **fields: Any):
 def batch_fields(scheduler_output: Any) -> dict[str, Any]:
     """Snapshot existing IDs only; never retain a mutable scheduler payload."""
     return {
+        "execution_id": scheduler_output.ttft_execution_id,
         "request_ids": tuple(scheduler_output.num_scheduled_tokens),
         "finished_request_ids": tuple(sorted(scheduler_output.finished_req_ids)),
         "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,

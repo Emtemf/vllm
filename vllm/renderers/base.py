@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
+import json
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
@@ -42,6 +43,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import make_async
 from vllm.utils.counter import AtomicCounter
 from vllm.utils.torch_utils import set_default_torch_num_threads
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 from vllm.v1.metrics.stats import MultiModalCacheStats
 
 from .embed_utils import safe_load_prompt_embeds
@@ -67,6 +69,44 @@ logger = init_logger(__name__)
 
 
 _T = TypeVar("_T", bound=TokenizerLike, default=TokenizerLike)
+
+
+def _log_tokenizer_timing(
+    render_start_ns: int,
+    tokenize_start_ns: int,
+    end_ns: int,
+    n: int,
+) -> None:
+    context = ttft_diag.current()
+    request_id = context.get("request_id")
+    purpose = context.get("purpose", "unscoped")
+    logger.info(
+        "[TTFT_DEBUG][Tokenizer] render=%.6f tokenize=%.6f n=%d "
+        "request_id=%s purpose=%s render_start_ns=%d render_end_ns=%d "
+        "tokenize_start_ns=%d tokenize_end_ns=%d",
+        (tokenize_start_ns - render_start_ns) / 1e9,
+        (end_ns - tokenize_start_ns) / 1e9,
+        n,
+        json.dumps(request_id),
+        json.dumps(purpose),
+        render_start_ns,
+        tokenize_start_ns,
+        tokenize_start_ns,
+        end_ns,
+    )
+    for event, start_ns, interval_end_ns in (
+        ("render", render_start_ns, tokenize_start_ns),
+        ("tokenize", tokenize_start_ns, end_ns),
+    ):
+        ttft_diag.emit(
+            event,
+            request_id=request_id,
+            purpose=purpose,
+            n=n,
+            start_ns=start_ns,
+            end_ns=interval_end_ns,
+            duration_ns=interval_end_ns - start_ns,
+        )
 
 
 class BaseRenderer(ABC, Generic[_T]):
@@ -249,7 +289,10 @@ class BaseRenderer(ABC, Generic[_T]):
                 logger.debug("Warming up chat template processing...")
                 start_time = time.perf_counter()
 
-                self.render_chat([[{"role": "user", "content": "warmup"}]], chat_params)
+                with ttft_diag.scope(request_id=None, purpose="warmup"):
+                    self.render_chat(
+                        [[{"role": "user", "content": "warmup"}]], chat_params
+                    )
 
                 elapsed = time.perf_counter() - start_time
                 logger.debug("Chat template warmup completed in %.3fs", elapsed)
@@ -995,15 +1038,12 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_cmpl_tok_params
 
-        _t_render_start = time.perf_counter()
+        _t_render_start = time.monotonic_ns()
         dict_prompts = self.render_prompts(prompts)
-        _t_tok_start = time.perf_counter()
+        _t_tok_start = time.monotonic_ns()
         tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
-        logger.info(
-            "[TTFT_DEBUG][Tokenizer] render=%.6f tokenize=%.6f n=%d",
-            _t_tok_start - _t_render_start,
-            time.perf_counter() - _t_tok_start,
-            len(tok_prompts),
+        _log_tokenizer_timing(
+            _t_render_start, _t_tok_start, time.monotonic_ns(), len(tok_prompts)
         )
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
@@ -1026,15 +1066,12 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_cmpl_tok_params
 
-        _t_render_start = time.perf_counter()
+        _t_render_start = time.monotonic_ns()
         dict_prompts = await self.render_prompts_async(prompts)
-        _t_tok_start = time.perf_counter()
+        _t_tok_start = time.monotonic_ns()
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
-        logger.info(
-            "[TTFT_DEBUG][Tokenizer] render=%.6f tokenize=%.6f n=%d",
-            _t_tok_start - _t_render_start,
-            time.perf_counter() - _t_tok_start,
-            len(tok_prompts),
+        _log_tokenizer_timing(
+            _t_render_start, _t_tok_start, time.monotonic_ns(), len(tok_prompts)
         )
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
@@ -1062,7 +1099,7 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_chat_tok_params
 
-        _t_render_start = time.perf_counter()
+        _t_render_start = time.monotonic_ns()
         rendered = [
             self.render_messages(conversation, chat_params)
             for conversation in conversations
@@ -1074,13 +1111,10 @@ class BaseRenderer(ABC, Generic[_T]):
             out_conversations.append(conv)
             dict_prompts.append(prompt)
 
-        _t_tok_start = time.perf_counter()
+        _t_tok_start = time.monotonic_ns()
         tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
-        logger.info(
-            "[TTFT_DEBUG][Tokenizer] render=%.6f tokenize=%.6f n=%d",
-            _t_tok_start - _t_render_start,
-            time.perf_counter() - _t_tok_start,
-            len(tok_prompts),
+        _log_tokenizer_timing(
+            _t_render_start, _t_tok_start, time.monotonic_ns(), len(tok_prompts)
         )
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
@@ -1106,7 +1140,7 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_chat_tok_params
 
-        _t_render_start = time.perf_counter()
+        _t_render_start = time.monotonic_ns()
         rendered = [
             self.render_messages_async(conversation, chat_params)
             for conversation in conversations
@@ -1118,13 +1152,10 @@ class BaseRenderer(ABC, Generic[_T]):
             out_conversations.append(conv)
             dict_prompts.append(prompt)
 
-        _t_tok_start = time.perf_counter()
+        _t_tok_start = time.monotonic_ns()
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
-        logger.info(
-            "[TTFT_DEBUG][Tokenizer] render=%.6f tokenize=%.6f n=%d",
-            _t_tok_start - _t_render_start,
-            time.perf_counter() - _t_tok_start,
-            len(tok_prompts),
+        _log_tokenizer_timing(
+            _t_render_start, _t_tok_start, time.monotonic_ns(), len(tok_prompts)
         )
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)

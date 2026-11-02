@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
@@ -9,6 +10,7 @@ import torch.nn as nn
 
 import vllm.ir
 from vllm.config import VllmConfig, set_current_vllm_config
+from vllm.distributed import get_tp_group
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.multimodal import MULTIMODAL_REGISTRY
@@ -356,6 +358,8 @@ class WorkerWrapperBase:
             task_id=ttft_diag.new_id("worker_batch"),
             rpc_rank=self.rpc_rank,
             global_rank=self.global_rank,
+            tp_rank=get_tp_group().rank_in_group,
+            native_tid=threading.get_native_id(),
         )
         with ttft_diag.scope(**diagnostic_fields):
             self._apply_mm_cache(scheduler_output)
@@ -375,6 +379,8 @@ class WorkerWrapperBase:
             "association": "unavailable",
             "rpc_rank": self.rpc_rank,
             "global_rank": self.global_rank,
+            "tp_rank": get_tp_group().rank_in_group,
+            "native_tid": threading.get_native_id(),
             "task_id": ttft_diag.new_id("worker_sample"),
         }
         with (

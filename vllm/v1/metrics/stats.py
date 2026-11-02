@@ -232,6 +232,14 @@ class RequestStateStats:
     first_token_ts: float = 0.0
     last_token_ts: float = 0.0
 
+    # Diagnostic-only initial queue provenance; do not change retained metrics.
+    initial_queued_ts: float | None = None
+    initial_scheduled_ts: float | None = None
+    queue_event_count: int = 0
+    scheduled_event_count: int = 0
+    preemption_count: int = 0
+    initial_queue_integrity: bool = True
+
     # first token latency
     first_token_latency: float = 0.0
 
@@ -459,20 +467,20 @@ class IterationStats:
                 output.ttft_num_steps,
             )
             if ttft_diag.enabled():
-                # These are retained existing events, not necessarily the
-                # initial queue interval (QUEUED can be overwritten on requeue).
-                # Do not subtract frontend wall time from core monotonic time.
-                queued_mono = req_stats.queued_ts if req_stats.queued_ts > 0.0 else None
-                scheduled_mono = (
-                    req_stats.scheduled_ts if req_stats.scheduled_ts > 0.0 else None
-                )
-                queue_wait = (
-                    scheduled_mono - queued_mono
-                    if queued_mono is not None
+                # Initial-only host interval, never total queueing. Missing or
+                # reordered events and any requeue/preemption invalidate it.
+                queued_mono = req_stats.initial_queued_ts
+                scheduled_mono = req_stats.initial_scheduled_ts
+                queue_valid = (
+                    req_stats.initial_queue_integrity
+                    and req_stats.queue_event_count == 1
+                    and req_stats.scheduled_event_count == 1
+                    and req_stats.preemption_count == 0
+                    and queued_mono is not None
                     and scheduled_mono is not None
                     and scheduled_mono >= queued_mono
-                    else None
                 )
+                queue_wait = scheduled_mono - queued_mono if queue_valid else None
                 with suppress(Exception):
                     logger.info(
                         "[TTFT][QUEUE] req=%s frontend_arrival_wall_s=%s "
@@ -480,7 +488,9 @@ class IterationStats:
                         "core_retained_queued_mono_s=%s "
                         "core_retained_first_scheduled_mono_s=%s "
                         "core_first_token_output_mono_s=%s "
-                        "queue_wait_s=%s reason=%s",
+                        "queue_wait_s=%s reason=%s initial_queue_valid=%s "
+                        "preemptions=%d queued_events=%d scheduled_events=%d "
+                        "timing_scope=initial_queue_host",
                         output.request_id,
                         req_stats.arrival_time,
                         self.iteration_timestamp,
@@ -488,9 +498,11 @@ class IterationStats:
                         scheduled_mono,
                         req_stats.first_token_ts,
                         queue_wait,
-                        "available"
-                        if queue_wait is not None
-                        else "unavailable_or_requeued",
+                        "available" if queue_valid else "unavailable_or_requeued",
+                        "true" if queue_valid else "false",
+                        req_stats.preemption_count,
+                        req_stats.queue_event_count,
+                        req_stats.scheduled_event_count,
                     )
         else:
             itl = engine_core_timestamp - req_stats.last_token_ts
@@ -512,13 +524,31 @@ class IterationStats:
 
         for event in events:
             if event.type == EngineCoreEventType.QUEUED:
+                req_stats.queue_event_count += 1
+                if req_stats.queue_event_count == 1:
+                    req_stats.initial_queued_ts = event.timestamp
+                if (
+                    req_stats.queue_event_count != 1
+                    or req_stats.scheduled_event_count != 0
+                ):
+                    req_stats.initial_queue_integrity = False
                 req_stats.queued_ts = event.timestamp
                 lora_states.request_waiting(req_id, lora_name)
             elif event.type == EngineCoreEventType.SCHEDULED:
+                req_stats.scheduled_event_count += 1
+                if req_stats.scheduled_event_count == 1:
+                    req_stats.initial_scheduled_ts = event.timestamp
+                if (
+                    req_stats.scheduled_event_count != 1
+                    or req_stats.queue_event_count != 1
+                ):
+                    req_stats.initial_queue_integrity = False
                 if req_stats.scheduled_ts == 0.0:  # ignore preemptions
                     req_stats.scheduled_ts = event.timestamp
                 lora_states.request_running(req_id, lora_name)
             elif event.type == EngineCoreEventType.PREEMPTED:
+                req_stats.preemption_count += 1
+                req_stats.initial_queue_integrity = False
                 self.num_preempted_reqs += 1
                 lora_states.request_waiting(req_id, lora_name)
 

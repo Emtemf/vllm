@@ -210,14 +210,12 @@ class EngineCoreOutput(
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
 
-    # TTFT breakdown: per-request timing (seconds).
-    # Schedule sub-timings are per-request (only set for the step where
-    # the request was first scheduled or had cache lookup).
+    # TTFT breakdown: accumulated per-request pre-first-token timings (seconds).
     hash_and_local_cache_time: float = 0.0
     external_lookup_time: float = 0.0
     allocate_slots_time: float = 0.0
     schedule_overhead_time: float = 0.0
-    # Worker-side timings from KVConnectorOutput (set for every step).
+    # Worker-side pre-first-token totals from KVConnectorOutput.
     load_kv_time: float = 0.0
     forward_time: float = 0.0
     save_kv_time: float = 0.0
@@ -225,7 +223,7 @@ class EngineCoreOutput(
     # (PD-mixed deployments). Zero on PD-separated runs.
     kv_transfer_time: float = 0.0
     ttft_no_forward_steps: int = 0
-    # EngineCore update_from_output time (per-step, divided by num_total_scheduled_reqs).
+    # Accumulated update_from_output shares (each step divided by scheduled reqs).
     update_time: float = 0.0
     # TTFT breakdown: chunked-prefill diagnostics.
     ttft_num_scheduled_tokens: int = 0

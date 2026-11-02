@@ -64,6 +64,7 @@ from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.collection_utils import as_list
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 
 logger = init_logger(__name__)
 
@@ -249,15 +250,15 @@ class OpenAIServingChat(GenerateBaseServing):
                 chat_template_kwargs=chat_template_kwargs,
                 model_config=self.model_config,
             )
-        result = await self.render_chat_request(request)
+        request_id = (
+            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
+        )
+        with ttft_diag.scope(request_id=request_id, purpose="business"):
+            result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
 
         conversation, engine_inputs = result
-
-        request_id = (
-            f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-        )
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
         if raw_request:

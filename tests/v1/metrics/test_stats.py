@@ -1,7 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from unittest.mock import Mock
+
+import pytest
+
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
-from vllm.v1.engine import EngineCoreOutputs, FinishReason
+from vllm.v1.engine import (
+    EngineCoreEvent,
+    EngineCoreEventType,
+    EngineCoreOutputs,
+    FinishReason,
+)
 from vllm.v1.metrics.stats import (
     IterationStats,
     PrefillStats,
@@ -12,6 +21,40 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.utils import compute_iteration_details
+
+
+@pytest.mark.parametrize(
+    "event_names,integrity,queued_count,scheduled_count,preemptions",
+    [
+        (["QUEUED", "SCHEDULED"], True, 1, 1, 0),
+        (["SCHEDULED"], False, 0, 1, 0),
+        (["SCHEDULED", "QUEUED"], False, 1, 1, 0),
+        (["QUEUED", "QUEUED", "SCHEDULED"], False, 2, 1, 0),
+        (["QUEUED", "SCHEDULED", "PREEMPTED"], False, 1, 1, 1),
+        (["QUEUED", "SCHEDULED", "SCHEDULED"], False, 1, 2, 0),
+    ],
+)
+def test_initial_queue_provenance_rejects_incomplete_or_requeued_events(
+    event_names, integrity, queued_count, scheduled_count, preemptions
+):
+    stats = RequestStateStats()
+    events = [
+        EngineCoreEvent(type=getattr(EngineCoreEventType, name), timestamp=float(i + 1))
+        for i, name in enumerate(event_names)
+    ]
+    IterationStats().update_from_events(
+        "req", events, True, stats, Mock(), None
+    )
+    assert stats.initial_queue_integrity is integrity
+    assert stats.queue_event_count == queued_count
+    assert stats.scheduled_event_count == scheduled_count
+    assert stats.preemption_count == preemptions
+    if queued_count:
+        first_queued = event_names.index("QUEUED") + 1
+        assert stats.initial_queued_ts == float(first_queued)
+    if scheduled_count:
+        first_scheduled = event_names.index("SCHEDULED") + 1
+        assert stats.initial_scheduled_ts == float(first_scheduled)
 
 
 def test_iteration_stats_repr():

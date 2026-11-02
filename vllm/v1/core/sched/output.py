@@ -276,6 +276,9 @@ class SchedulerOutput:
     num_scheduled_new_reqs: int = 0
     num_total_scheduled_reqs: int = 0
 
+    # Assigned once by schedule(); retained with queued execution payloads.
+    ttft_execution_id: str = ""
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

@@ -4,6 +4,7 @@
 Define KV connector functionality mixin for model runners.
 """
 
+import time
 from collections.abc import Generator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -18,6 +19,7 @@ from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend
 from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
@@ -29,15 +31,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-import time
 
-# TTFT breakdown: KVConnectorOutput whose save time was deferred
-# (sentinel -1.0). Kept so finalize_kv_connector() can fill the actual
-# wait_for_save() time in place on the same object the model runner
-# later attaches to ModelRunnerOutput. The execute_model ->
-# sample_tokens flow is sequential per worker process, so a single
-# module-level reference is sufficient.
+# Keep the originating scope with the deferred output: sample_tokens may run
+# outside execute_model's scope, and later executions must not relabel this save.
 _pending_deferred_kv_output: "KVConnectorOutput | None" = None
+_pending_deferred_kv_fields: dict | None = None
 
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
@@ -60,7 +58,7 @@ class KVConnectorModelRunnerMixin:
         # The unclaimed wait segment (wall minus load/sched/update) is
         # attributed to kv_transfer so it no longer vanishes into residual.
         # forward stays 0 by definition; save_kv stays 0 (wait_for_save=False).
-        if kv_connector_output is not None:
+        if kv_connector_output is not None and output.kv_connector_output is not None:
             output.worker_no_forward_step = True
             # Pure wait segment: the no-forward yield body is empty, so the
             # whole t1..t2 span (worker_forward_time) is connector-side wait.
@@ -89,11 +87,24 @@ class KVConnectorModelRunnerMixin:
         Returns the time (seconds) spent in wait_for_save().
         """
         global _pending_deferred_kv_output
+        global _pending_deferred_kv_fields
+        diagnostic_fields = _pending_deferred_kv_fields
+        if diagnostic_fields is None:
+            diagnostic_fields = {
+                "execution_id": None,
+                "request_ids": (),
+                "association": "unavailable",
+                "timing_scope": "shared_batch_host",
+            }
         save_time = 0.0
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
             t0 = time.perf_counter()
-            kv_connector.wait_for_save()
+            with (
+                ttft_diag.scope(**diagnostic_fields),
+                ttft_diag.span("worker_save", deferred=True),
+            ):
+                kv_connector.wait_for_save()
             save_time = time.perf_counter() - t0
             kv_connector.clear_connector_metadata()
         # TTFT breakdown: fill the -1.0 sentinel in place on the deferred
@@ -106,6 +117,7 @@ class KVConnectorModelRunnerMixin:
                 _pending_deferred_kv_output.worker_save_kv_time = save_time
                 logger.info("[TTFT_DEBUG][Worker] deferred_save=%.6f", save_time)
             _pending_deferred_kv_output = None
+            _pending_deferred_kv_fields = None
         return save_time
 
     # This context manager must be used within an active forward context.
@@ -118,6 +130,8 @@ class KVConnectorModelRunnerMixin:
         defer_finalize: bool = False,
     ) -> Generator[KVConnectorOutput, None, None]:
         output = KVConnectorOutput()
+        diagnostic_fields = ttft_diag.current()
+        diagnostic_fields.update(ttft_diag.batch_fields(scheduler_output))
 
         # Update KVConnector with the KVConnector metadata forward().
         kv_connector = get_kv_transfer_group()
@@ -130,15 +144,32 @@ class KVConnectorModelRunnerMixin:
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
         t0 = time.perf_counter()
-        kv_connector.start_load_kv(get_forward_context())
+        with (
+            ttft_diag.scope(**diagnostic_fields),
+            ttft_diag.span("worker_load"),
+        ):
+            kv_connector.start_load_kv(get_forward_context())
         t1 = time.perf_counter()
+        forward_start_ns = time.monotonic_ns()
         try:
             yield output
         finally:
             t2 = time.perf_counter()
+            forward_end_ns = time.monotonic_ns()
+            ttft_diag.emit(
+                "worker_forward",
+                **diagnostic_fields,
+                start_ns=forward_start_ns,
+                end_ns=forward_end_ns,
+                duration_ns=forward_end_ns - forward_start_ns,
+            )
             t5 = time.perf_counter()
             if wait_for_save and not defer_finalize:
-                kv_connector.wait_for_save()
+                with (
+                    ttft_diag.scope(**diagnostic_fields),
+                    ttft_diag.span("worker_save", deferred=False),
+                ):
+                    kv_connector.wait_for_save()
                 t6 = time.perf_counter()
                 save_kv_time = t6 - t5
             else:
@@ -156,7 +187,9 @@ class KVConnectorModelRunnerMixin:
 
             if save_kv_time < 0:
                 global _pending_deferred_kv_output
+                global _pending_deferred_kv_fields
                 _pending_deferred_kv_output = output
+                _pending_deferred_kv_fields = diagnostic_fields
 
             logger.info(
                 "[TTFT_DEBUG][Worker] load=%.6f forward=%.6f save=%.6f "

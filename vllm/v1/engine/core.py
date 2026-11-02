@@ -619,17 +619,34 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         with ttft_diag.span("engine_update", path="sync", **diagnostic_fields):
+            ttft_requests = self._ttft_prefilling_requests(scheduler_output)
             _t_update_start = time.perf_counter()
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output
             )
             _update_time = time.perf_counter() - _t_update_start
         self._attach_ttft_breakdown(
-            scheduler_output, model_output, engine_core_outputs, _update_time
+            scheduler_output,
+            model_output,
+            engine_core_outputs,
+            _update_time,
+            ttft_requests,
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _ttft_prefilling_requests(
+        self, scheduler_output: SchedulerOutput
+    ) -> dict[str, Request]:
+        # Retain objects across update_from_output, which can finish/remove
+        # requests or append their first token before timing is available.
+        return {
+            req_id: request
+            for req_id in scheduler_output.num_scheduled_tokens
+            if (request := self.scheduler.requests.get(req_id)) is not None
+            and not request.output_token_ids
+        }
 
     def _attach_ttft_breakdown(
         self,
@@ -637,10 +654,13 @@ class EngineCore:
         model_output: ModelRunnerOutput | None,
         engine_core_outputs: dict[int, EngineCoreOutputs] | None,
         update_time: float,
+        ttft_requests: dict[str, Request],
     ) -> None:
         # Attach TTFT breakdown timings to each EngineCoreOutput.
         _num_total = scheduler_output.num_total_scheduled_reqs
         _update_per_req = update_time / _num_total if _num_total > 0 else 0.0
+        for request in ttft_requests.values():
+            request.ttft_update_time += _update_per_req
         _worker_load = 0.0
         _worker_forward = 0.0
         _worker_save = 0.0
@@ -661,8 +681,12 @@ class EngineCore:
         logger.info(
             "[TTFT_DEBUG][EngineCore] load=%.6f forward=%.6f save=%.6f "
             "sched_hash=%.6f sched_ext=%.6f sched_alloc=%.6f sched_overhead=%.6f "
-            "num_new=%d num_total=%d num_tokens=%d update=%.6f",
-            _worker_load, _worker_forward, _worker_save,
+            "num_new=%d num_total=%d num_tokens=%d update=%.6f "
+            "execution_id=%s request_ids=%s prefill_request_ids=%s "
+            "timing_scope=shared_batch_host",
+            _worker_load,
+            _worker_forward,
+            _worker_save,
             scheduler_output.schedule_hash_time,
             scheduler_output.schedule_external_lookup_time,
             scheduler_output.schedule_allocate_slots_time,
@@ -671,15 +695,17 @@ class EngineCore:
             scheduler_output.num_total_scheduled_reqs,
             scheduler_output.total_num_scheduled_tokens,
             _update_per_req,
+            scheduler_output.ttft_execution_id,
+            ",".join(scheduler_output.num_scheduled_tokens),
+            ",".join(ttft_requests) or "[]",
         )
 
         _num_attached = 0
         for _outputs in engine_core_outputs.values() if engine_core_outputs else []:
             for _eco in _outputs.outputs:
-                # The other 7 fields carry per-request accumulated totals
-                # set by Scheduler.update_from_output; only update_time is
-                # per-step and attached here.
-                _eco.update_time = _update_per_req
+                request = ttft_requests.get(_eco.request_id)
+                if request is not None:
+                    _eco.update_time = request.ttft_update_time
                 _num_attached += 1
 
         if _num_attached > 0:
@@ -762,7 +788,6 @@ class EngineCore:
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
 
-
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
@@ -803,13 +828,18 @@ class EngineCore:
         # during the model execution.
         self._process_aborts_queue()
         with ttft_diag.span("engine_update", path="batch_queue", **diagnostic_fields):
+            ttft_requests = self._ttft_prefilling_requests(scheduler_output)
             _t_update_start = time.perf_counter()
             engine_core_outputs = self.scheduler.update_from_output(
                 scheduler_output, model_output
             )
             _update_time = time.perf_counter() - _t_update_start
         self._attach_ttft_breakdown(
-            scheduler_output, model_output, engine_core_outputs, _update_time
+            scheduler_output,
+            model_output,
+            engine_core_outputs,
+            _update_time,
+            ttft_requests,
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
 
@@ -833,9 +863,7 @@ class EngineCore:
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
-            future = self.model_executor.sample_tokens(
-                grammar_output, non_block=True
-            )
+            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
