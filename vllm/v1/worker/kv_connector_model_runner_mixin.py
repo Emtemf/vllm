@@ -99,13 +99,10 @@ class KVConnectorModelRunnerMixin:
         save_time = 0.0
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
-            t0 = time.perf_counter()
-            with (
-                ttft_diag.scope(**diagnostic_fields),
-                ttft_diag.span("worker_save", deferred=True),
-            ):
+            with ttft_diag.scope(**diagnostic_fields):
+                t0 = time.perf_counter()
                 kv_connector.wait_for_save()
-            save_time = time.perf_counter() - t0
+                save_time = time.perf_counter() - t0
             kv_connector.clear_connector_metadata()
         # TTFT breakdown: fill the -1.0 sentinel in place on the deferred
         # KVConnectorOutput. The model runner holds the same object and
@@ -147,72 +144,63 @@ class KVConnectorModelRunnerMixin:
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
-        t0 = time.perf_counter()
-        with (
-            ttft_diag.scope(**diagnostic_fields),
-            ttft_diag.span("worker_load"),
-        ):
+        with ttft_diag.scope(**diagnostic_fields):
+            t0 = time.perf_counter()
             kv_connector.start_load_kv(get_forward_context())
-        t1 = time.perf_counter()
-        try:
-            with (
-                ttft_diag.scope(**diagnostic_fields),
-                ttft_diag.span("worker_forward"),
-            ):
+            t1 = time.perf_counter()
+            try:
                 try:
                     yield output
                 finally:
                     t2 = time.perf_counter()
-        finally:
-            t5 = time.perf_counter()
-            if wait_for_save and not defer_finalize:
-                with (
-                    ttft_diag.scope(**diagnostic_fields),
-                    ttft_diag.span("worker_save", deferred=False),
-                ):
+            finally:
+                t5 = time.perf_counter()
+                if wait_for_save and not defer_finalize:
                     kv_connector.wait_for_save()
-                t6 = time.perf_counter()
-                save_kv_time = t6 - t5
-            else:
-                # Deferred: wait_for_save() will be called later by
-                # finalize_kv_connector(). Mark with -1 sentinel so the
-                # caller knows to fill in the actual time.
-                save_kv_time = -1.0 if (wait_for_save and defer_finalize) else 0.0
+                    t6 = time.perf_counter()
+                    save_kv_time = t6 - t5
+                else:
+                    # Deferred: wait_for_save() will be called later by
+                    # finalize_kv_connector(). Mark with -1 sentinel so the
+                    # caller knows to fill in the actual time.
+                    save_kv_time = -1.0 if (wait_for_save and defer_finalize) else 0.0
 
-            forward_time = t2 - t1
-            load_kv_time = t1 - t0
+                forward_time = t2 - t1
+                load_kv_time = t1 - t0
 
-            output.worker_load_kv_time = load_kv_time
-            output.worker_forward_time = forward_time
-            output.worker_save_kv_time = save_kv_time
+                output.worker_load_kv_time = load_kv_time
+                output.worker_forward_time = forward_time
+                output.worker_save_kv_time = save_kv_time
 
-            if save_kv_time < 0:
-                global _pending_deferred_kv_output
-                global _pending_deferred_kv_fields
-                _pending_deferred_kv_output = output
-                _pending_deferred_kv_fields = diagnostic_fields
+                if save_kv_time < 0:
+                    global _pending_deferred_kv_output
+                    global _pending_deferred_kv_fields
+                    _pending_deferred_kv_output = output
+                    _pending_deferred_kv_fields = diagnostic_fields
 
-            logger.info(
-                "[TTFT_DEBUG][Worker] load=%.6f forward=%.6f save=%.6f "
-                "(defer_finalize=%s, wait_for_save=%s)",
-                load_kv_time,
-                forward_time,
-                save_kv_time,
-                defer_finalize,
-                wait_for_save,
-            )
+                logger.info(
+                    "[TTFT_DEBUG][Worker] load=%.6f forward=%.6f save=%.6f "
+                    "(defer_finalize=%s, wait_for_save=%s)",
+                    load_kv_time,
+                    forward_time,
+                    save_kv_time,
+                    defer_finalize,
+                    wait_for_save,
+                )
 
-            output.finished_sending, output.finished_recving = (
-                kv_connector.get_finished(scheduler_output.finished_req_ids)
-            )
-            output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+                output.finished_sending, output.finished_recving = (
+                    kv_connector.get_finished(scheduler_output.finished_req_ids)
+                )
+                output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
 
-            output.kv_connector_stats = kv_connector.get_kv_connector_stats()
-            output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
-            output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
+                output.kv_connector_stats = kv_connector.get_kv_connector_stats()
+                output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
+                output.kv_connector_worker_meta = (
+                    kv_connector.build_connector_worker_meta()
+                )
 
-            if not defer_finalize:
-                kv_connector.clear_connector_metadata()
+                if not defer_finalize:
+                    kv_connector.clear_connector_metadata()
 
     @staticmethod
     def use_uniform_kv_cache(

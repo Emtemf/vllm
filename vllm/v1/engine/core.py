@@ -84,7 +84,6 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     fault_tolerant_wrapper,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig, get_kv_cache_spec_kind
-from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -593,38 +592,25 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        with ttft_diag.span("engine_schedule", path="sync") as schedule_diag:
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-            diagnostic_fields = ttft_diag.batch_fields(scheduler_output)
-            if schedule_diag is not None:
-                schedule_diag.update(diagnostic_fields)
-        with ttft_diag.scope(path="sync", **diagnostic_fields):
-            with ttft_diag.span("engine_execute_submit"):
-                future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
-            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            with ttft_diag.span(
-                "engine_execute_wait", path="sync", **diagnostic_fields
-            ):
-                model_output = future.result()
+            model_output = future.result()
             if model_output is None:
-                with ttft_diag.span("engine_sample", path="sync", **diagnostic_fields):
-                    model_output = self.model_executor.sample_tokens(grammar_output)
+                model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
-        with ttft_diag.span("engine_update", path="sync", **diagnostic_fields):
-            ttft_requests = self._ttft_prefilling_requests(scheduler_output)
-            _t_update_start = time.perf_counter()
-            engine_core_outputs = self.scheduler.update_from_output(
-                scheduler_output, model_output
-            )
-            _update_time = time.perf_counter() - _t_update_start
+        ttft_requests = self._ttft_prefilling_requests(scheduler_output)
+        _t_update_start = time.perf_counter()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
+        _update_time = time.perf_counter() - _t_update_start
         self._attach_ttft_breakdown(
             scheduler_output,
             model_output,
@@ -751,19 +737,8 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
-            with ttft_diag.span("engine_schedule", path="batch_queue") as schedule_diag:
-                scheduler_output = self.scheduler.schedule(
-                    self._should_throttle_prefills()
-                )
-                diagnostic_fields = ttft_diag.batch_fields(scheduler_output)
-                if schedule_diag is not None:
-                    schedule_diag.update(diagnostic_fields)
-            with (
-                self.log_error_detail(scheduler_output),
-                ttft_diag.span(
-                    "engine_execute_submit", path="batch_queue", **diagnostic_fields
-                ),
-            ):
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
@@ -806,34 +781,26 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
-        diagnostic_fields = ttft_diag.batch_fields(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            with ttft_diag.span(
-                "engine_result_wait", path="batch_queue", **diagnostic_fields
-            ):
-                model_output = future.result()
+            model_output = future.result()
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
-                with ttft_diag.span(
-                    "engine_execute_error_wait", path="batch_queue", **diagnostic_fields
-                ):
-                    exec_model_fut.result()
+                exec_model_fut.result()
                 raise RuntimeError("unexpected error")
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        with ttft_diag.span("engine_update", path="batch_queue", **diagnostic_fields):
-            ttft_requests = self._ttft_prefilling_requests(scheduler_output)
-            _t_update_start = time.perf_counter()
-            engine_core_outputs = self.scheduler.update_from_output(
-                scheduler_output, model_output
-            )
-            _update_time = time.perf_counter() - _t_update_start
+        ttft_requests = self._ttft_prefilling_requests(scheduler_output)
+        _t_update_start = time.perf_counter()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
+        _update_time = time.perf_counter() - _t_update_start
         self._attach_ttft_breakdown(
             scheduler_output,
             model_output,

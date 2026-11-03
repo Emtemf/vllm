@@ -8,12 +8,13 @@ Monotonic timestamps are comparable only within a host clock domain; stages
 and ranks can overlap. No device synchronization is performed, and logging
 failures are non-fatal.
 
-Scheduler payloads carry execution_id through queued results. Batch host
-intervals overlap across ranks and must not be summed as request time.
-Spans emit one completion with monotonic bounds and start wall/thread provenance.
-Sample RPCs carry no execution ID; optional grammar IDs are only a batch subset.
-Actual output membership is available only after sampling/materialization.
-Deferred worker_save intervals retain the scope of their originating forward.
+Scheduler payloads carry execution_id through queued results. Each worker emits
+one untimed execution identity, including ranks that do not save KV, and scopes
+that identity for downstream store capture. Deferred saves retain the scope of
+their originating execution even though sample RPCs carry no execution ID.
+Native backend-put and rendering/tokenization spans emit one completion with
+monotonic bounds and start wall/thread provenance. Overlapping host spans must
+not be summed as request time.
 The separate QUEUE record is subtractable only when initial_queue_valid=true;
 it never represents total queueing after requeue or preemption.
 """
@@ -162,7 +163,7 @@ def _span(event: str, fields: dict[str, Any]):
         start_ns = None
     status = "ok"
     try:
-        # Callers may add output membership after a scheduling operation.
+        # Callers may add completion metadata without changing the interval.
         yield fields
     except BaseException:
         status = "error"
@@ -194,7 +195,5 @@ def batch_fields(scheduler_output: Any) -> dict[str, Any]:
     return {
         "execution_id": scheduler_output.ttft_execution_id,
         "request_ids": tuple(scheduler_output.num_scheduled_tokens),
-        "finished_request_ids": tuple(sorted(scheduler_output.finished_req_ids)),
-        "scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
         "timing_scope": "shared_batch_host",
     }

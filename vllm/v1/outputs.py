@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import time
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from contextlib import suppress
 from copy import copy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple, TypeAlias
@@ -14,7 +12,6 @@ import torch
 
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_events import KVConnectorKVEvents
@@ -353,45 +350,6 @@ class AsyncModelRunnerOutput(ABC):
         This method should only be called once per AsyncModelRunnerOutput.
         """
         pass
-
-
-class DiagnosticAsyncModelRunnerOutput(AsyncModelRunnerOutput):
-    """Local-only diagnostic wrapper; never changes the serialized output.
-
-    Capture each output's association before an executor queues it to another
-    thread; sample request membership is recovered only on materialization.
-    Shared/empty ModelRunnerOutputs themselves are never annotated.
-    """
-
-    def __init__(self, output: AsyncModelRunnerOutput, fields: dict):
-        self._output = output
-        self._fields = fields.copy()
-        self._queued_ns = time.monotonic_ns()
-        ttft_diag.emit("worker_output_pending", **self._fields)
-
-    def get_output(self) -> ModelRunnerOutput:
-        materialize_fields = {"queued_ns": self._queued_ns}
-        with suppress(Exception):
-            materialize_fields["queue_delay_ns"] = (
-                time.monotonic_ns() - self._queued_ns
-            )
-        with (
-            ttft_diag.scope(**self._fields),
-            ttft_diag.span(
-                "worker_output_materialize", **materialize_fields
-            ) as materialize_diag,
-        ):
-            output = self._output.get_output()
-            try:
-                output_request_ids = tuple(output.req_ids)
-                materialize_diag["output_request_ids"] = output_request_ids
-                if self._fields.get("association") == "unavailable":
-                    materialize_diag.update(
-                        request_ids=output_request_ids, association="output"
-                    )
-            except Exception:
-                pass
-            return output
 
 
 @dataclass

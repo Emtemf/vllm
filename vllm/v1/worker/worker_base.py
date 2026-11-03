@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
@@ -349,10 +348,6 @@ class WorkerWrapperBase:
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        if not ttft_diag.enabled():
-            self._apply_mm_cache(scheduler_output)
-            return self.worker.execute_model(scheduler_output)
-
         try:
             diagnostic_fields = ttft_diag.batch_fields(scheduler_output)
             diagnostic_fields.update(
@@ -360,74 +355,20 @@ class WorkerWrapperBase:
                 rpc_rank=self.rpc_rank,
                 global_rank=self.global_rank,
                 tp_rank=get_tp_group().rank_in_group,
-                native_tid=threading.get_native_id(),
             )
         except Exception:
             self._apply_mm_cache(scheduler_output)
             return self.worker.execute_model(scheduler_output)
         with ttft_diag.scope(**diagnostic_fields):
             self._apply_mm_cache(scheduler_output)
-            with ttft_diag.span("worker_execute") as execute_diag:
-                output = self.worker.execute_model(scheduler_output)
-                try:
-                    output_request_ids = getattr(output, "req_ids", None)
-                    if output_request_ids is not None:
-                        execute_diag["output_request_ids"] = tuple(output_request_ids)
-                except Exception:
-                    pass
-        return self._ttft_trace_output(output, diagnostic_fields)
+            # Observe every participating rank, including executions with no save.
+            ttft_diag.emit("worker_execute")
+            return self.worker.execute_model(scheduler_output)
 
     def sample_tokens(
         self, grammar_output: GrammarOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        if not ttft_diag.enabled():
-            return self.worker.sample_tokens(grammar_output)
-        # The RPC has no execution ID; grammar IDs cover only structured output.
-        # Recover actual request membership from this call's output, never a
-        # preceding execute (PP execute-None does not imply a sampling call).
-        try:
-            diagnostic_fields = {
-                "execution_id": None,
-                "request_ids": (),
-                "association": "unavailable",
-                "rpc_rank": self.rpc_rank,
-                "global_rank": self.global_rank,
-                "tp_rank": get_tp_group().rank_in_group,
-                "native_tid": threading.get_native_id(),
-                "task_id": ttft_diag.new_id("worker_sample"),
-            }
-        except Exception:
-            return self.worker.sample_tokens(grammar_output)
-        with (
-            ttft_diag.scope(**diagnostic_fields),
-            ttft_diag.span("worker_sample") as sample_diag,
-        ):
-            output = self.worker.sample_tokens(grammar_output)
-            try:
-                output_request_ids = getattr(output, "req_ids", None)
-                if output_request_ids is not None:
-                    diagnostic_fields.update(
-                        request_ids=tuple(output_request_ids),
-                        association="output",
-                    )
-                    sample_diag.update(diagnostic_fields)
-            except Exception:
-                pass
-        return self._ttft_trace_output(output, diagnostic_fields)
-
-    @staticmethod
-    def _ttft_trace_output(output, diagnostic_fields):
-        try:
-            from vllm.v1.outputs import (
-                AsyncModelRunnerOutput,
-                DiagnosticAsyncModelRunnerOutput,
-            )
-
-            if isinstance(output, AsyncModelRunnerOutput):
-                return DiagnosticAsyncModelRunnerOutput(output, diagnostic_fields)
-        except Exception:
-            pass
-        return output
+        return self.worker.sample_tokens(grammar_output)
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
