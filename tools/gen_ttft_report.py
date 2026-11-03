@@ -15,7 +15,7 @@ Deploy matching vLLM and vllm-ascend diagnostics and retain startup TTFT_THREAD
 records. Mooncake's original batch_put_from_multi_buffers API and native phase
 logs are sufficient; no trace API is required. A build exposing optional trace
 APIs may remain installed. Old logs without execution/thread identity stay
-incomplete. All observed TP ranks are shown by default; --tp-rank filters timings.
+incomplete. All observed TP ranks are shown by default; --tp-rank filters TP rows.
 
 The table flattens every step and observed TP, retaining grouped put phases.
 Tokenizer candidates are selectable in the page; known warmups are disabled.
@@ -56,6 +56,9 @@ PHASES = (
 SCHEDULE = ("hash", "ext_lookup", "alloc", "overhead")
 ENGINE = ("sched_hash", "sched_ext", "sched_alloc", "sched_overhead", "load", "forward")
 SAVE = ("queue_wait", "build_key", "lookup", "prepare", "sync")
+FORWARD_L2 = ("model_call_pre", "model_call", "model_call_post")
+FORWARD_L3 = ("model_prepare", "model_graph_update", "model_run")
+FORWARD_FIELDS = ("forward",) + FORWARD_L2 + FORWARD_L3
 
 
 def pf(text):
@@ -180,6 +183,13 @@ def parse(path: Path):
                 _source=str(path),
                 _raw=line.rstrip(),
                 _worker=(rank, pid) if rank is not None and pid is not None else None,
+                _identity_conflict=bool(
+                    worker
+                    and (
+                        (rank is not None and rank != int(worker[1]))
+                        or (pid is not None and pid != int(worker[2]))
+                    )
+                ),
                 _pid=pid,
                 _prefer="[prefer_same_node]" in tail,
                 _native_tid=integer(
@@ -587,6 +597,37 @@ def associate_puts(data, saves):
     return result, unassigned
 
 
+def forward_records(data, request, executions):
+    """Require explicit forward identity; never infer a TP from another record."""
+    return [
+        record
+        for record in data["diag"]
+        if record.get("event") == "forward_breakdown"
+        and record.get("execution_id") not in (None, "", "null", "None")
+        and execution(record) in executions
+        and ids({"request_ids": record.get("request_ids", "")}) == {request}
+        and integer(record.get("tp_rank")) is not None
+        and record["_worker"] is not None
+        and not record["_identity_conflict"]
+    ]
+
+
+def forward_for_step(records, exec_id, worker, warnings):
+    matches = [
+        record
+        for record in records
+        if execution(record) == exec_id and record["_worker"] == worker
+    ]
+    if len(matches) != 1:
+        if matches:
+            warnings.append(
+                f"forward_breakdown execution={exec_id} Worker={worker} 重复；"
+                "该行 Forward 分层全部未知，不选择其中一条。"
+            )
+        return {}
+    return matches[0]
+
+
 def save_rows(data, request, end, steps, requested_rank, warnings):
     executions = {execution(step) for step in steps if execution(step)}
     saves = [
@@ -599,22 +640,40 @@ def save_rows(data, request, end, steps, requested_rank, warnings):
         for s in data["wfs"]
         if execution(s) in executions and (not ids(s) or ids(s) == {request})
     ]
+    forwards = forward_records(data, request, executions)
     workers = sorted(
         {
             s["_worker"]
             for s in saves
             + waits
-            + [r for r in data["diag"] if execution(r) in executions]
+            + [
+                r
+                for r in data["diag"]
+                if execution(r) in executions
+                and r.get("event") != "forward_breakdown"
+                and (not ids(r) or ids(r) == {request})
+            ]
             if s["_worker"] is not None
         }
     )
+    forward_workers = {r["_worker"] for r in forwards}
+    for rank in sorted({worker[0] for worker in forward_workers}):
+        candidates = {worker for worker in forward_workers if worker[0] == rank}
+        if any(worker[0] == rank for worker in workers):
+            if candidates - set(workers):
+                warnings.append(f"TP{rank} Forward 的 PID 与已知 Worker 不符，未借用。")
+        elif len(candidates) == 1:
+            workers.extend(candidates)
+        else:
+            warnings.append(f"TP{rank} Forward 有多个 Worker PID，身份有歧义，未认领。")
+    workers.sort()
     if not workers:
-        warnings.append("没有已关联 Worker 保存记录，保存明细缺失，不代表零耗时。")
+        warnings.append("没有已关联 Worker 记录，Forward/保存明细缺失，不代表零耗时。")
     if any(sum(w[0] == rank for w in workers) > 1 for rank in {w[0] for w in workers}):
         raise ValueError("同一个 TP 有多个 Worker PID，请先截取同一次运行的日志。")
     displayed = [w for w in workers if requested_rank is None or w[0] == requested_rank]
     if requested_rank is not None and not displayed:
-        raise ValueError(f"没有找到 TP{requested_rank} 的 Worker 保存日志。")
+        raise ValueError(f"没有找到 TP{requested_rank} 的 Worker 日志。")
     phase_map, unassigned = associate_puts(data, saves)
     if unassigned:
         warnings.append(
@@ -655,38 +714,22 @@ def save_rows(data, request, end, steps, requested_rank, warnings):
                     if values and all(v is not None for v in values)
                     else None
                 )
+            keys = 0 if empty else total(tasks, "keys")
+            byte_count = 0 if empty else total(tasks, "bytes")
             ranks.append(
                 {
                     "worker": worker,
+                    "forward": forward_for_step(forwards, exec_id, worker, warnings),
                     "values": [total(tasks, field) for field in SAVE] + phases,
                     "put": total(tasks, "put"),
+                    "volume": [
+                        keys,
+                        None if byte_count is None else byte_count / 1048576,
+                    ],
                     "empty": empty,
                 }
             )
-        all_empty = (
-            not all_tasks
-            and workers
-            and all(
-                any(
-                    w["_worker"] == candidate
-                    and execution(w) == exec_id
-                    and number(w.get("join")) == 0
-                    for w in waits
-                )
-                for candidate in workers
-            )
-        )
-        keys, byte_count = (
-            (0, 0)
-            if all_empty
-            else (total(all_tasks, "keys"), total(all_tasks, "bytes"))
-        )
-        rows.append(
-            {
-                "ranks": ranks,
-                "volume": [keys, None if byte_count is None else byte_count / 1048576],
-            }
-        )
+        rows.append({"ranks": ranks})
     return rows, displayed, saves
 
 
@@ -867,7 +910,7 @@ def render(
             f'<td rowspan="{span}" title="请求级 TTFT 仅在总计行展示"></td>',
             f'<td rowspan="{span}" title="请求级 tokenizer 仅在总计行展示"></td>',
         ]
-        for key in ENGINE:
+        for key in ENGINE[:4]:
             shared.append(
                 f'<td rowspan="{span}" '
                 f'title="EngineCore 日志行 {step.get("_line", "—")}">'
@@ -879,6 +922,34 @@ def render(
             source = "Worker 身份缺失" if worker is None else f"Worker PID {worker[1]}"
             cells = list(shared) if rank_index == 0 else []
             cells.append(f'<td class="rank" title="{escape(source)}">{label}</td>')
+            forward = rank["forward"]
+            cells.append(
+                f'<td data-field="load_kv">{fmt(number(forward.get("load_kv")))}</td>'
+            )
+            forward_source = (
+                f"forward_breakdown 行 {forward['_line']}；"
+                f"branch={forward.get('branch', '未知')}；"
+                f"status={forward.get('status', '未知')}；"
+                f"failed_stage={forward.get('failed_stage', '未知')}；"
+                f"model_forward_status={forward.get('model_forward_status', '未知')}；"
+                f"graph_mode={forward.get('graph_mode', '未知')}；"
+                f"capturing={forward.get('capturing', '未知')}"
+                if forward
+                else "缺少唯一匹配的 forward_breakdown"
+            )
+            for field in (
+                "model_call_pre",
+                *FORWARD_L3,
+                "model_call_post",
+            ):
+                value = number(forward.get(field))
+                if value is not None and value < 0:
+                    value = None
+                cells.append(
+                    f'<td class="forward-layer{" missing" if value is None else ""}" '
+                    f'data-field="{field}" title="{escape(forward_source)}">'
+                    f"{fmt(value)}</td>"
+                )
             for column, value in enumerate(rank["values"]):
                 if column >= 5 and (
                     rank["empty"]
@@ -902,9 +973,8 @@ def render(
                 if value is None:
                     classes += " missing"
                 cells.append(f'<td class="{classes.strip()}">{fmt(value)}</td>')
-            if rank_index == 0:
-                for value, digits in zip(save["volume"], (0, 1)):
-                    cells.append(f'<td rowspan="{span}">{fmt(value, digits)}</td>')
+            for field, value, digits in zip(("keys", "mib"), rank["volume"], (0, 1)):
+                cells.append(f'<td data-field="{field}">{fmt(value, digits)}</td>')
             row_class = ' class="step-start"' if rank_index == 0 else ""
             body.append(f"<tr{row_class}>" + "".join(cells) + "</tr>")
     worker_text = ", ".join(f"TP{w[0]} / PID {w[1]}" for w in workers) or "未知 Worker"
@@ -990,6 +1060,14 @@ def render(
         + "</span>"
     )
     save_evidence = "".join(evidence(r) for r in raw_saves)
+    forward_evidence = "".join(
+        evidence(record)
+        for record in data["diag"]
+        if record.get("event") == "forward_breakdown"
+        and execution(record) in {execution(step) for step in steps if execution(step)}
+        and ids(record) == {request}
+        and (tp_rank is None or integer(record.get("tp_rank")) == tp_rank)
+    )
     queue_evidence = evidence(queue) if queue else "<p>QUEUE 证据缺失或多条歧义。</p>"
     tokenizer_evidence = "".join(
         evidence(r)
@@ -1019,7 +1097,7 @@ def render(
 <h1>TTFT 逐 step × TP 统计</h1>
 <div class="meta">请求 <code>{escape(request)}</code> · mode={escape(mode)} ·
 {len(steps)} steps ·
-保存明细：{escape(worker_text)} · 时间 s，数据量 MiB</div>
+Worker 明细：{escape(worker_text)} · 主机 elapsed 时间 s，数据量 MiB</div>
 <div class="request">render
 <b><span id="render-value">{fmt(number(tok.get("render")))}</span> s</b>
 首次 Scheduler 排队 <b>{fmt(queue_time)} s</b>
@@ -1041,40 +1119,49 @@ JavaScript，不要在禁用脚本的聊天或文件预览中操作。
 <div class="scroll" tabindex="0" aria-label="逐 step × TP 统计表，可横向滚动">
 <table id="main-table"><thead>
 <tr><th>行</th><th>TTFT (s)</th><th>tokenizer (s)</th>
-<th colspan="4" class="ec">schedule (s)</th><th class="wk">start_load_kv (s)</th>
-<th class="wk">forward (s)</th>
-<th colspan="12" class="store">wait_for_save (s)</th></tr>
+<th colspan="4" class="ec">schedule (s)</th><th>TP</th>
+<th class="wk">start_load_kv (s)</th>
+<th colspan="5" class="wk">forward (s)</th>
+<th colspan="11" class="store">wait_for_save (s)</th></tr>
 <tr class="total"><th>总计</th><td>{fmt(ttft)}</td>
 <td id="tokenizer-value">{fmt(number(tok.get("tokenize")))}</td>
 <td colspan="4">{fmt(schedule)}</td>
-<td>{fmt(number(bd.get("load_kv")))}</td><td>{fmt(number(bd.get("forward")))}</td>
-<td colspan="12" class="store">
+<td></td><td>{fmt(number(bd.get("load_kv")))}</td>
+<td colspan="5">{fmt(number(bd.get("forward")))} · BREAKDOWN.forward</td>
+<td colspan="11" class="store">
 {fmt(number(bd.get("save_kv")))} · BREAKDOWN.save_kv</td></tr>
 <tr><th rowspan="2">执行轮次</th><th rowspan="2"></th><th rowspan="2"></th>
 <th rowspan="2" class="ec">hash</th>
 <th rowspan="2" class="ec">ext_lookup</th><th rowspan="2" class="ec">alloc</th>
-<th rowspan="2" class="ec">other</th><th rowspan="2" class="wk">load</th>
-<th rowspan="2" class="wk">forward</th>
-<th rowspan="2" class="store">TP</th>
-<th rowspan="2" class="store"
-title="保存任务从入队到保存线程开始处理的等待；不是 Scheduler 排队或外层 join">
-q_wait</th>
+<th rowspan="2" class="ec">other</th><th rowspan="2">TP</th>
+<th rowspan="2" class="wk">load（当前TP）</th>
+<th rowspan="2" class="wk">model_call_pre</th>
+<th colspan="3" class="wk">model_call</th>
+<th rowspan="2" class="wk">model_call_post</th>
+<th rowspan="2" class="store">q_wait</th>
 <th rowspan="2" class="store">build_key</th>
 <th rowspan="2" class="store">lookup</th>
 <th rowspan="2" class="store">prepare</th>
 <th rowspan="2" class="store">sync</th>
 <th colspan="4" class="put">put</th>
-<th rowspan="2" class="store">keys (全部TP)</th>
-<th rowspan="2" class="store">MiB (全部TP)</th></tr>
-<tr><th class="put">start</th>
-<th class="put">submit</th>
-<th class="put">wait</th>
-<th class="put">finalize</th>
+<th rowspan="2" class="store">keys (当前TP)</th>
+<th rowspan="2" class="store">MiB (当前TP)</th></tr>
+<tr><th class="wk">model_prepare</th><th class="wk">model_graph_update</th>
+<th class="wk">model_run</th>
+<th class="put">start</th><th class="put">submit</th>
+<th class="put">wait</th><th class="put">finalize</th>
 </tr></thead><tbody>{"".join(body)}</tbody></table></div>
 <p class="note">总计取请求级 BREAKDOWN；逐轮左侧取 EngineCore 记录；
 保存任务及 Mooncake 四阶段按 TP 独立分行，缺少某轮证据时保留缺失值；
-不跨 TP 相加或逐列取最大值。keys/MiB 汇总全部已记录 TP，每轮只展示一次，
---tp-rank 仅筛选时间明细，不改变数据量统计。未出现的 TP 无法从日志推断。</p>
+不跨 TP 相加或逐列取最大值。keys/MiB 在各 TP 行独立展示，只累计该 TP 的保存提交；
+顶部摘要仍汇总全部 TP。--tp-rank 筛选整行，不改变顶部总量。
+未出现的 TP 无法从日志推断。</p>
+<p class="note">Forward 分层只认同一 execution_id、唯一 request_ids、显式 tp_rank
+及 Worker PID 的单条 forward_breakdown；重复或身份歧义不选取、不借用其他 TP。
+load 取当前 TP 的 load_kv；L2 仅覆盖 KV with body，旧日志缺字段时不复制 EngineCore 值；
+L3 是 model_call 内部范围，嵌套层级不得相加或加入 BREAKDOWN/residual。
+均为主机 elapsed 秒，不是纯设备/网络时间；图更新可能在 model_run 前或后。
+分支与执行状态见数值提示；缺失、未执行、失败前未完成或图重放无新证据显示 —，不是 0。</p>
 <p class="note">
 wait_for_save 下方是保存相关明细，不代表各列相加等于外层接口时间。
 “—”表示缺失或无法关联，不表示 0。</p>
@@ -1097,7 +1184,7 @@ QUEUE 来源行 {queue_source}。
 人工候选只供查看，不作为已证明的 residual 扣减依据。</li>
 <li>QUEUE 仅有 initial_queue_valid=true、零 preemption、一次 QUEUED/SCHEDULED 时
 用于首次排队扣减；这不是请求累计排队量，旧日志无有效性证据则不扣减。</li>
-</ul>{evidence(bd)}{queue_evidence}{tokenizer_evidence}{save_evidence}</details>
+</ul>{evidence(bd)}{queue_evidence}{tokenizer_evidence}{save_evidence}{forward_evidence}</details>
 <script>
 const tokenizerSelect = document.getElementById("tokenizer-select");
 function updateTokenizer() {{

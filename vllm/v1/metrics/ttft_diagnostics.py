@@ -190,6 +190,29 @@ def span(event: str, **fields: Any):
     return _span(event, fields)
 
 
+@contextmanager
+def measure_elapsed(fields: dict[str, Any] | None, name: str):
+    """Record one host phase in caller-owned state without emitting a log."""
+    if fields is None:
+        yield
+        return
+    start = None
+    with suppress(Exception):
+        start = time.perf_counter()
+    try:
+        yield
+    except BaseException:
+        with suppress(Exception):
+            fields["status"] = "error"
+            if fields.get("failed_stage") is None:
+                fields["failed_stage"] = name
+        raise
+    finally:
+        with suppress(Exception):
+            if start is not None:
+                fields[name] = time.perf_counter() - start
+
+
 def batch_fields(scheduler_output: Any) -> dict[str, Any]:
     """Snapshot existing IDs only; never retain a mutable scheduler payload."""
     return {
