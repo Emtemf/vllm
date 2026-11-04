@@ -101,7 +101,8 @@ class KVConnectorModelRunnerMixin:
             kv_connector = get_kv_transfer_group()
             with ttft_diag.scope(**diagnostic_fields):
                 t0 = time.perf_counter()
-                kv_connector.wait_for_save()
+                with ttft_diag.worker_range("save"):
+                    kv_connector.wait_for_save()
                 save_time = time.perf_counter() - t0
             kv_connector.clear_connector_metadata()
         # TTFT breakdown: fill the -1.0 sentinel in place on the deferred
@@ -146,17 +147,20 @@ class KVConnectorModelRunnerMixin:
         # Do this here to save a collective_rpc.
         with ttft_diag.scope(**diagnostic_fields):
             t0 = time.perf_counter()
-            kv_connector.start_load_kv(get_forward_context())
+            with ttft_diag.worker_range("load"):
+                kv_connector.start_load_kv(get_forward_context())
             t1 = time.perf_counter()
             try:
                 try:
-                    yield output
+                    with ttft_diag.worker_range("forward"):
+                        yield output
                 finally:
                     t2 = time.perf_counter()
             finally:
                 t5 = time.perf_counter()
                 if wait_for_save and not defer_finalize:
-                    kv_connector.wait_for_save()
+                    with ttft_diag.worker_range("save"):
+                        kv_connector.wait_for_save()
                     t6 = time.perf_counter()
                     save_kv_time = t6 - t5
                 else:
