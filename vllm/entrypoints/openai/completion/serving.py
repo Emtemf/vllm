@@ -10,6 +10,7 @@ from typing import cast
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.serve.utils import pd_diagnostics as pd_api
 from vllm.entrypoints.generate.base.protocol import (
     PerRequestMetrics,
     RequestResponseMetadata,
@@ -175,6 +176,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 )
 
             request_id_item = f"{request_id}-{i}"
+            pd_api.request_link(request_id, request_id_item, i)
 
             self._log_inputs(
                 request_id_item,
@@ -261,6 +263,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
                 request_metadata,
             )
         except asyncio.CancelledError:
+            pd_api.generation_error(asyncio.CancelledError())
             return self.create_error_response("Client disconnected")
 
         # When user requests streaming but we don't stream, we still need to
@@ -440,6 +443,12 @@ class OpenAIServingCompletion(GenerateBaseServing):
                         )
 
                     response_json = chunk.model_dump_json(exclude_unset=True)
+                    if output.text or (request.return_token_ids and output.token_ids):
+                        pd_api.generated(
+                            request_id,
+                            kind="content" if output.text else "token_ids",
+                            stream=True, choice_index=i,
+                        )
                     yield f"data: {response_json}\n\n"
 
             total_prompt_tokens = sum(num_prompt_tokens)
@@ -495,8 +504,10 @@ class OpenAIServingCompletion(GenerateBaseServing):
             request_metadata.final_usage_info = final_usage_info
 
         except GenerationError as e:
+            pd_api.generation_error(e)
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
         except Exception as e:
+            pd_api.generation_error(e)
             logger.exception("Error in completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
@@ -530,6 +541,12 @@ class OpenAIServingCompletion(GenerateBaseServing):
 
             for output in final_res.outputs:
                 self._raise_if_error(output.finish_reason, request_id)
+                if output.text or (request.return_token_ids and output.token_ids):
+                    pd_api.generated(
+                        request_id,
+                        kind="content" if output.text else "token_ids",
+                        stream=False, choice_index=len(choices),
+                    )
 
                 assert request.max_tokens is not None
                 if request.echo:

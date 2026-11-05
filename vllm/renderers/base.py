@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Generic, overload
 from typing_extensions import TypeVar
 
 from vllm.exceptions import VLLMValidationError
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.inputs import (
     EmbedsInput,
     EmbedsPrompt,
@@ -684,8 +685,13 @@ class BaseRenderer(ABC, Generic[_T]):
                 self.tokenizer, prompt["prompt"]
             )
             prompt = params.apply_pre_tokenization(self.tokenizer, prompt)  # type: ignore[arg-type]
-            prompt = self._tokenize_prompt(prompt, params)
+            with diag.span("tokenize", source="tokenizer_sync") as timing:
+                prompt = self._tokenize_prompt(prompt, params)
+                timing["num_output_tokens"] = len(prompt["prompt_token_ids"])
             prompt = self._apply_prompt_char_offset(prompt, prompt_char_offset)
+        else:
+            diag.emit("tokenize", status="skipped", reason="pretokenized_or_embeds",
+                      duration_ns=None)
 
         if params.needs_detokenization and "prompt" not in prompt:
             if "prompt_token_ids" not in prompt:
@@ -724,8 +730,13 @@ class BaseRenderer(ABC, Generic[_T]):
                 self.tokenizer, prompt["prompt"]
             )
             prompt = params.apply_pre_tokenization(self.tokenizer, prompt)  # type: ignore[arg-type]
-            prompt = await self._tokenize_prompt_async(prompt, params)
+            with diag.span("tokenize", source="tokenizer_async_await") as timing:
+                prompt = await self._tokenize_prompt_async(prompt, params)
+                timing["num_output_tokens"] = len(prompt["prompt_token_ids"])
             prompt = self._apply_prompt_char_offset(prompt, prompt_char_offset)
+        else:
+            diag.emit("tokenize", status="skipped", reason="pretokenized_or_embeds",
+                      duration_ns=None)
 
         if params.needs_detokenization and "prompt" not in prompt:
             if "prompt_token_ids" not in prompt:
@@ -1245,7 +1256,8 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_cmpl_tok_params
 
-        dict_prompts = self.render_prompts(prompts)
+        with diag.span("render", source="render_prompts", num_inputs=len(prompts)):
+            dict_prompts = self.render_prompts(prompts)
         tok_prompts = self.tokenize_prompts(dict_prompts, tok_params)
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
@@ -1270,7 +1282,8 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_cmpl_tok_params
 
-        dict_prompts = await self.render_prompts_async(prompts)
+        with diag.span("render", source="render_prompts_async", num_inputs=len(prompts)):
+            dict_prompts = await self.render_prompts_async(prompts)
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
@@ -1298,10 +1311,12 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_chat_tok_params
 
-        rendered = [
-            self.render_messages(conversation, chat_params)
-            for conversation in conversations
-        ]
+        with diag.span("render", source="render_messages",
+                       num_inputs=len(conversations)):
+            rendered = [
+                self.render_messages(conversation, chat_params)
+                for conversation in conversations
+            ]
 
         out_conversations = list[list["ConversationMessage"]]()
         dict_prompts = list[DictPrompt]()
@@ -1345,9 +1360,11 @@ class BaseRenderer(ABC, Generic[_T]):
 
         out_conversations = list[list["ConversationMessage"]]()
         dict_prompts = list[DictPrompt]()
-        for conv, prompt in await asyncio.gather(*rendered):
-            out_conversations.append(conv)
-            dict_prompts.append(prompt)
+        with diag.span("render", source="render_messages_async",
+                       num_inputs=len(conversations)):
+            for conv, prompt in await asyncio.gather(*rendered):
+                out_conversations.append(conv)
+                dict_prompts.append(prompt)
 
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 

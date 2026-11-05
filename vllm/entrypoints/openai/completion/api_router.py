@@ -20,6 +20,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.entrypoints.serve.utils.sse_keep_alive import with_sse_keep_alive
+from vllm.entrypoints.serve.utils import pd_diagnostics as pd_api
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -45,6 +46,7 @@ def completion(request: Request) -> OpenAIServingCompletion | None:
 @with_cancellation
 @load_aware_call
 async def create_completion(request: CompletionRequest, raw_request: Request):
+    pd_api.typed_handler(raw_request, stream=bool(request.stream))
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )
@@ -73,4 +75,5 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
 
 
 def attach_router(app: FastAPI):
+    pd_api.install(app)
     app.include_router(router)

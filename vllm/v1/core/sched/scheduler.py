@@ -61,6 +61,7 @@ from vllm.v1.kv_cache_interface import (
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.stats import (
     KV_FETCH_COMPLETED_WAITING,
     KV_FETCH_IN_PROGRESS,
@@ -94,6 +95,7 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self._pd_engine_id = diag.new_id("engine")
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -589,6 +591,37 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        execution_id = diag.new_id("execution")
+        transfer = self.vllm_config.kv_transfer_config
+        self.kv_cache_manager.pd_stage_ns.clear()
+        with diag.scope(
+            execution_id=execution_id, engine_id=self._pd_engine_id,
+            dp_rank=self.parallel_config.data_parallel_index,
+            kv_role=transfer.kv_role if transfer is not None else None,
+            role="unknown",
+        ), diag.span("scheduler_schedule") as timing:
+            start_ns = time.monotonic_ns()
+            try:
+                output = self._schedule(throttle_prefills)
+                timing.update(
+                    request_ids=list(output.num_scheduled_tokens),
+                    num_scheduled_tokens=dict(output.num_scheduled_tokens),
+                    total_num_scheduled_tokens=output.total_num_scheduled_tokens,
+                    no_forward=output.total_num_scheduled_tokens == 0,
+                    has_kv_connector_metadata=output.kv_connector_metadata is not None,
+                )
+                return output
+            finally:
+                elapsed = time.monotonic_ns() - start_ns
+                measured = sum(self.kv_cache_manager.pd_stage_ns.values())
+                timing.update(
+                    manager_ranges_ns=dict(self.kv_cache_manager.pd_stage_ns),
+                    other_ns=elapsed - measured,
+                    other_source="schedule_minus_nonoverlapping_manager_host_ranges",
+                    hash_source="request_hash_cumulative_not_subtracted_from_schedule",
+                )
+
+    def _schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -1346,6 +1379,8 @@ class Scheduler(SchedulerInterface):
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
+                request.pd_execution_id = diag.current().get("execution_id")
+                request.pd_queue_transition("scheduled")
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -1499,6 +1534,7 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
+            pd_execution_id=diag.current().get("execution_id"),
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -1550,6 +1586,40 @@ class Scheduler(SchedulerInterface):
         # write KV and have their output processed later in update_from_output).
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
+
+        members = []
+        for request_id, scheduled_tokens in num_scheduled_tokens.items():
+            request = self.requests[request_id]
+            request.pd_execution_id = scheduler_output.pd_execution_id
+            request.pd_executions += 1
+            request.pd_emit_hash_ranges()
+            members.append({
+                "request_id": request_id,
+                "scheduled_tokens": scheduled_tokens,
+                "num_computed_tokens_before": request.num_computed_tokens,
+                "num_output_tokens": request.num_output_tokens,
+                "num_prompt_tokens": request.num_prompt_tokens,
+                "num_tokens": request.num_tokens,
+                "is_prefill_chunk": (
+                    request.num_computed_tokens + scheduled_tokens
+                    < request.num_tokens + request.num_output_placeholders
+                ),
+                "prefill_tokens_remaining_before": max(
+                    request.num_prompt_tokens - request.num_computed_tokens, 0
+                ),
+                "num_spec_tokens": len(scheduled_spec_decode_tokens.get(request_id, ())),
+                "execution_participation": request.pd_executions,
+                "hash_duration_ns_cumulative": request.pd_hash_duration_ns,
+                "hash_calls_cumulative": request.pd_hash_calls,
+                "hash_blocks_cumulative": request.pd_hash_blocks,
+            })
+        diag.emit(
+            "scheduler_execution", request_ids=list(num_scheduled_tokens),
+            members=members, no_forward=total_num_scheduled_tokens == 0,
+            finished_request_ids=list(scheduler_output.finished_req_ids),
+            preempted_request_ids=[request.request_id for request in preempted_reqs],
+        )
+        self.kv_cache_manager.pd_resource_snapshot(num_scheduled_tokens)
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -1606,6 +1676,7 @@ class Scheduler(SchedulerInterface):
         request.num_stale_output_tokens = request.num_in_flight_tokens
         request.num_output_placeholders = 0
         request.num_preemptions += 1
+        request.pd_queue_transition("preempted")
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
 
@@ -1686,6 +1757,7 @@ class Scheduler(SchedulerInterface):
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
             self.num_waiting_for_streaming_input -= 1
         session.status = RequestStatus.WAITING
+        session.pd_queue_transition("stream_resumed")
 
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
@@ -2628,6 +2700,7 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            request.pd_queue_transition("queued")
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
@@ -2715,6 +2788,7 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        request.pd_queue_transition("finished")
 
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
@@ -2773,6 +2847,12 @@ class Scheduler(SchedulerInterface):
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
             self.deferred_frees.append((self.sched_step_seq, blocks))
+            diag.emit(
+                "kv_cache_deferred_release", request_id=request.request_id,
+                execution_id=request.pd_execution_id, lifecycle="fence_pending",
+                block_references=len(blocks), fence_seq=self.sched_step_seq,
+                processed_step_seq=self.processed_step_seq,
+            )
 
     def _free_cow_retained_blocks(
         self, blocks: list[KVCacheBlock], fence_seq: int
@@ -2782,6 +2862,12 @@ class Scheduler(SchedulerInterface):
         """
         if not self.defer_block_free or fence_seq <= self.processed_step_seq:
             self.kv_cache_manager.block_pool.free_blocks(blocks)
+            diag.emit(
+                "kv_cache_deferred_release", lifecycle="cow_retention_released",
+                block_references=len(blocks), fence_seq=fence_seq,
+                processed_step_seq=self.processed_step_seq,
+            )
+            self.kv_cache_manager.pd_resource_snapshot(())
             return
         self.deferred_frees.append((fence_seq, blocks[::-1]))
 
@@ -2799,6 +2885,12 @@ class Scheduler(SchedulerInterface):
             _, blocks = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
             self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
+            diag.emit(
+                "kv_cache_deferred_release", lifecycle="fence_released",
+                block_references=len(blocks), fence_seq=fence,
+                processed_step_seq=self.processed_step_seq,
+            )
+            self.kv_cache_manager.pd_resource_snapshot(())
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:

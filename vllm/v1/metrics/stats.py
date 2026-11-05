@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.logger import init_logger
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -282,6 +283,9 @@ class RequestStateStats:
 
     # Track if this request asked for the watermark but could not use it
     is_watermark_skipped: bool = False
+
+    # Explicit frontend identity survives shared output-handler task execution.
+    pd_identity: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -628,6 +632,31 @@ class IterationStats:
             num_cached_tokens=num_cached_tokens,
         )
         self.finished_requests.append(finished_req)
+        diag.emit(
+            "request_summary",
+            **({"request_id": request_id, "observation_id": None}
+               | req_stats.pd_identity),
+            source="stats.IterationStats.update_from_finished_request",
+            unit="seconds", status=str(finish_reason),
+            time_to_first_token=req_stats.first_token_latency,
+            e2e_latency=finished_req.e2e_latency,
+            queued_time=finished_req.queued_time,
+            prefill_time=finished_req.prefill_time,
+            inference_time=finished_req.inference_time,
+            decode_time=finished_req.decode_time,
+            mean_time_per_output_token=finished_req.mean_time_per_output_token,
+            num_prompt_tokens=finished_req.num_prompt_tokens,
+            num_generation_tokens=finished_req.num_generation_tokens,
+            num_preemptions=finished_req.num_preemptions,
+            num_cached_tokens=finished_req.num_cached_tokens,
+            first_token_observed=(
+                req_stats.num_generation_tokens > 0
+                and req_stats.first_token_ts != 0.0
+            ),
+            native_ttft_source="frontend_iteration_wall_minus_arrival_wall",
+            response_time_to_first_token=finished_req.prefill_time,
+            native_response_ttft_source="first_token_ts_minus_scheduled_ts",
+        )
 
         # Count corrupted requests when they finish (only once per request)
         if req_stats.is_corrupted:

@@ -11,6 +11,7 @@ from typing import Any, Final, cast
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
+from vllm.entrypoints.serve.utils import pd_diagnostics as pd_api
 from vllm.entrypoints.generate.base.protocol import (
     DeltaMessage,
     FunctionCall,
@@ -339,6 +340,7 @@ class OpenAIServingChat(GenerateBaseServing):
             sub_request_id = (
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
+            pd_api.request_link(request_id, sub_request_id, i)
 
             max_tokens = get_max_tokens(
                 max_model_len,
@@ -511,6 +513,7 @@ class OpenAIServingChat(GenerateBaseServing):
             else:
                 parsers = [None] * num_choices
         except Exception as e:
+            pd_api.generation_error(e)
             logger.exception("Error in parser creation.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
@@ -827,6 +830,13 @@ class OpenAIServingChat(GenerateBaseServing):
                         )
 
                     data = chunk.model_dump_json(exclude_unset=True)
+                    pd_api.generated_chat(
+                        request_id, choice_data.delta, stream=True, choice_index=i
+                    )
+                    if choice_data.token_ids:
+                        pd_api.generated(
+                            request_id, kind="token_ids", stream=True, choice_index=i
+                        )
                     yield f"data: {data}\n\n"
 
             if self._include_reasoning_tokens_details and not include_continuous_usage:
@@ -924,8 +934,10 @@ class OpenAIServingChat(GenerateBaseServing):
                     )
 
         except GenerationError as e:
+            pd_api.generation_error(e)
             yield f"data: {self._convert_generation_error_to_streaming_response(e)}\n\n"
         except Exception as e:
+            pd_api.generation_error(e)
             logger.exception("Error in chat completion stream generator.")
             data = self.create_streaming_error_response(e)
             yield f"data: {data}\n\n"
@@ -951,6 +963,7 @@ class OpenAIServingChat(GenerateBaseServing):
             async for res in result_generator:
                 final_res = res
         except asyncio.CancelledError:
+            pd_api.generation_error(asyncio.CancelledError())
             return self.create_error_response("Client disconnected")
 
         if final_res is None:
@@ -1128,6 +1141,13 @@ class OpenAIServingChat(GenerateBaseServing):
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
 
             choices.append(choice_data)
+            pd_api.generated_chat(
+                request_id, choice_data.message, stream=False, choice_index=i
+            )
+            if choice_data.token_ids:
+                pd_api.generated(
+                    request_id, kind="token_ids", stream=False, choice_index=i
+                )
 
         if request.echo:
             last_msg_content: str | list[dict[str, str]] = ""

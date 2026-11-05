@@ -97,6 +97,7 @@ from vllm.v1.kv_cache_interface import (
     is_full_attention_spec,
 )
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
@@ -180,6 +181,12 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        manager = getattr(self.scheduler, "kv_cache_manager", None)
+        if manager is not None and hasattr(manager, "pd_configure"):
+            try:
+                manager.pd_configure(self._pd_cache_configs)
+            except Exception:
+                diag.emit("kv_cache_observation_incomplete", complete=False)
         self._initialize_effective_attention_block_size()
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
@@ -337,6 +344,9 @@ class EngineCore:
             self.collective_rpc("update_max_model_len", args=(max_model_len_after,))
 
         scheduler_kv_cache_config = generate_scheduler_kv_cache_config(kv_cache_configs)
+        # Retain original per-worker specs; scheduler conversion may collapse
+        # heterogeneous per-layer specs to one representative.
+        self._pd_cache_configs = kv_cache_configs
         vllm_config.cache_config.num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         kv_cache_groups = scheduler_kv_cache_config.kv_cache_groups
         if kv_cache_groups:
@@ -517,6 +527,13 @@ class EngineCore:
                 f"request_id must be a string, got {type(request.request_id)}"
             )
 
+        diag.emit(
+            "engine_core_received", request_id=request.request_id,
+            engine_id=getattr(self.scheduler, "_pd_engine_id", None),
+            dp_rank=self.vllm_config.parallel_config.data_parallel_index,
+            request_wave=request_wave,
+        )
+
         if pooling_params := request.pooling_params:
             supported_pooling_tasks = [
                 task for task in self.get_supported_tasks() if task in POOLING_TASKS
@@ -654,6 +671,31 @@ class EngineCore:
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    @contextmanager
+    def _pd_execution_span(self, event: str, output: SchedulerOutput, **fields):
+        """Restore identity from the queued object, not ambient execution state."""
+        if event == "engine_execute_submit" and output.pd_execution_id is None:
+            # Custom schedulers can omit diagnostics. This identity observes
+            # submission only; it does not imply measured scheduler subranges.
+            output.pd_execution_id = diag.new_id("execution")
+        with diag.scope(
+            execution_id=output.pd_execution_id,
+            request_ids=list(output.num_scheduled_tokens),
+            engine_id=getattr(self.scheduler, "_pd_engine_id", None),
+            dp_rank=self.vllm_config.parallel_config.data_parallel_index,
+            no_forward=output.total_num_scheduled_tokens == 0,
+            **fields,
+        ), diag.span(event) as observation:
+            if event == "engine_execute_submit":
+                diag.emit(
+                    "engine_execution", execution_id=output.pd_execution_id,
+                    request_ids=list(output.num_scheduled_tokens),
+                    num_scheduled_tokens=dict(output.num_scheduled_tokens),
+                    total_num_scheduled_tokens=output.total_num_scheduled_tokens,
+                    source="actual_executor_submission",
+                )
+            yield observation
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -665,22 +707,26 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        with self._pd_execution_span("engine_execute_submit", scheduler_output):
+            future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
+            with self._pd_execution_span("engine_execute_wait", scheduler_output):
+                model_output = future.result()
             if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+                with self._pd_execution_span("engine_sample_call", scheduler_output):
+                    model_output = self.model_executor.sample_tokens(grammar_output)
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        with self._pd_execution_span("engine_scheduler_update", scheduler_output):
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
 
@@ -723,7 +769,12 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-            with self.log_error_detail(scheduler_output):
+            with (
+                self.log_error_detail(scheduler_output),
+                self._pd_execution_span(
+                    "engine_execute_submit", scheduler_output, queued=True
+                ),
+            ):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
@@ -740,9 +791,12 @@ class EngineCore:
                     grammar_output = self.scheduler.get_grammar_bitmask(
                         scheduler_output
                     )
-                    future = self.model_executor.sample_tokens(
-                        grammar_output, non_block=True
-                    )
+                    with self._pd_execution_span(
+                        "engine_sample_submit", scheduler_output, queued=True
+                    ):
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
@@ -751,6 +805,11 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
+                with self._pd_execution_span(
+                    "engine_batch_enqueued", scheduler_output,
+                    queue_depth=len(batch_queue),
+                ):
+                    pass
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -766,11 +825,16 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
+        with self._pd_execution_span(
+            "engine_batch_dequeued", scheduler_output, queue_depth=len(batch_queue)
+        ):
+            pass
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
         ):
-            model_output = future.result()
+            with self._pd_execution_span("engine_execute_wait", scheduler_output):
+                model_output = future.result()
             if model_output is None:
                 # None from sample_tokens() implies that the original execute_model()
                 # call failed - raise that exception.
@@ -780,9 +844,10 @@ class EngineCore:
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
+        with self._pd_execution_span("engine_scheduler_update", scheduler_output):
+            engine_core_outputs = self.scheduler.update_from_output(
+                scheduler_output, model_output
+            )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
         self._attach_weight_version(engine_core_outputs)
 
@@ -806,8 +871,17 @@ class EngineCore:
             grammar_output = self.scheduler.get_grammar_bitmask(
                 deferred_scheduler_output
             )
-            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+            with self._pd_execution_span(
+                "engine_sample_submit", deferred_scheduler_output,
+                queued=True, deferred=True,
+            ):
+                future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            with self._pd_execution_span(
+                "engine_batch_enqueued", deferred_scheduler_output,
+                queue_depth=len(batch_queue), deferred=True,
+            ):
+                pass
 
         return engine_core_outputs, model_executed
 

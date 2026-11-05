@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import json
 from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -76,6 +77,89 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from .utils import EOS_TOKEN_ID, create_requests, create_scheduler, mock_kv
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_execution_members_report_current_prefill_chunk(caplog):
+    caplog.set_level("INFO", logger="vllm.v1.metrics.pd_diagnostics")
+    scheduler = create_scheduler(
+        max_num_batched_tokens=50, enable_chunked_prefill=True
+    )
+    scheduler.parallel_config.data_parallel_index = 3
+    request = create_requests(num_requests=1, num_tokens=100)[0]
+    scheduler.add_request(request)
+
+    first = scheduler.schedule()
+    assert first.num_scheduled_tokens == {request.request_id: 50}
+    assert request.is_prefill_chunk
+    final = scheduler.schedule()
+    assert final.num_scheduled_tokens == {request.request_id: 50}
+    assert not request.is_prefill_chunk
+
+    events = [
+        json.loads(record.message.removeprefix("[PD_DIAG] "))
+        for record in caplog.records
+        if record.message.startswith("[PD_DIAG] ")
+    ]
+    executions = [event for event in events if event["event"] == "scheduler_execution"]
+    assert [event["members"][0]["is_prefill_chunk"] for event in executions] == [
+        True, False
+    ]
+    assert [event["members"][0]["num_computed_tokens_before"] for event in executions] == [
+        0, 50
+    ]
+    assert all(event["dp_rank"] == 3 for event in executions)
+
+
+@pytest.mark.parametrize("transition", ["queued", "preempted", "stream_resumed"])
+@pytest.mark.parametrize("execution_id", [None, "transition-execution"])
+def test_queue_entry_does_not_borrow_previous_execution(
+    caplog, transition, execution_id
+):
+    from vllm.v1.metrics import pd_diagnostics as diag
+
+    caplog.set_level("INFO", logger="vllm.v1.metrics.pd_diagnostics")
+    request = create_requests(num_requests=1)[0]
+    request.pd_execution_id = "previous-participation"
+    with diag.scope(execution_id=execution_id):
+        request.pd_queue_transition(transition)
+    event = json.loads(caplog.records[-1].message.removeprefix("[PD_DIAG] "))
+    assert event["event"] == "scheduler_queue_open"
+    assert event["execution_id"] == execution_id
+    assert request.pd_execution_id == "previous-participation"
+
+
+def test_independent_dense_replica_diagnostics_keep_global_rank(caplog):
+    from vllm.v1.worker.worker_base import pd_execution
+
+    caplog.set_level("INFO", logger="vllm.v1.metrics.pd_diagnostics")
+    scheduler = create_scheduler()
+    scheduler.parallel_config.data_parallel_rank = 0
+    scheduler.parallel_config.data_parallel_index = 3
+    core = EngineCore.__new__(EngineCore)
+    core.scheduler = scheduler
+    core.vllm_config = scheduler.vllm_config
+    request = create_requests(num_requests=1)[0]
+    core.add_request(request)
+    output = SchedulerOutput.make_empty()
+    with core._pd_execution_span("engine_execute_submit", output):
+        pass
+    runner = SimpleNamespace(parallel_config=scheduler.parallel_config)
+    execute = pd_execution(lambda self, scheduler_output: "native_result")
+    group = SimpleNamespace(rank_in_group=0)
+    with (
+        patch("vllm.distributed.get_tp_group", return_value=group),
+        patch("vllm.distributed.get_pp_group", return_value=group),
+    ):
+        assert execute(runner, output) == "native_result"
+    events = [
+        json.loads(record.message.removeprefix("[PD_DIAG] "))
+        for record in caplog.records
+        if record.message.startswith("[PD_DIAG] ")
+    ]
+    for event_name in ("engine_core_received", "engine_execute_submit", "runner.execute"):
+        matching = [event for event in events if event["event"] == event_name]
+        assert len(matching) == 1
+        assert matching[0]["dp_rank"] == 3
 
 
 def test_make_scheduled_encoder_input_stats_output_embeddings():
@@ -1445,7 +1529,8 @@ def test_schedule_order(enable_chunked_prefill: bool):
         assert len(scheduler_output1.scheduled_new_reqs) == 1
 
 
-def test_preempt_during_execution():
+def test_preempt_during_execution(caplog):
+    caplog.set_level("INFO", logger="vllm.v1.metrics.pd_diagnostics")
     # NOTE(woosuk): The actual number of available blocks is 10 instead of 11
     # because block 0 is reserved as the null block.
     scheduler = create_scheduler(
@@ -1483,10 +1568,19 @@ def test_preempt_during_execution():
 
     # Schedule the first request again. This will cause the preemption
     # of the second request because the KV cache is full.
-    _ = scheduler.schedule()
+    scheduler_output2 = scheduler.schedule()
     assert len(scheduler.running) == 1
     assert scheduler.running[0] == requests[0]
     assert requests[1].status == RequestStatus.PREEMPTED
+    preemptions = [
+        json.loads(record.message.removeprefix("[PD_DIAG] "))
+        for record in caplog.records
+        if record.message.startswith("[PD_DIAG] ")
+        and '"transition":"preempted"' in record.message
+    ]
+    assert len(preemptions) == 1
+    assert preemptions[0]["execution_id"] == scheduler_output2.pd_execution_id
+    assert requests[1].pd_execution_id == scheduler_output1.pd_execution_id
 
     model_runner_output1 = ModelRunnerOutput(
         req_ids=[requests[1].request_id],

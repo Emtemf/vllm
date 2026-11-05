@@ -34,6 +34,7 @@ from vllm.utils.diffusion import validate_diffusion_sampling_params
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.kv_hints import KvHintsEnvelope
+from vllm.v1.metrics import pd_diagnostics as diag
 
 logger = init_logger(__name__)
 
@@ -79,9 +80,15 @@ class InputProcessor:
         # Raw-prompt preprocessing (tokenization and multimodal processing)
         # is blocking, so async callers should run it on the renderer's
         # thread pool to keep their event loop responsive.
-        self.process_inputs_async = make_async(
-            self.process_inputs, executor=self.renderer._executor
+        process_in_executor = make_async(
+            self._process_inputs_with_context, executor=self.renderer._executor
         )
+
+        async def process_inputs_async(*args, **kwargs):
+            # Snapshot explicitly before crossing the executor boundary.
+            return await process_in_executor(diag.current(), *args, **kwargs)
+
+        self.process_inputs_async = process_inputs_async
 
     @property
     def tokenizer(self) -> TokenizerLike | None:
@@ -369,6 +376,12 @@ class InputProcessor:
             )
         else:
             request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
+        diag.emit("request_id_link", request_id=request.request_id,
+                  external_req_id=request.external_req_id)
+
+    def _process_inputs_with_context(self, context, *args, **kwargs):
+        with diag.scope(**context):
+            return self.process_inputs(*args, **kwargs)
 
     def process_inputs(
         self,
@@ -386,173 +399,174 @@ class InputProcessor:
         session_id: str | None = None,
         kv_hints: KvHintsEnvelope | None = None,
     ) -> EngineCoreRequest:
-        watermarking = self._validate_params(params, supported_tasks)
-        self._validate_lora(lora_request)
-
-        parallel_config = self.vllm_config.parallel_config
-        dp_size = parallel_config.data_parallel_size
-        dp_local_size = parallel_config.data_parallel_size_local
-        num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
-        if data_parallel_rank is not None and not (0 <= data_parallel_rank < num_ranks):
-            raise VLLMValidationError(
-                f"data_parallel_rank {data_parallel_rank} "
-                f"is out of range [0, {num_ranks})."
-            )
-
-        if isinstance(prompt, dict) and "type" in prompt:
-            if arrival_time is None:
-                arrival_time = prompt.get("arrival_time", time.time())  # type: ignore[assignment]
-
-            engine_input: EngineInput = prompt  # type: ignore[assignment]
-        else:
-            logger.warning_once(
-                "Passing raw prompts to InputProcessor is deprecated "
-                "and will be removed in the future. You should instead pass "
-                "the outputs of Renderer.render_cmpl() or Renderer.render_chat()."
-            )
-
-            if arrival_time is None:
-                arrival_time = time.time()
-
-            renderer = self.renderer
-            model_config = self.model_config
-
-            parsed_prompt = parse_model_prompt(model_config, prompt)
-            tok_params = renderer.default_cmpl_tok_params.with_kwargs(
-                **(tokenization_kwargs or {})
-            )
-
-            (engine_input,) = renderer.render_cmpl(
-                [parsed_prompt],
-                tok_params,
-            )
-
-        current_platform.validate_request(engine_input, params)
-
-        encoder_input, decoder_input = split_enc_dec_input(engine_input)
-        self._validate_model_inputs(encoder_input, decoder_input)
-
-        # Mypy can be conservative for TypedDict unions; normalize access.
-        if decoder_input["type"] == "embeds":
-            prompt_embeds = decoder_input["prompt_embeds"]
-            prompt_token_ids = decoder_input.get("prompt_token_ids")
-            prompt_is_token_ids = decoder_input.get("is_token_ids")
-        else:
-            prompt_token_ids = decoder_input["prompt_token_ids"]
-            prompt_embeds = None
-            prompt_is_token_ids = None
-
-        sampling_params = None
-        pooling_params = None
-        if isinstance(params, SamplingParams):
-            # TODO: can we avoid cloning here in multiproc case?
-            sampling_params = params.clone()
-            # Resolve on the request-local copy: `params` may be shared across
-            # prompts, requests and even engines by the caller.
-            assert watermarking is not None
-            self.apply_watermarking(sampling_params, watermarking)
-            prompt_len = length_from_prompt_token_ids_or_embeds(
-                prompt_token_ids, prompt_embeds
-            )
-            if not 0 <= sampling_params.routed_experts_prompt_start <= prompt_len:
+        with diag.span("input_process", external_req_id=request_id):
+            watermarking = self._validate_params(params, supported_tasks)
+            self._validate_lora(lora_request)
+    
+            parallel_config = self.vllm_config.parallel_config
+            dp_size = parallel_config.data_parallel_size
+            dp_local_size = parallel_config.data_parallel_size_local
+            num_ranks = dp_local_size if parallel_config.local_engines_only else dp_size
+            if data_parallel_rank is not None and not (0 <= data_parallel_rank < num_ranks):
                 raise VLLMValidationError(
-                    f"routed_experts_prompt_start must be between 0 and "
-                    f"the prompt length ({prompt_len}), inclusive.",
-                    parameter="routed_experts_prompt_start",
-                    value=sampling_params.routed_experts_prompt_start,
+                    f"data_parallel_rank {data_parallel_rank} "
+                    f"is out of range [0, {num_ranks})."
                 )
-            rows = sampling_params.prompt_logprob_token_ids
-            if rows is not None:
-                start = sampling_params.prompt_logprob_start or 0
-                num_rows = max(prompt_len - 1 - start, 0)
-                if len(rows) != num_rows:
-                    raise VLLMValidationError(
-                        f"prompt_logprob_token_ids has {len(rows)} rows, but the "
-                        f"prompt has {num_rows} scored rows "
-                        f"(prompt_len - 1 - prompt_logprob_start).",
-                        parameter="prompt_logprob_token_ids",
-                        value=len(rows),
-                    )
-            # If unset max tokens, then generate up to the max_model_len.
-            if sampling_params.max_tokens is None:
-                sampling_params.max_tokens = (
-                    self.model_config.max_model_len - prompt_len
+    
+            if isinstance(prompt, dict) and "type" in prompt:
+                if arrival_time is None:
+                    arrival_time = prompt.get("arrival_time", time.time())  # type: ignore[assignment]
+    
+                engine_input: EngineInput = prompt  # type: ignore[assignment]
+            else:
+                logger.warning_once(
+                    "Passing raw prompts to InputProcessor is deprecated "
+                    "and will be removed in the future. You should instead pass "
+                    "the outputs of Renderer.render_cmpl() or Renderer.render_chat()."
                 )
-                # min_tokens is not checked while max_tokens is unset.
-                if sampling_params.min_tokens > sampling_params.max_tokens:
+    
+                if arrival_time is None:
+                    arrival_time = time.time()
+    
+                renderer = self.renderer
+                model_config = self.model_config
+    
+                parsed_prompt = parse_model_prompt(model_config, prompt)
+                tok_params = renderer.default_cmpl_tok_params.with_kwargs(
+                    **(tokenization_kwargs or {})
+                )
+    
+                (engine_input,) = renderer.render_cmpl(
+                    [parsed_prompt],
+                    tok_params,
+                )
+    
+            current_platform.validate_request(engine_input, params)
+    
+            encoder_input, decoder_input = split_enc_dec_input(engine_input)
+            self._validate_model_inputs(encoder_input, decoder_input)
+    
+            # Mypy can be conservative for TypedDict unions; normalize access.
+            if decoder_input["type"] == "embeds":
+                prompt_embeds = decoder_input["prompt_embeds"]
+                prompt_token_ids = decoder_input.get("prompt_token_ids")
+                prompt_is_token_ids = decoder_input.get("is_token_ids")
+            else:
+                prompt_token_ids = decoder_input["prompt_token_ids"]
+                prompt_embeds = None
+                prompt_is_token_ids = None
+    
+            sampling_params = None
+            pooling_params = None
+            if isinstance(params, SamplingParams):
+                # TODO: can we avoid cloning here in multiproc case?
+                sampling_params = params.clone()
+                # Resolve on the request-local copy: `params` may be shared across
+                # prompts, requests and even engines by the caller.
+                assert watermarking is not None
+                self.apply_watermarking(sampling_params, watermarking)
+                prompt_len = length_from_prompt_token_ids_or_embeds(
+                    prompt_token_ids, prompt_embeds
+                )
+                if not 0 <= sampling_params.routed_experts_prompt_start <= prompt_len:
                     raise VLLMValidationError(
-                        f"min_tokens must be less than or equal to "
-                        f"max_tokens={sampling_params.max_tokens}, got "
-                        f"{sampling_params.min_tokens}."
+                        f"routed_experts_prompt_start must be between 0 and "
+                        f"the prompt length ({prompt_len}), inclusive.",
+                        parameter="routed_experts_prompt_start",
+                        value=sampling_params.routed_experts_prompt_start,
                     )
-
-            sampling_params.update_from_generation_config(
-                self.generation_config_fields,
-                self.renderer.get_eos_token_id(),
+                rows = sampling_params.prompt_logprob_token_ids
+                if rows is not None:
+                    start = sampling_params.prompt_logprob_start or 0
+                    num_rows = max(prompt_len - 1 - start, 0)
+                    if len(rows) != num_rows:
+                        raise VLLMValidationError(
+                            f"prompt_logprob_token_ids has {len(rows)} rows, but the "
+                            f"prompt has {num_rows} scored rows "
+                            f"(prompt_len - 1 - prompt_logprob_start).",
+                            parameter="prompt_logprob_token_ids",
+                            value=len(rows),
+                        )
+                # If unset max tokens, then generate up to the max_model_len.
+                if sampling_params.max_tokens is None:
+                    sampling_params.max_tokens = (
+                        self.model_config.max_model_len - prompt_len
+                    )
+                    # min_tokens is not checked while max_tokens is unset.
+                    if sampling_params.min_tokens > sampling_params.max_tokens:
+                        raise VLLMValidationError(
+                            f"min_tokens must be less than or equal to "
+                            f"max_tokens={sampling_params.max_tokens}, got "
+                            f"{sampling_params.min_tokens}."
+                        )
+    
+                sampling_params.update_from_generation_config(
+                    self.generation_config_fields,
+                    self.renderer.get_eos_token_id(),
+                )
+                if self.tokenizer is not None:
+                    sampling_params.update_from_tokenizer(self.tokenizer)
+                if sampling_params.trace_decode_token_ids:
+                    self._normalize_trace_replay_params(sampling_params, prompt_len)
+            else:
+                pooling_params = params.clone()
+    
+            # Multimodal related.
+            mm_features: list[MultiModalFeatureSpec] | None = None
+    
+            if decoder_input["type"] == "multimodal":
+                decoder_mm_inputs = decoder_input["mm_kwargs"]
+                decoder_mm_positions = decoder_input["mm_placeholders"]
+                decoder_mm_hashes = decoder_input["mm_hashes"]
+    
+                if not all(
+                    isinstance(leaf, str) for leaf in json_iter_leaves(decoder_mm_hashes)
+                ):
+                    raise ValueError(
+                        f"mm_hashes must contain only strings, got: {decoder_mm_hashes}. "
+                        "This is likely due to an incorrect custom implementation of "
+                        "MultiModalProcessor.apply method."
+                    )
+    
+                # Merge and flatten multimodal placeholders, hashes and inputs
+                # from dictionaries to lists, and sort them by each item's position
+                # in the input sequence.
+                sorted_mm_idxs = argsort_mm_positions(decoder_mm_positions)
+    
+                mm_features = []
+                for modality, idx in sorted_mm_idxs:
+                    base_mm_hash = decoder_mm_hashes[modality][idx]
+                    mm_features.append(
+                        MultiModalFeatureSpec(
+                            data=decoder_mm_inputs[modality][idx],
+                            modality=modality,
+                            identifier=self._get_mm_identifier(
+                                base_mm_hash,
+                                lora_request,
+                            ),
+                            mm_position=decoder_mm_positions[modality][idx],
+                            mm_hash=base_mm_hash,
+                        )
+                    )
+    
+            return EngineCoreRequest(
+                request_id=request_id,
+                prompt_token_ids=prompt_token_ids,
+                prompt_embeds=prompt_embeds,
+                prompt_is_token_ids=prompt_is_token_ids,
+                mm_features=mm_features,
+                sampling_params=sampling_params,
+                pooling_params=pooling_params,
+                arrival_time=arrival_time,
+                lora_request=lora_request,
+                cache_salt=decoder_input.get("cache_salt"),
+                priority=priority,
+                data_parallel_rank=data_parallel_rank,
+                trace_headers=trace_headers,
+                resumable=resumable,
+                session_id=session_id,
+                kv_hints=kv_hints,
             )
-            if self.tokenizer is not None:
-                sampling_params.update_from_tokenizer(self.tokenizer)
-            if sampling_params.trace_decode_token_ids:
-                self._normalize_trace_replay_params(sampling_params, prompt_len)
-        else:
-            pooling_params = params.clone()
-
-        # Multimodal related.
-        mm_features: list[MultiModalFeatureSpec] | None = None
-
-        if decoder_input["type"] == "multimodal":
-            decoder_mm_inputs = decoder_input["mm_kwargs"]
-            decoder_mm_positions = decoder_input["mm_placeholders"]
-            decoder_mm_hashes = decoder_input["mm_hashes"]
-
-            if not all(
-                isinstance(leaf, str) for leaf in json_iter_leaves(decoder_mm_hashes)
-            ):
-                raise ValueError(
-                    f"mm_hashes must contain only strings, got: {decoder_mm_hashes}. "
-                    "This is likely due to an incorrect custom implementation of "
-                    "MultiModalProcessor.apply method."
-                )
-
-            # Merge and flatten multimodal placeholders, hashes and inputs
-            # from dictionaries to lists, and sort them by each item's position
-            # in the input sequence.
-            sorted_mm_idxs = argsort_mm_positions(decoder_mm_positions)
-
-            mm_features = []
-            for modality, idx in sorted_mm_idxs:
-                base_mm_hash = decoder_mm_hashes[modality][idx]
-                mm_features.append(
-                    MultiModalFeatureSpec(
-                        data=decoder_mm_inputs[modality][idx],
-                        modality=modality,
-                        identifier=self._get_mm_identifier(
-                            base_mm_hash,
-                            lora_request,
-                        ),
-                        mm_position=decoder_mm_positions[modality][idx],
-                        mm_hash=base_mm_hash,
-                    )
-                )
-
-        return EngineCoreRequest(
-            request_id=request_id,
-            prompt_token_ids=prompt_token_ids,
-            prompt_embeds=prompt_embeds,
-            prompt_is_token_ids=prompt_is_token_ids,
-            mm_features=mm_features,
-            sampling_params=sampling_params,
-            pooling_params=pooling_params,
-            arrival_time=arrival_time,
-            lora_request=lora_request,
-            cache_salt=decoder_input.get("cache_salt"),
-            priority=priority,
-            data_parallel_rank=data_parallel_rank,
-            trace_headers=trace_headers,
-            resumable=resumable,
-            session_id=session_id,
-            kv_hints=kv_hints,
-        )
 
     def _validate_prompt_len(
         self,

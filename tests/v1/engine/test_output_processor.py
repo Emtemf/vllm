@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 import math
 import time
 from unittest.mock import MagicMock, Mock
@@ -22,6 +23,7 @@ from vllm.config.watermarking import WatermarkConfig
 from vllm.logprobs import FlatLogprobs, Logprob, PromptLogprobs, SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import (
+    STREAM_FINISHED,
     CompletionOutput,
     PoolingRequestOutput,
     RequestOutput,
@@ -99,6 +101,56 @@ def test_completion_output_preserves_each_sampling_mask_position() -> None:
 
     assert output.sampling_mask is not None
     assert output.sampling_mask.token_ids == [[10, 11], [20], [30, 31, 32]]
+
+
+@pytest.mark.skip_global_cleanup
+def test_resumable_stream_close_emits_one_terminal(dummy_test_vectors, caplog):
+    caplog.set_level("INFO", logger="vllm.v1.metrics.pd_diagnostics")
+    processor = OutputProcessor(dummy_test_vectors.tokenizer, log_stats=False)
+    request = EngineCoreRequest(
+        request_id="stream-int",
+        external_req_id="stream",
+        prompt_token_ids=[1, 2],
+        mm_features=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+        resumable=True,
+    )
+    queue = RequestOutputCollector(RequestOutputKind.DELTA, request.request_id)
+    processor.add_request(request, prompt=None, queue=queue)
+    state = processor.request_states[request.request_id]
+    processor.process_outputs([
+        EngineCoreOutput(
+            request_id=request.request_id,
+            new_token_ids=[7],
+            finish_reason=FinishReason.LENGTH,
+        )
+    ])
+    output = queue.get_nowait()
+    assert output is not None and not output.finished
+    assert state.input_chunk_queue is None
+    assert not state.pd_terminal_emitted
+
+    request.resumable = False
+    processor.add_request(request, prompt=None)
+    assert queue.get_nowait() is STREAM_FINISHED
+    assert not processor.has_unfinished_requests()
+    assert request.external_req_id not in processor.external_req_ids
+    # A later abort must not produce a second terminal observation.
+    assert processor.abort_requests([request.request_id], internal=True) == []
+    terminals = [
+        json.loads(record.message.removeprefix("[PD_DIAG] "))
+        for record in caplog.records
+        if record.message.startswith("[PD_DIAG] ")
+        and '"event":"frontend_request_terminal"' in record.message
+    ]
+    assert len(terminals) == 1
+    assert terminals[0]["request_id"] == request.request_id
+    assert terminals[0]["status"] == "stream_finished"
 
 
 def _ref_convert_id_to_token(

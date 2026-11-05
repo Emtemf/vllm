@@ -58,6 +58,7 @@ from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.executor import Executor
 from vllm.v1.fault_tolerance.utils import FaultToleranceRequest, FaultToleranceResult
 from vllm.v1.kv_hints import KvHintsEnvelope
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.loggers import (
     StatLoggerFactory,
     StatLoggerManager,
@@ -406,6 +407,7 @@ class AsyncLLM(EngineClient):
         kv_hints: KvHintsEnvelope | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
+        diag.emit("engine_add_request", external_req_id=request_id)
         if self.errored:
             raise EngineDeadError()
 
@@ -538,6 +540,11 @@ class AsyncLLM(EngineClient):
             child_request.request_id = request_id
             child_request.sampling_params = child_params
             child_requests.append(child_request)
+            diag.emit(
+                "request_child_link", request_id=request_id,
+                parent_request_id=parent_request.request_id,
+                external_req_id=child_request.external_req_id, choice_index=idx,
+            )
 
         self.check_admission(parent_params.n, parent_request.request_id)
         try:
@@ -547,7 +554,13 @@ class AsyncLLM(EngineClient):
                 )
 
             for child_request in child_requests:
-                await self.engine_core.add_request_async(child_request)
+                with diag.span(
+                    "engine_submit", request_id=child_request.request_id,
+                    external_req_id=child_request.external_req_id,
+                    parent_request_id=parent_request.request_id,
+                    source="engine_core_add_request_async",
+                ):
+                    await self.engine_core.add_request_async(child_request)
                 if self.log_requests:
                     logger.info("Added request %s.", child_request.request_id)
         except BaseException:
@@ -572,7 +585,12 @@ class AsyncLLM(EngineClient):
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+        with diag.span(
+            "engine_submit", request_id=request.request_id,
+            external_req_id=request.external_req_id,
+            source="engine_core_add_request_async",
+        ):
+            await self.engine_core.add_request_async(request)
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)

@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
+
+import pytest
+
 from vllm.v1.core.sched.output import ScheduledEncoderInputStats, SchedulerOutput
-from vllm.v1.engine import EngineCoreOutputs, FinishReason
+from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.metrics.stats import (
     IterationStats,
@@ -15,6 +19,40 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.utils import compute_iteration_details
+
+
+@pytest.mark.parametrize("new_token_ids", [[], [7]])
+def test_request_summary_requires_generated_token_for_first_token(
+    caplog, new_token_ids
+):
+    caplog.set_level("INFO", logger="vllm.v1.metrics.pd_diagnostics")
+    iteration = IterationStats()
+    iteration.iteration_timestamp = 10.0
+    req_stats = RequestStateStats(
+        arrival_time=2.0, queued_ts=3.0, scheduled_ts=4.0
+    )
+    iteration.update_from_output(
+        output=EngineCoreOutput(
+            request_id="req",
+            new_token_ids=new_token_ids,
+            finish_reason=FinishReason.ERROR,
+        ),
+        engine_core_timestamp=6.0,
+        is_prefilling=True,
+        req_stats=req_stats,
+        lora_states=None,
+        lora_name=None,
+    )
+    iteration.update_from_finished_request(
+        FinishReason.ERROR, "req", 100, 10, req_stats
+    )
+    summary = json.loads(caplog.records[-1].message.removeprefix("[PD_DIAG] "))
+    assert summary["event"] == "request_summary"
+    assert summary["first_token_observed"] is bool(new_token_ids)
+    # The diagnostic validity marker must not change native timestamp formulas.
+    assert req_stats.first_token_ts == 6.0
+    assert summary["time_to_first_token"] == 8.0
+    assert summary["response_time_to_first_token"] == 2.0
 
 
 def test_iteration_stats_repr():

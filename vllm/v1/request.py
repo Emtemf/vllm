@@ -21,6 +21,7 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.kv_hints import KvHintsEnvelope
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.stats import PrefillStats, RequestSpecDecodeMetrics
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
@@ -222,6 +223,20 @@ class Request:
         # add_request, then observed each verify step); stays None otherwise.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
+        # Independent diagnostic counters; native retained events are unchanged.
+        self.pd_hash_duration_ns = 0
+        self.pd_hash_calls = 0
+        self.pd_hash_blocks = 0
+        self.pd_hash_ranges: list[dict[str, Any]] = []
+        self.pd_hash_ranges_dropped = 0
+        self.pd_wait_start_ns: int | None = None
+        self.pd_wait_episode = 0
+        self.pd_wait_total_ns = 0
+        self.pd_initial_wait_ns: int | None = None
+        self.pd_queue_valid = True
+        self.pd_executions = 0
+        self.pd_execution_id: str | None = None
+
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
@@ -285,7 +300,36 @@ class Request:
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
-            self.block_hashes.extend(self._block_hasher(self))
+            start_ns = time.monotonic_ns()
+            previous_blocks = len(self.block_hashes)
+            error_type = None
+            try:
+                self.block_hashes.extend(self._block_hasher(self))
+            except BaseException as exc:
+                error_type = type(exc).__name__
+                raise
+            finally:
+                end_ns = time.monotonic_ns()
+                self.pd_hash_duration_ns += end_ns - start_ns
+                if len(self.pd_hash_ranges) < 64:
+                    self.pd_hash_ranges.append({
+                        "execution_id": diag.current().get("execution_id"),
+                        "start_ns": start_ns, "end_ns": end_ns,
+                        "duration_ns": end_ns - start_ns,
+                        "status": "error" if error_type is not None else "ok",
+                        "error_type": error_type,
+                    })
+                else:
+                    self.pd_hash_ranges_dropped += 1
+                self.pd_hash_calls += 1
+                self.pd_hash_blocks += len(self.block_hashes) - previous_blocks
+                if error_type is not None:
+                    diag.emit(
+                        "request_hash_error", request_id=self.request_id,
+                        start_ns=start_ns, end_ns=end_ns,
+                        duration_ns=end_ns - start_ns, status="error",
+                        error_type=error_type,
+                    )
 
     @property
     def use_structured_output(self) -> bool:
@@ -333,6 +377,95 @@ class Request:
     def get_num_encoder_embeds(self, input_id: int) -> int:
         assert input_id < len(self.mm_features)
         return self.mm_features[input_id].mm_position.get_num_embeds()
+
+    def pd_emit_hash_ranges(self) -> None:
+        if self.pd_hash_ranges or self.pd_hash_ranges_dropped:
+            diag.emit(
+                "request_hash_ranges", request_id=self.request_id,
+                execution_id=None, ranges=self.pd_hash_ranges,
+                dropped_ranges=self.pd_hash_ranges_dropped,
+                complete=self.pd_hash_ranges_dropped == 0,
+                source="actual_request_block_hasher_host_calls",
+            )
+            self.pd_hash_ranges = []
+            self.pd_hash_ranges_dropped = 0
+
+    def pd_queue_transition(self, transition: str) -> None:
+        """Observe real queue episodes without changing native event retention."""
+        now = time.monotonic_ns()
+        start = self.pd_wait_start_ns
+        if transition in ("queued", "preempted", "stream_resumed"):
+            if start is not None:
+                self.pd_queue_valid = False
+            else:
+                self.pd_wait_start_ns = now
+                self.pd_wait_episode += 1
+            diag.emit(
+                "scheduler_queue_open", request_id=self.request_id,
+                # Queue entry belongs to its cause, not the last participation.
+                execution_id=diag.current().get("execution_id"),
+                transition=transition,
+                episode=self.pd_wait_episode, start_ns=self.pd_wait_start_ns,
+                valid=self.pd_queue_valid,
+            )
+            return
+        if transition == "scheduled":
+            if start is None or now < start:
+                self.pd_queue_valid = False
+                diag.emit(
+                    "scheduler_queue_episode", request_id=self.request_id,
+                    execution_id=self.pd_execution_id,
+                    episode=self.pd_wait_episode, start_ns=start, end_ns=now,
+                    duration_ns=None, valid=False, complete=False,
+                    transition=transition,
+                )
+            else:
+                duration = now - start
+                self.pd_wait_total_ns += duration
+                if self.pd_initial_wait_ns is None:
+                    self.pd_initial_wait_ns = duration
+                diag.emit(
+                    "scheduler_queue_episode", request_id=self.request_id,
+                    execution_id=self.pd_execution_id,
+                    episode=self.pd_wait_episode, start_ns=start, end_ns=now,
+                    duration_ns=duration, valid=self.pd_queue_valid,
+                    complete=True, transition=transition,
+                )
+            self.pd_wait_start_ns = None
+            return
+        if transition == "finished":
+            if start is not None:
+                duration = now - start
+                if duration < 0:
+                    self.pd_queue_valid = False
+                else:
+                    self.pd_wait_total_ns += duration
+                    if self.pd_initial_wait_ns is None:
+                        self.pd_initial_wait_ns = duration
+                    diag.emit(
+                        "scheduler_queue_episode", request_id=self.request_id,
+                        execution_id=self.pd_execution_id,
+                        episode=self.pd_wait_episode, start_ns=start, end_ns=now,
+                        duration_ns=duration, valid=self.pd_queue_valid,
+                        complete=self.pd_queue_valid, transition="finished",
+                        status=self.status.name,
+                    )
+                    self.pd_wait_start_ns = None
+                    start = None
+            self.pd_emit_hash_ranges()
+            diag.emit(
+                "scheduler_queue_summary", request_id=self.request_id,
+                execution_id=self.pd_execution_id,
+                initial_wait_ns=self.pd_initial_wait_ns,
+                total_completed_wait_ns=self.pd_wait_total_ns,
+                open_wait_ns=now - start if start is not None else None,
+                episodes=self.pd_wait_episode, valid=self.pd_queue_valid,
+                complete=start is None and self.pd_queue_valid,
+                status=self.status.name,
+                executions=self.pd_executions, preemptions=self.num_preemptions,
+                hash_duration_ns=self.pd_hash_duration_ns,
+                hash_calls=self.pd_hash_calls, hash_blocks=self.pd_hash_blocks,
+            )
 
     def record_event(
         self,

@@ -8,6 +8,37 @@ vLLM exposes a rich set of metrics to support observability and capacity plannin
 - Prioritize Prometheus integrations, as this is what we expect to be used in production environments.
 - Offer logging support (i.e. printing metrics to the info log) for ad-hoc testing, debugging, development, and exploratory use cases.
 
+## P/D diagnostic evidence
+
+The paired P/D diagnostic implementation emits `[PD_DIAG]` JSON observations
+through the INFO logger. This is separate from Prometheus aggregation and
+does not enable device profiling or add device synchronization.
+
+Each observation includes process/clock identity and a unique record ID.
+Execution IDs link scheduler batches to workers; request and task links retain
+shared work rather than attributing a whole batch to every member. Dense DP
+replicas use their preserved `data_parallel_index`, including after the local
+parallel rank has been reset for an independent engine.
+
+API observation supports root-path mounts, token-ID-only generated responses,
+and delayed closure of resumable input. Request summaries preserve the native
+timing formulas. `first_token_observed=false` marks a terminal output with no
+generated token: its native first-output timestamp is not proof of a first
+token, even when the native TTFT field is nonzero.
+
+To inspect collected observations:
+
+```bash
+python tools/pd_metrics_report.py prefill.log decode.log -o pd-report.json
+python tools/pd_metrics_report.py prefill.log decode.log -o pd-report.html --html
+```
+
+The report does not add parallel TP intervals, subtract clocks from different
+processes, or treat submitted bytes as measured wire traffic. Missing evidence
+remains unknown. CPU regression checks do not establish NPU performance or
+distributed serving correctness; validate the paired build on the target stack.
+
+
 ## Background
 
 Metrics in vLLM can be categorized as follows:

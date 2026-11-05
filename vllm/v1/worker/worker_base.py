@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Callable
+from functools import wraps
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
@@ -21,6 +22,7 @@ from vllm.v1.attention.backends.utils import (
     record_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.metrics import pd_diagnostics as diag
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -34,6 +36,67 @@ else:
 logger = init_logger(__name__)
 
 _R = TypeVar("_R")
+
+
+def pd_execution_context(owner: Any, scheduler_output: Any) -> dict[str, Any]:
+    """Snapshot CPU identity, never retain a mutable scheduler/batch object."""
+    from vllm.distributed import get_pp_group, get_tp_group
+
+    return {
+        "execution_id": scheduler_output.pd_execution_id,
+        "request_id": None,
+        "request_ids": list(scheduler_output.num_scheduled_tokens),
+        "tp_rank": get_tp_group().rank_in_group,
+        "pp_rank": get_pp_group().rank_in_group,
+        "dp_rank": owner.parallel_config.data_parallel_index,
+        "runner": type(owner).__module__ + "." + type(owner).__qualname__,
+        "timing_domain": "host_monotonic",
+    }
+
+
+def pd_execution(method):
+    """Retain explicit execution identity across the execute/sample split."""
+    @wraps(method)
+    def wrapped(self, scheduler_output, *args, **kwargs):
+        dummy_run = kwargs.get("dummy_run", args[1] if len(args) > 1 else False)
+        if dummy_run:
+            with diag.scope(dummy_run=True):
+                return method(self, scheduler_output, *args, **kwargs)
+        # Ascend overrides call the shared implementation; observe the outer
+        # runner once while retaining the actual inner business spans.
+        if getattr(self, "_pd_executing", False):
+            return method(self, scheduler_output, *args, **kwargs)
+        context = pd_execution_context(self, scheduler_output)
+        self._pd_execution_context = context
+        self._pd_executing = True
+        try:
+            with diag.scope(**context), diag.span("runner.execute"):
+                return method(self, scheduler_output, *args, **kwargs)
+        except BaseException:
+            self._pd_execution_context = None
+            raise
+        finally:
+            self._pd_executing = False
+
+    return wrapped
+
+
+def pd_sample(method):
+    """Restore the originating execute identity, including deferred MTP work."""
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if getattr(self, "_pd_sampling", False):
+            return method(self, *args, **kwargs)
+        context = getattr(self, "_pd_execution_context", None)
+        self._pd_sampling = True
+        try:
+            with diag.scope(**(context or {})), diag.span("runner.sample_tokens"):
+                return method(self, *args, **kwargs)
+        finally:
+            self._pd_sampling = False
+            self._pd_execution_context = None
+
+    return wrapped
 
 
 class CompilationTimes(NamedTuple):
@@ -365,9 +428,25 @@ class WorkerWrapperBase:
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        self._apply_mm_cache(scheduler_output)
+        context = pd_execution_context(self.worker, scheduler_output)
+        self._pd_worker_context = context
+        try:
+            with diag.scope(**context), diag.span("worker.execute"):
+                self._apply_mm_cache(scheduler_output)
+                return self.worker.execute_model(scheduler_output)
+        except BaseException:
+            self._pd_worker_context = None
+            raise
 
-        return self.worker.execute_model(scheduler_output)
+    def sample_tokens(
+        self, grammar_output: GrammarOutput
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        context = getattr(self, "_pd_worker_context", None)
+        try:
+            with diag.scope(**(context or {})), diag.span("worker.sample_tokens"):
+                return self.worker.sample_tokens(grammar_output)
+        finally:
+            self._pd_worker_context = None
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache

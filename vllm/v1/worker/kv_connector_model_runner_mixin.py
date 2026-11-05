@@ -10,6 +10,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.forward_context import get_forward_context, set_forward_context
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
@@ -57,8 +58,15 @@ class KVConnectorModelRunnerMixin:
         """
         if has_kv_transfer_group():
             kv_connector = get_kv_transfer_group()
-            kv_connector.wait_for_save()
-            kv_connector.clear_connector_metadata()
+            context = getattr(kv_connector, "_pd_deferred_context", None)
+            try:
+                with diag.scope(**(context or {})), diag.span(
+                    "kv.save_wait", deferred=True
+                ):
+                    kv_connector.wait_for_save()
+                    kv_connector.clear_connector_metadata()
+            finally:
+                kv_connector._pd_deferred_context = None
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
@@ -75,6 +83,8 @@ class KVConnectorModelRunnerMixin:
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        if defer_finalize:
+            kv_connector._pd_deferred_context = diag.current()
 
         # Start this step's KV loads, ordered after any in-flight KV block
         # zeroing. Sync loads feed this step's forward so must precede it;
@@ -82,17 +92,33 @@ class KVConnectorModelRunnerMixin:
         # their host-side submission cost off the critical path.
         start_after_forward = not scheduler_output.has_sync_kv_loads
         if not start_after_forward:
-            kv_connector.start_load_kv(get_forward_context())
+            with diag.span(
+                "kv.load_submit",
+                completion="submission_return_not_transfer_completion",
+            ):
+                kv_connector.start_load_kv(get_forward_context())
         try:
             yield output
         finally:
             if start_after_forward:
-                kv_connector.start_load_kv(get_forward_context())
+                with diag.span(
+                    "kv.load_submit",
+                    completion="submission_return_not_transfer_completion",
+                ):
+                    kv_connector.start_load_kv(get_forward_context())
             if not defer_finalize:
-                kv_connector.wait_for_save()
+                with diag.span("kv.save_wait", deferred=False):
+                    kv_connector.wait_for_save()
 
             transfer_results = kv_connector.get_transfer_results(
                 scheduler_output.finished_req_ids
+            )
+            diag.emit(
+                "kv.completion_observed",
+                finished_sending=list(transfer_results.finished_sending or ()),
+                finished_recving=list(transfer_results.finished_recving or ()),
+                failed_recving=list(transfer_results.failed_recving or ()),
+                completion_source="get_transfer_results",
             )
             output.finished_sending = transfer_results.finished_sending
             output.finished_recving = transfer_results.finished_recving

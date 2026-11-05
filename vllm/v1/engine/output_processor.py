@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+from time import monotonic_ns
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -34,6 +35,7 @@ from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.stats import (
     IterationStats,
     LoRARequestStates,
@@ -162,6 +164,19 @@ class RequestState:
         self.external_req_id = external_req_id
         self.parent_req = parent_req
         self.request_index = request_index
+        # The output handler is shared: never use its inherited task context.
+        self.pd_identity = {
+            "observation_id": diag.current().get("observation_id"),
+            "request_id": request_id,
+            "external_req_id": external_req_id,
+            "parent_request_id": parent_req.request_id if parent_req else None,
+            "choice_index": request_index,
+        }
+        self.pd_detokenize_ns = 0
+        self.pd_detokenize_calls = 0
+        self.pd_detokenize_tokens = 0
+        self.pd_first_output = False
+        self.pd_terminal_emitted = False
         self.lora_request = lora_request
         self.lora_name = lora_request.lora_name if lora_request is not None else None
         self.output_kind = output_kind
@@ -299,6 +314,8 @@ class RequestState:
             stream_input=request.resumable,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
         )
+        if state.stats is not None:
+            state.stats.pd_identity = state.pd_identity
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
             state.stats.is_watermark_skipped = sampling_params._watermarking_skipped
@@ -547,6 +564,7 @@ class OutputProcessor:
         """Propagate error to all generate() tasks."""
         for _, state in self.request_states.items():
             assert state.queue is not None
+            self._emit_request_terminal(state, "error", error_type=type(e).__name__)
             state.queue.put(e)
 
     def abort_requests(self, request_ids: Iterable[str], internal: bool) -> list[str]:
@@ -585,6 +603,7 @@ class OutputProcessor:
         for request_id in internal_req_ids:
             req_state = self.request_states.pop(request_id, None)
             if req_state is not None:
+                self._emit_request_terminal(req_state, "abort")
                 self.lora_states.request_finished(request_id, req_state.lora_name)
                 request_ids_to_abort.append(request_id)
                 # Produce final abort output.
@@ -638,6 +657,7 @@ class OutputProcessor:
             stream_interval=self.stream_interval,
         )
         self.request_states[request_id] = req_state
+        diag.emit("frontend_request_registered", **req_state.pd_identity)
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
 
@@ -653,6 +673,7 @@ class OutputProcessor:
             # Final request - just mark completion, don't add its dummy tokens.
             if req_state.input_chunk_queue is None:
                 # Engine already finished - emit final output and clean up.
+                self._emit_request_terminal(req_state, "stream_finished")
                 self._finish_request(req_state)
                 if req_state.queue is not None:
                     # Emit a final output with finished=True
@@ -720,6 +741,11 @@ class OutputProcessor:
             )
 
             new_token_ids = engine_core_output.new_token_ids
+            if new_token_ids and not req_state.pd_first_output:
+                req_state.pd_first_output = True
+                diag.emit("engine_first_output", **req_state.pd_identity,
+                          num_new_tokens=len(new_token_ids),
+                          source="output_processor_engine_tokens")
             pooling_output = engine_core_output.pooling_output
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
@@ -765,9 +791,15 @@ class OutputProcessor:
                     req_state.track_weight_version(weight_version)
                 # 2) Detokenize the token ids into text and perform stop checks.
                 num_prev_tokens = req_state.detokenizer.num_output_tokens()
-                stop_string = req_state.detokenizer.update(
-                    new_token_ids, finish_reason == FinishReason.STOP
-                )
+                detokenize_start = monotonic_ns()
+                try:
+                    stop_string = req_state.detokenizer.update(
+                        new_token_ids, finish_reason == FinishReason.STOP
+                    )
+                finally:
+                    req_state.pd_detokenize_ns += monotonic_ns() - detokenize_start
+                    req_state.pd_detokenize_calls += 1
+                    req_state.pd_detokenize_tokens += len(new_token_ids)
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
@@ -813,6 +845,7 @@ class OutputProcessor:
                     else:
                         req_state.input_chunk_queue = None
                 else:
+                    self._emit_request_terminal(req_state, str(finish_reason))
                     self._finish_request(req_state)
                     if not engine_core_output.finished:
                         # If req not finished in EngineCore, but Detokenizer
@@ -851,6 +884,22 @@ class OutputProcessor:
             )
         if output.routed_experts is not None:
             req_state.routed_experts_chunks[-1] = output.routed_experts[:-num_dropped]
+
+    @staticmethod
+    def _emit_request_terminal(
+        req_state: RequestState, status: str, error_type: str | None = None
+    ) -> None:
+        if req_state.pd_terminal_emitted:
+            return
+        req_state.pd_terminal_emitted = True
+        diag.emit(
+            "frontend_request_terminal", **req_state.pd_identity, status=status,
+            error_type=error_type, detokenize_duration_ns=req_state.pd_detokenize_ns,
+            detokenize_calls=req_state.pd_detokenize_calls,
+            detokenize_input_tokens=req_state.pd_detokenize_tokens,
+            native_stats_available=req_state.stats is not None,
+            source="request_state",
+        )
 
     def _finish_request(self, req_state: RequestState) -> None:
         req_id = req_state.request_id
