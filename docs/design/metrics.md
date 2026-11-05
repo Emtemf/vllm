@@ -11,14 +11,18 @@ vLLM exposes a rich set of metrics to support observability and capacity plannin
 ## P/D diagnostic evidence
 
 The paired P/D diagnostic implementation emits `[PD_DIAG]` JSON observations
-through the INFO logger. This is separate from Prometheus aggregation and
+through the INFO logger. Original model, scheduler, and cache behavior and
+native metric formulas are preserved. Additional IDs, counters, spans, and
+logging are diagnostic observations with overhead, not zero-cost instrumentation
+or complete TTFT accounting. This is separate from Prometheus aggregation and
 does not enable device profiling or add device synchronization.
 
 Each observation includes process/clock identity and a unique record ID.
 Execution IDs link scheduler batches to workers; request and task links retain
-shared work rather than attributing a whole batch to every member. Dense DP
-replicas use their preserved `data_parallel_index`, including after the local
-parallel rank has been reset for an independent engine.
+shared work rather than attributing a whole batch to every member. Shared batch
+and parallel TP ranges are not per-request additive latency. Dense DP replicas
+use their preserved `data_parallel_index`, including after the local parallel
+rank has been reset for an independent engine.
 
 API observation supports root-path mounts, token-ID-only generated responses,
 and delayed closure of resumable input. Request summaries preserve the native
