@@ -594,6 +594,7 @@ class Scheduler(SchedulerInterface):
         execution_id = diag.new_id("execution")
         transfer = self.vllm_config.kv_transfer_config
         self.kv_cache_manager.pd_stage_ns.clear()
+        self._pd_external_lookup_ns = 0
         with diag.scope(
             execution_id=execution_id, engine_id=self._pd_engine_id,
             dp_rank=self.parallel_config.data_parallel_index,
@@ -616,8 +617,11 @@ class Scheduler(SchedulerInterface):
                 measured = sum(self.kv_cache_manager.pd_stage_ns.values())
                 timing.update(
                     manager_ranges_ns=dict(self.kv_cache_manager.pd_stage_ns),
-                    other_ns=elapsed - measured,
-                    other_source="schedule_minus_nonoverlapping_manager_host_ranges",
+                    external_lookup_ns=self._pd_external_lookup_ns,
+                    other_ns=elapsed - measured - self._pd_external_lookup_ns,
+                    other_source=(
+                        "schedule_minus_nonoverlapping_manager_and_external_lookup_ranges"
+                    ),
                     hash_source="request_hash_cumulative_not_subtracted_from_schedule",
                 )
 
@@ -1008,11 +1012,18 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, block_aligned_local
-                            )
-                        )
+                        try:
+                            with diag.span(
+                                "scheduler_external_lookup",
+                                request_id=request.request_id,
+                            ) as lookup_timing:
+                                ext_tokens, load_kv_async = (
+                                    self.connector.get_num_new_matched_tokens(
+                                        request, block_aligned_local
+                                    )
+                                )
+                        finally:
+                            self._pd_external_lookup_ns += lookup_timing["duration_ns"]
                         if request.skip_reading_prefix_cache:
                             ext_tokens, load_kv_async = 0, False
 

@@ -33,8 +33,60 @@ token, even when the native TTFT field is nonzero.
 To inspect collected observations:
 
 ```bash
-python tools/pd_metrics_report.py prefill.log decode.log -o pd-report.json
-python tools/pd_metrics_report.py prefill.log decode.log -o pd-report.html --html
+uv run --no-project .venv/bin/python tools/pd_metrics_report.py prefill.log decode.log -o pd-report.json
+uv run --no-project .venv/bin/python tools/pd_metrics_report.py prefill.log decode.log -o pd-report.html --html
+```
+
+The HTML report follows a fixed business-stage worksheet: request totals,
+preprocessing, shared Scheduler work, per-TP load/forward/sampling, save-related
+details, and frontend output processing. Detokenizer is a request-level frontend
+total displayed after sampling, never copied into each TP row. Missing timings
+remain missing cells, not invented parent nodes. Shared Scheduler cells span
+the execution's TP rows. Worker execute/sample actual time, observed same-thread
+stage union, and local uncovered time are independent coverage columns, not a
+request residual.
+
+The save-related header expands queue/key/lookup/preparation/synchronization and
+put into native start/submit/wait/finalize columns. It groups related work; it
+does not assert that backend-task durations add up to the wait interface time.
+Actual tasks retain their original execution, TP and task identity. Pool get
+and P/D read work remain distinct from put; parallel TP values are never summed.
+The first three columns stay fixed during horizontal scrolling. The request
+selector filters rows; detailed provenance and raw JSON are collapsed last.
+Prefill-only logs are supported: omit `decode.log` to inspect P without D.
+Explicit lifecycle and transport links establish request association. Ambiguous
+reused IDs remain visible candidates and do not contribute durations to a request.
+Scheduler and mixed-task work stays shared; TP rows are never summed.
+Missing, zero, skipped, and fused observations are displayed distinctly.
+Derived dashboard fields do not change the source schema-v1 observations.
+
+`scheduler_external_lookup` measures the existing connector call, including
+attempts that cannot yet be scheduled. Each schedule summary retains its
+`external_lookup_ns` and excludes it from `other_ns`. Request hash ranges remain
+request-level unless an explicit execution identity is present; truncated ranges
+are marked incomplete. Engine `update_from_output`, released-request save fences,
+and P/D metadata/preparation/reformat boundaries are displayed separately.
+
+The report also reads `[BatchPutTiming]` and `[BatchUpsertTiming]` text records.
+For each whole-key native put, the paired Ascend code emits `pool_native_call`
+with its task identity, native TID, wall-clock start/end, source UTC offset, and
+submitted keys/bytes. The report requires the same input source and thread, one
+matching wall-clock call interval, and agreement with any native keys/bytes.
+Glog timestamp precision is respected; a timestamp bucket overlapping multiple
+calls remains ambiguous. The source offset is used, not the reporting machine's
+timezone. Matching phases appear in the original save task's put cells.
+
+Thread ownership alone cannot select a put or request. Logs lacking a usable
+call boundary remain in collapsed pending evidence, not a detached main-table
+native row or a guessed task. The `phase1_only`, `prefer_same_node_remaining`,
+and `normal_full` scopes stay distinct; the remaining-path total excludes phase 1.
+
+For raw-log inspection:
+
+```bash
+grep -E '"event":"(scheduler_external_lookup|engine_scheduler_update|request_hash_ranges|pool_save_fence)"' prefill.log
+grep -E '"event":"pd_transfer_(meta_fetch|prepare|reformat|batch_finished|task_finished)"' decode.log
+grep -E 'Batch(Put|Upsert)Timing|"native_tid":' prefill.log
 ```
 
 The report does not add parallel TP intervals, subtract clocks from different
@@ -42,6 +94,115 @@ processes, or treat submitted bytes as measured wire traffic. Missing evidence
 remains unknown. CPU regression checks do not establish NPU performance or
 distributed serving correctness; validate the paired build on the target stack.
 
+### P-side source refresh
+
+Validate P first while leaving the current D, proxy, and installed Mooncake
+wheel unchanged. Stop P's serving workers through the normal supervisor before
+changing source; do not stop the shared Mooncake master. Resolve the currently
+imported vLLM and Ascend source roots in the serving environment, and update
+those checkouts rather than an unrelated clone. Preserve the existing
+PYTHONPATH/editable setup and compiled extensions.
+
+Fetch the core `feature/pd-metrics-v0.32.0` and Ascend
+`feature/pd-metrics-v0.32.0-imagebase` branches from the corresponding Emtemf
+forks. Refuse dirty trees and in-progress Git operations, record both original
+HEADs, and require a fast-forward on both roots before applying either update.
+The D utility below has separate pinned commits and a wheel-installation step;
+it is not the P-only source-refresh command.
+
+Restart P using its existing launch command, complete one request through the
+unchanged D/proxy, then run the updated report with the full P log as its only
+input. Keep the full log and generated HTML; native phases without sufficient
+boundary evidence remain pending, not inferred from the timing display.
+
+
+### Guarded D-side deployment
+
+`tools/deploy_pd_metrics_d.sh` is a standalone Bash utility. Copy the reviewed
+script **outside both source trees** on D (for example,
+`/vllm-workspace/deploy_pd_metrics_d.sh`) so it remains available after source
+checkout and for rollback. No source snapshot is converted into a Git repository.
+The existing vLLM and Ascend installs must already be editable installs from the
+specified clean Git roots in the selected Python 3.12 interpreter. The utility
+does not rebuild or reinstall either project or their extensions.
+
+Stop D's serving/transfer-client workers through the normal supervisor first,
+**not the independent/shared `mooncake_master`**; it may remain running unchanged.
+Use this single block. Set `mode=apply` only when ready to deploy; `check` is the
+default and never fetches, installs, creates a state directory, or checks out sources.
+Replace both wheel paths with real absolute filenames: the diagnostic wheel
+must be the **P-built, non-`-npu` distribution `mooncake-transfer==0.3.13`**; the
+backup must be the exact original official wheel, not another diagnostic build.
+
+```bash
+(
+  set -euo pipefail
+  mode=check # Change to apply for the guarded cutover.
+  bash /vllm-workspace/deploy_pd_metrics_d.sh --"$mode" \
+    --vllm-dir /vllm-workspace/vllm \
+    --ascend-dir /vllm-workspace/vllm-ascend \
+    --python /usr/local/python3.12.16/bin/python3.12 \
+    --wheel /absolute/path/to/P-built/mooncake_transfer-0.3.13-cp312-cp312-manylinux_2_35_aarch64.whl \
+    --backup-wheel /absolute/path/to/original/mooncake_transfer-0.3.13-cp312-cp312-manylinux_2_35_aarch64.whl \
+    --state-dir /vllm-workspace/pd-metrics-deploy-state
+)
+```
+
+`--help` lists the full interface. `uv`, Git, and the interpreter's existing
+`packaging` module are required. Inspection uses
+`uv run --no-project --no-sync --offline --python ...` and top-level import specs
+plus editable metadata, not imports of vLLM, Ascend, Torch or NPU extensions.
+Wheel tags, ZIP/RECORD hashes, native-module presence and `BatchPutTiming` in the
+store payload are checked without loading native modules. Installed Mooncake
+payload must match one of the two supplied wheels, so an unrelated installation
+cannot be silently overwritten. If D already has the diagnostic wheel, both
+wheels are still required; apply is not a source-only shortcut.
+
+The reviewed source pins are core
+`75330b299b0212d9ecf7e50e977b50c95282c5c0` from
+`https://github.com/Emtemf/vllm.git` and Ascend
+`bd339decd1697dc9bb7c1fa683a32625aa16c577` from
+`https://github.com/Emtemf/vllm-ascend.git`. Approved baselines are respectively
+`5df63a7203cdb9328d824a27b682e77c7b9928be` and
+`fd4be4dbcf751fcff0dd99d18389caf40680e9e7`. Only these baselines or proven
+first-parent diagnostic ancestors up to the exact pins are accepted; unrelated
+histories, later commits, dirty/untracked changes and in-progress Git operations
+are refused. An offline check requires the pinned commits already in the local
+object databases; when missing, it explains that only apply may fetch them.
+Apply fetches missing objects from the explicit fork URLs, completes both-root
+preflight, saves private wheel copies and a JSON rollback record, then switches
+to detached pinned HEADs, preserving existing branch tips. Mooncake installation
+alone uses `uv pip install --offline --python ... --force-reinstall --no-deps`.
+
+Save the printed state path. If a source switch or wheel installation fails, use
+the printed rollback command; partial apply is recoverable with the same record.
+For example:
+
+```bash
+(
+  set -euo pipefail
+  bash /vllm-workspace/deploy_pd_metrics_d.sh \
+    --python /usr/local/python3.12.16/bin/python3.12 \
+    --rollback /vllm-workspace/pd-metrics-deploy-state/run-REPLACE/state.json
+)
+```
+
+Rollback restores the recorded branches/commits and the previously installed
+wheel (original or already-diagnostic), and refuses unexpected HEADs, dirty
+trees, changed branch tips or changed saved wheels. Keep the entire state
+directory, not just its JSON file. No mode kills/restarts services, stashes,
+resets, forces checkout, removes local files, or downloads a wheel. Worker
+detection is deliberately conservative (including Ray/Torch/multiprocessing
+workers); insufficient `/proc` visibility is a refusal, not evidence of stopped
+services. Explicit `mooncake_master` executables and Python console-script
+launchers are exempt: a running shared master retains its already-loaded binary.
+Wheel installation/rollback replaces its on-disk binary and CLI for the **next
+launch** only; coordinate any later master restart separately, without restarting
+P's shared master as part of D migration. The utility cannot prevent an external
+supervisor restarting workers mid-run: disable D-worker automatic restarts and
+keep those workers stopped until completion. Start D workers manually only after
+successful apply or rollback; target-stack smoke/performance validation remains
+a separate operator step.
 
 ## Background
 
