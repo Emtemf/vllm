@@ -9,9 +9,9 @@ and ranks can overlap. No device synchronization is performed, and logging
 failures are non-fatal.
 
 Scheduler payloads carry execution_id through queued results. Each worker emits
-one execution identity and one local phase completion, including ranks that do
-not save KV. Deferred sample identity is captured with its originating runner
-state; deferred saves retain their original execution even across threads.
+one untimed execution identity, including ranks that do not save KV, and scopes
+that identity for downstream store capture. Deferred saves retain the scope of
+their originating execution even though sample RPCs carry no execution ID.
 Native backend-put and rendering/tokenization spans emit one completion with
 monotonic bounds and start wall/thread provenance. Overlapping host spans must
 not be summed as request time.
@@ -37,9 +37,6 @@ _HOST = socket.gethostname()
 _COUNTER = itertools.count()
 _CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
     "ttft_diagnostics", default=None
-)
-_WORKER_PHASE: ContextVar[dict[str, Any] | None] = ContextVar(
-    "ttft_worker_phase", default=None
 )
 
 
@@ -223,131 +220,3 @@ def batch_fields(scheduler_output: Any) -> dict[str, Any]:
         "request_ids": tuple(scheduler_output.num_scheduled_tokens),
         "timing_scope": "shared_batch_host",
     }
-
-
-def _interval_union(ranges: list[tuple[int, int]]) -> int:
-    total = 0
-    right = None
-    for start, end in sorted(ranges):
-        total += max(0, end - max(start, right if right is not None else start))
-        right = max(end, right if right is not None else end)
-    return total
-
-
-@contextmanager
-def worker_phase(phase: str, fields: dict[str, Any]):
-    """One local Worker call, never subtractable from request residual."""
-    state = None
-    token = None
-    with suppress(Exception):
-        state = {
-            "fields": fields,
-            "start_ns": time.monotonic_ns(),
-            "start_wall_ns": time.time_ns(),
-            "start_native_tid": threading.get_native_id(),
-            "ranges": [],
-            "business": [],
-            "invalid": False,
-        }
-        token = _WORKER_PHASE.set(state)
-    status = "ok"
-    try:
-        yield
-    except BaseException:
-        status = "error"
-        raise
-    finally:
-        with suppress(Exception):
-            if state is not None:
-                end = time.monotonic_ns()
-                start = state["start_ns"]
-                tid = state["start_native_tid"]
-                ranges = state["ranges"]
-                exact = (
-                    fields.get("execution_id") is not None
-                    and fields.get("request_ids") is not None
-                    and fields.get("tp_rank") is not None
-                )
-                valid = exact and not state["invalid"] and bool(ranges)
-                valid = valid and threading.get_native_id() == tid and all(
-                    start <= left <= right <= end and origin_tid == tid
-                    for _, left, right, origin_tid in ranges
-                )
-                covered = (
-                    _interval_union([(left, right) for _, left, right, _ in ranges])
-                    if valid else None
-                )
-                pre = min(r[1] for r in ranges) - start if valid else None
-                post = end - max(r[2] for r in ranges) if valid else None
-                emit(
-                    "worker_phase_breakdown",
-                    **fields,
-                    phase=phase,
-                    association="exact" if exact else "unavailable",
-                    start_ns=start,
-                    end_ns=end,
-                    duration_ns=end - start,
-                    start_wall_ns=state["start_wall_ns"],
-                    start_native_tid=tid,
-                    status=status,
-                    coverage_status=(
-                        "valid" if valid else
-                        "invalid" if ranges or state["invalid"] else "unavailable"
-                    ),
-                    coverage_complete=bool(valid),
-                    coverage_scope="observed_original_ranges",
-                    covered_ns=covered,
-                    uncovered_ns=end - start - covered if valid else None,
-                    pre_covered_ns=pre,
-                    post_covered_ns=post,
-                    interior_uncovered_ns=(
-                        end - start - covered - pre - post if valid else None
-                    ),
-                    covered_ranges=[
-                        f"{name}:{left}:{right}:{origin_tid}"
-                        for name, left, right, origin_tid in ranges
-                    ],
-                    business_ranges=[
-                        f"{name}:{left}:{right}:{origin_tid}"
-                        for name, left, right, origin_tid in state["business"]
-                    ],
-                )
-        if token is not None:
-            with suppress(Exception):
-                _WORKER_PHASE.reset(token)
-
-
-@contextmanager
-def worker_range(name: str, *, coverage: bool = True):
-    """Capture original call bounds, including a failed call, without logging."""
-    state = None
-    start = None
-    try:
-        state = _WORKER_PHASE.get()
-        if state is not None:
-            start = time.monotonic_ns()
-            tid = threading.get_native_id()
-            identity = current()
-    except Exception:
-        with suppress(Exception):
-            if state is not None:
-                state["invalid"] = True
-    try:
-        yield
-    finally:
-        try:
-            if state is not None and start is not None:
-                end = time.monotonic_ns()
-                fields = state["fields"]
-                if any(
-                    identity.get(key) != fields.get(key)
-                    for key in ("execution_id", "request_ids", "tp_rank")
-                ) or threading.get_native_id() != tid:
-                    state["invalid"] = True
-                state["ranges" if coverage else "business"].append(
-                    (name, start, end, tid)
-                )
-        except Exception:
-            with suppress(Exception):
-                if state is not None:
-                    state["invalid"] = True

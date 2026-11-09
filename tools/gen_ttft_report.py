@@ -20,10 +20,9 @@ incomplete. All observed TP ranks are shown by default; --tp-rank filters TP row
 The table flattens every step and observed TP, retaining grouped put phases.
 Tokenizer candidates are selectable in the page; known warmups are disabled.
 Manual legacy selections are display-only and never deduct from residual.
-Worker-local execute/sample coverage is a separate, same-thread interval union,
-not a per-step request residual. It is never subtracted from BREAKDOWN.residual.
-Missing, failed, duplicate or inconsistent evidence remains unknown. The main
-table retains the original request residual and its preprocessing reconciliation.
+The report retains only the first table, Tokenizer selection, basic residual
+reconciliation and source evidence. It does not infer residual causes from
+Worker intervals or render diagnostic timelines.
 """
 
 from __future__ import annotations
@@ -629,135 +628,6 @@ def forward_for_step(records, exec_id, worker, warnings):
     return matches[0]
 
 
-def worker_phase_for_step(data, request, exec_id, worker, phase, warnings):
-    """Validate a local call, never assign request-wide residual to a step."""
-    unknown = {"values": [None, None, None], "source": "缺少 Worker-local 证据"}
-    if not exec_id or worker is None:
-        return unknown
-    records = [
-        record
-        for record in data["diag"]
-        if record.get("event") == "worker_phase_breakdown"
-        and execution(record) == exec_id
-        and (
-            integer(record.get("tp_rank")) == worker[0]
-            or record["_worker"] == worker
-        )
-    ]
-    matches = [record for record in records if record.get("phase") == phase]
-    if not matches:
-        return unknown
-    source = "；".join(f"行 {record['_line']}" for record in matches)
-
-    def reject(reason):
-        warnings.append(
-            f"Worker-local {phase} execution={exec_id} TP{worker[0]} "
-            f"{reason}；不作为请求 residual 或局部覆盖证据。"
-        )
-        return {"values": [None, None, None], "source": f"{source}；{reason}"}
-
-    if len(matches) != 1:
-        return reject("重复完成记录")
-    record = matches[0]
-    identities = {
-        (r.get("host"), r.get("pid"), r.get("run_id")) for r in records
-    }
-    if len(identities) != 1 or any(
-        not r.get(key) or str(r[key]) in ("None", "null")
-        for r in records
-        for key in ("host", "pid", "run_id")
-    ):
-        return reject("主机/进程/run 身份缺失或冲突")
-    if any(
-        ids({"request_ids": r.get("request_ids")}) != {request}
-        or integer(r.get("tp_rank")) != worker[0]
-        or integer(r.get("pid")) != worker[1]
-        or r["_identity_conflict"]
-        or r.get("association") != "exact"
-        or r["_worker"] != worker
-        for r in records
-    ):
-        return reject("请求/TP/进程关联不唯一")
-    bounds = interval(record)
-    tid = integer(record.get("start_native_tid"))
-    if (
-        bounds is None
-        or bounds[0] < 0
-        or tid is None
-        or tid != integer(record.get("native_tid"))
-        or tid != record["_native_tid"]
-        or record["_thread"] != (
-            record["host"], worker[1], record["run_id"], tid
-        )
-        or record.get("status") != "ok"
-    ):
-        return reject("失败、跨线程或调用区间无效")
-    duration = bounds[1] - bounds[0]
-    result = {
-        "values": [duration / 1e9, None, None],
-        "source": (
-            f"{source}；status=ok；coverage={record.get('coverage_status', '未知')}"
-        ),
-    }
-    if (
-        record.get("coverage_status") != "valid"
-        or record.get("coverage_complete") != "true"
-        or record.get("coverage_scope") != "observed_original_ranges"
-    ):
-        return result
-    encoded = record.get("covered_ranges", "")
-    try:
-        if not isinstance(encoded, str) or not encoded or encoded == "[]":
-            raise ValueError
-        ranges = []
-        for item in encoded.split(","):
-            name, start, finish, native_tid = item.split(":")
-            start, finish, native_tid = int(start), int(finish), int(native_tid)
-            if (
-                name not in ("load", "forward", "save")
-                or native_tid != tid
-                or not bounds[0] <= start <= finish <= bounds[1]
-                or (start, finish, name) in ranges
-            ):
-                raise ValueError
-            ranges.append((start, finish, name))
-        covered = 0
-        right = bounds[0]
-        for start, finish, _ in sorted(ranges):
-            covered += max(0, finish - max(start, right))
-            right = max(right, finish)
-        uncovered = duration - covered
-        pre = min(start for start, _, _ in ranges) - bounds[0]
-        post = bounds[1] - max(finish for _, finish, _ in ranges)
-        expected = {
-            "covered_ns": covered,
-            "uncovered_ns": uncovered,
-            "pre_covered_ns": pre,
-            "post_covered_ns": post,
-            "interior_uncovered_ns": uncovered - pre - post,
-        }
-        if any(
-            integer(record.get(key)) != value
-            for key, value in expected.items()
-            if key in ("covered_ns", "uncovered_ns")
-            or record.get(key) not in (None, "None", "null")
-        ):
-            raise ValueError
-    except (ValueError, TypeError, AttributeError):
-        result["source"] += "；覆盖区间/union/边界对账无效"
-        warnings.append(
-            f"Worker-local {phase} execution={exec_id} TP{worker[0]} "
-            "覆盖区间或 union 对账无效；covered/local uncovered 保持未知。"
-        )
-        return result
-    result["values"][1:] = [covered / 1e9, uncovered / 1e9]
-    result["source"] += (
-        f"；仅本线程 load/forward/save union；调用前段={pre / 1e9:.6f}s，"
-        f"后段={post / 1e9:.6f}s，区间间隙={(uncovered - pre - post) / 1e9:.6f}s"
-    )
-    return result
-
-
 def save_rows(data, request, end, steps, requested_rank, warnings):
     executions = {execution(step) for step in steps if execution(step)}
     saves = [
@@ -780,33 +650,22 @@ def save_rows(data, request, end, steps, requested_rank, warnings):
                 r
                 for r in data["diag"]
                 if execution(r) in executions
-                and r.get("event") not in (
-                    "forward_breakdown", "worker_phase_breakdown"
-                )
+                and r.get("event") != "forward_breakdown"
                 and (not ids(r) or ids(r) == {request})
             ]
             if s["_worker"] is not None
         }
     )
-    forward_workers = {r["_worker"] for r in forwards} | {
-        r["_worker"]
-        for r in data["diag"]
-        if r.get("event") == "worker_phase_breakdown"
-        and execution(r) in executions
-        and r["_worker"] is not None
-        and not r["_identity_conflict"]
-    }
+    forward_workers = {r["_worker"] for r in forwards}
     for rank in sorted({worker[0] for worker in forward_workers}):
         candidates = {worker for worker in forward_workers if worker[0] == rank}
         if any(worker[0] == rank for worker in workers):
             if candidates - set(workers):
-                warnings.append(
-                    f"TP{rank} Worker 诊断的 PID 与已知 Worker 不符，未借用。"
-                )
+                warnings.append(f"TP{rank} Forward 的 PID 与已知 Worker 不符，未借用。")
         elif len(candidates) == 1:
             workers.extend(candidates)
         else:
-            warnings.append(f"TP{rank} Worker 诊断有多个 PID，身份有歧义，未认领。")
+            warnings.append(f"TP{rank} Forward 有多个 Worker PID，身份有歧义，未认领。")
     workers.sort()
     if not workers:
         warnings.append("没有已关联 Worker 记录，Forward/保存明细缺失，不代表零耗时。")
@@ -861,12 +720,6 @@ def save_rows(data, request, end, steps, requested_rank, warnings):
                 {
                     "worker": worker,
                     "forward": forward_for_step(forwards, exec_id, worker, warnings),
-                    "worker_phases": {
-                        phase: worker_phase_for_step(
-                            data, request, exec_id, worker, phase, warnings
-                        )
-                        for phase in ("execute", "sample")
-                    },
                     "values": [total(tasks, field) for field in SAVE] + phases,
                     "put": total(tasks, "put"),
                     "volume": [
@@ -1122,20 +975,6 @@ def render(
                 cells.append(f'<td class="{classes.strip()}">{fmt(value)}</td>')
             for field, value, digits in zip(("keys", "mib"), rank["volume"], (0, 1)):
                 cells.append(f'<td data-field="{field}">{fmt(value, digits)}</td>')
-            for phase, coverage in rank["worker_phases"].items():
-                for field, value in zip(
-                    ("duration", "covered", "uncovered"), coverage["values"]
-                ):
-                    cells.append(
-                        f'<td class="wk{" missing" if value is None else ""}" '
-                        f'data-worker-phase="{phase}" data-field="{field}" '
-                        f'title="{escape(coverage["source"])}">{fmt(value)}</td>'
-                    )
-            if rank_index == 0:
-                cells.extend(
-                    f'<td rowspan="{span}" title="请求级 {name} 仅在总计行展示"></td>'
-                    for name in ("原始 residual", "尚未归因差额")
-                )
             row_class = ' class="step-start"' if rank_index == 0 else ""
             body.append(f"<tr{row_class}>" + "".join(cells) + "</tr>")
     worker_text = ", ".join(f"TP{w[0]} / PID {w[1]}" for w in workers) or "未知 Worker"
@@ -1229,13 +1068,6 @@ def render(
         and ids(record) == {request}
         and (tp_rank is None or integer(record.get("tp_rank")) == tp_rank)
     )
-    worker_evidence = "".join(
-        evidence(record)
-        for record in data["diag"]
-        if record.get("event") == "worker_phase_breakdown"
-        and execution(record) in {execution(step) for step in steps if execution(step)}
-        and (tp_rank is None or integer(record.get("tp_rank")) == tp_rank)
-    )
     queue_evidence = evidence(queue) if queue else "<p>QUEUE 证据缺失或多条歧义。</p>"
     tokenizer_evidence = "".join(
         evidence(r)
@@ -1290,32 +1122,22 @@ JavaScript，不要在禁用脚本的聊天或文件预览中操作。
 <th colspan="4" class="ec">schedule (s)</th><th>TP</th>
 <th class="wk">start_load_kv (s)</th>
 <th colspan="5" class="wk">forward (s)</th>
-<th colspan="11" class="store">wait_for_save (s)</th>
-<th colspan="6" class="wk">
-Worker-local coverage（当前 TP，非请求 step residual；s）</th>
-<th colspan="2">请求 residual（s，仅总计）</th></tr>
+<th colspan="11" class="store">wait_for_save (s)</th></tr>
 <tr class="total"><th>总计</th><td>{fmt(ttft)}</td>
 <td id="tokenizer-value">{fmt(number(tok.get("tokenize")))}</td>
 <td colspan="4">{fmt(schedule)}</td>
 <td></td><td>{fmt(number(bd.get("load_kv")))}</td>
 <td colspan="5">{fmt(number(bd.get("forward")))} · BREAKDOWN.forward</td>
 <td colspan="11" class="store">
-{fmt(number(bd.get("save_kv")))} · BREAKDOWN.save_kv</td>
-<td colspan="6" title="并行 TP/多次调用不相加，不从请求 residual 扣除"></td>
-<td id="request-residual-value">{fmt(residual)}</td>
-<td id="remaining-table-value">{fmt(remaining)}</td></tr>
+{fmt(number(bd.get("save_kv")))} · BREAKDOWN.save_kv</td></tr>
 <tr><th rowspan="2">执行轮次</th><th rowspan="2"></th><th rowspan="2"></th>
 <th rowspan="2" class="ec">hash</th>
 <th rowspan="2" class="ec">ext_lookup</th><th rowspan="2" class="ec">alloc</th>
 <th rowspan="2" class="ec">other</th><th rowspan="2">TP</th>
 <th rowspan="2" class="wk">load（当前TP）</th>
-<th rowspan="2" class="wk"
-title="model_call_pre：KV with body 中 _model_forward 前的 Mamba 条件准备/复制；
-不是整个 Worker 输入准备">Mamba 条件准备/复制</th>
+<th rowspan="2" class="wk">model_call_pre</th>
 <th colspan="3" class="wk">model_call</th>
-<th rowspan="2" class="wk"
-title="model_call_post：KV with body 中 _model_forward 后的 Mamba 条件收尾">
-Mamba 条件收尾</th>
+<th rowspan="2" class="wk">model_call_post</th>
 <th rowspan="2" class="store">q_wait</th>
 <th rowspan="2" class="store">build_key</th>
 <th rowspan="2" class="store">lookup</th>
@@ -1323,20 +1145,11 @@ Mamba 条件收尾</th>
 <th rowspan="2" class="store">sync</th>
 <th colspan="4" class="put">put</th>
 <th rowspan="2" class="store">keys (当前TP)</th>
-<th rowspan="2" class="store">MiB (当前TP)</th>
-<th colspan="3" class="wk">execute 实际调用</th>
-<th colspan="3" class="wk">sample 实际调用</th>
-<th rowspan="2">原始 residual</th><th rowspan="2">尚未归因差额</th></tr>
-<tr><th class="wk"
-title="model_prepare：仅 _model_forward 内部模型执行准备，不是整个 Worker 输入准备">
-model_prepare</th><th class="wk">model_graph_update</th>
+<th rowspan="2" class="store">MiB (当前TP)</th></tr>
+<tr><th class="wk">model_prepare</th><th class="wk">model_graph_update</th>
 <th class="wk">model_run</th>
 <th class="put">start</th><th class="put">submit</th>
 <th class="put">wait</th><th class="put">finalize</th>
-<th class="wk">实际耗时</th><th class="wk">已覆盖 union</th>
-<th class="wk">局部未覆盖</th>
-<th class="wk">实际耗时</th><th class="wk">已覆盖 union</th>
-<th class="wk">局部未覆盖</th>
 </tr></thead><tbody>{"".join(body)}</tbody></table></div>
 <p class="note">总计取请求级 BREAKDOWN；逐轮左侧取 EngineCore 记录；
 保存任务及 Mooncake 四阶段按 TP 独立分行，缺少某轮证据时保留缺失值；
@@ -1352,17 +1165,6 @@ L3 是 model_call 内部范围，嵌套层级不得相加或加入 BREAKDOWN/res
 <p class="note">
 wait_for_save 下方是保存相关明细，不代表各列相加等于外层接口时间。
 “—”表示缺失或无法关联，不表示 0。</p>
-<p class="note">Worker-local coverage 独立展示 Worker.execute_model / sample_tokens
-实际调用范围，以及同 execution、唯一请求、TP、主机/进程/run、同原生线程的
-load/forward/save 观测到的原始主机计时边界 union；不把父子区间重复相加。
-coverage_complete 仅表示这些已观测区间通过关联/线程/边界检查，不表示整个业务都已覆盖，
-也不证明每个嵌套操作成功；status=ok 只表示外层 Worker 方法正常返回。
-局部未覆盖 = 调用耗时 − union，仅表示本次 Worker 调用内尚未覆盖的主机区间，
-不是请求 step residual，绝不从原始 residual 或尚未归因差额扣减，
-也不跨 TP 或调用相加。缺少旧日志、sample 未调用、混合请求、身份冲突/重复、
-失败、跨线程/时钟或不完整覆盖均保留未知；有效调用耗时可独立于覆盖完整性展示。
-提示含首段/尾段/区间间隙，三者只解释局部未覆盖，不重复计入 union。
-延迟 sample/save 按原始 execution 身份关联，不按日志位置挪到下一轮。</p>
 <details><summary>数据来源与统计规则</summary><ul>
 <li>总计行、TTFT、原始 residual、update={fmt(number(bd.get("update")))} s
 {transfer_summary}
@@ -1382,7 +1184,7 @@ QUEUE 来源行 {queue_source}。
 人工候选只供查看，不作为已证明的 residual 扣减依据。</li>
 <li>QUEUE 仅有 initial_queue_valid=true、零 preemption、一次 QUEUED/SCHEDULED 时
 用于首次排队扣减；这不是请求累计排队量，旧日志无有效性证据则不扣减。</li>
-</ul>{evidence(bd)}{queue_evidence}{tokenizer_evidence}{save_evidence}{forward_evidence}{worker_evidence}</details>
+</ul>{evidence(bd)}{queue_evidence}{tokenizer_evidence}{save_evidence}{forward_evidence}</details>
 <script>
 const tokenizerSelect = document.getElementById("tokenizer-select");
 function updateTokenizer() {{
@@ -1396,8 +1198,6 @@ function updateTokenizer() {{
     document.getElementById("remaining-value").textContent =
         option.dataset.remaining || "—";
     document.getElementById("remaining-evidence").textContent =
-        option.dataset.remaining || "—";
-    document.getElementById("remaining-table-value").textContent =
         option.dataset.remaining || "—";
     document.getElementById("tokenizer-selection").textContent =
         "当前显示：render=" + (option.dataset.render || "—") +

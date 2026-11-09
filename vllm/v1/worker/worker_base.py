@@ -357,15 +357,10 @@ class WorkerWrapperBase:
                 tp_rank=get_tp_group().rank_in_group,
             )
         except Exception:
-            diagnostic_fields = {
-                "execution_id": None, "request_ids": None, "tp_rank": None,
-            }
-        with (
-            ttft_diag.scope(**diagnostic_fields),
-            ttft_diag.worker_phase("execute", diagnostic_fields),
-        ):
-            with ttft_diag.worker_range("input_prepare", coverage=False):
-                self._apply_mm_cache(scheduler_output)
+            self._apply_mm_cache(scheduler_output)
+            return self.worker.execute_model(scheduler_output)
+        with ttft_diag.scope(**diagnostic_fields):
+            self._apply_mm_cache(scheduler_output)
             # Observe every participating rank, including executions with no save.
             ttft_diag.emit("worker_execute")
             return self.worker.execute_model(scheduler_output)
@@ -373,23 +368,7 @@ class WorkerWrapperBase:
     def sample_tokens(
         self, grammar_output: GrammarOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        diagnostic_fields = {
-            "execution_id": None, "request_ids": None, "tp_rank": None,
-        }
-        try:
-            # Captured with the originating runner state, not ambient RPC scope.
-            runner = self.worker.model_runner
-            saved = getattr(runner, "_ttft_sample_fields", None)
-            runner._ttft_sample_fields = None
-            if saved is not None:
-                diagnostic_fields = saved
-        except Exception:
-            pass
-        with (
-            ttft_diag.scope(**diagnostic_fields),
-            ttft_diag.worker_phase("sample", diagnostic_fields),
-        ):
-            return self.worker.sample_tokens(grammar_output)
+        return self.worker.sample_tokens(grammar_output)
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache
