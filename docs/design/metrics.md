@@ -53,6 +53,41 @@ For Grafana rows only, convert raw logs in one command without intermediate file
 Malformed diagnostic records or logs without diagnostic records cause exit code 2
 before writing output. The existing report-JSON input remains supported.
 
+### 已有日志：一步生成 Grafana JSON
+
+在可以读取本次 P/D 日志的机器执行；不要求 NPU，也不导入 vLLM、torch
+或 numpy。将 `pd_grafana_json.py` 和同版本 `pd_metrics_report.py` 放在同一
+目录。转换不会采集远程日志或重启服务，不需要手动 grep 或拼接文件。
+
+```bash
+/usr/local/python3.12.16/bin/python \
+  /vllm-workspace/vllm/tools/pd_grafana_json.py \
+  --logs log_prefill.log log_decode.log \
+  -o rows.json
+```
+
+将两个日志名替换成实际路径；只有 P 日志就只传 P 文件，有多个 Worker 日志
+就继续列在 `--logs` 后。相对路径按当前目录解释，输出父目录需存在。
+成功输出 `N requests; M observations -> rows.json`；N/M 来自实际日志。
+已有同名结果会被覆盖。当前入口不生成 report.json 或 requests.json。
+
+```bash
+/usr/local/python3.12.16/bin/python -c 'import json; d=json.load(open("rows.json")); print({k:len(d[k]) for k in ("requests","observations","tasks","hbm","pd_transfers","quality")})'
+```
+
+- `No module named pd_metrics_report`：配套模块未放在脚本同目录。
+- `No diagnostic records found`：日志没有可识别打点，核对 `[PD_DIAG]`、
+  服务是否在代码更新后重启、是否收集了正确进程的日志。
+- `Invalid diagnostic records`：按报错文件和行号检查截断或损坏记录。
+- `quality` 多或字段为 null：核查缺失日志及身份关联证据，不补零。
+
+无打点或非法打点以 2 退出、不写新结果；旧 rows.json 仍可能存在，失败后
+不要继续使用旧文件。只提供 P 日志不会得到 D 的完整数据。
+
+rows.json 是数据文件，不是 dashboard 导入文件。把它交给现有 rows HTTP API，
+让 API 改读该路径并重启，再刷新 Grafana。API 若只在启动时加载数据，每次转换
+新日志后均需重启。Grafana 服务端必须能访问 API；跨容器不能照抄 loopback 地址。
+
 The HTML report starts with five non-additive mainline groups:
 
 1. API input: req_resolve, render, tokenize, input assembly, registration, send.
