@@ -33,9 +33,13 @@ Defaults:
 Default source pins (override with PD_DEPLOY_CORE_PIN / PD_DEPLOY_ASCEND_PIN;
 each must contain exactly 40 hexadecimal characters):
   https://github.com/Emtemf/vllm.git
-    a707a07ab5e7f0e3b3d384685bbc5b910758e964
+    f8b9de31a9e3a1b8ad76dee78917534121be39d1
   https://github.com/Emtemf/vllm-ascend.git
     afdbf1e3e3057b32cfe22075244e552a25113330
+When installing a newer verified release, set PD_DEPLOY_CORE_PIN to that exact
+published core commit on both P and D. The default is a committed source baseline,
+not a moving branch tip; current HEAD must be its ancestor (newer HEADs are refused).
+Download/copy this script outside both source roots before --apply or --rollback.
 
 Example on either P or D (stop workers through your normal supervisor first):
   bash tools/deploy_pd_metrics_d.sh --check
@@ -482,7 +486,7 @@ except (OSError, ValueError, KeyError, IndexError, TypeError, zipfile.BadZipFile
 PY
 }
 
-core_pin=${PD_DEPLOY_CORE_PIN-a707a07ab5e7f0e3b3d384685bbc5b910758e964}
+core_pin=${PD_DEPLOY_CORE_PIN-f8b9de31a9e3a1b8ad76dee78917534121be39d1}
 ascend_pin=${PD_DEPLOY_ASCEND_PIN-afdbf1e3e3057b32cfe22075244e552a25113330}
 [[ $core_pin =~ ^[[:xdigit:]]{40}$ ]] || die 'PD_DEPLOY_CORE_PIN must contain exactly 40 hexadecimal characters.'
 [[ $ascend_pin =~ ^[[:xdigit:]]{40}$ ]] || die 'PD_DEPLOY_ASCEND_PIN must contain exactly 40 hexadecimal characters.'

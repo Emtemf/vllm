@@ -51,13 +51,28 @@ def wall_timestamp(records: list[dict[str, Any]]) -> str | None:
     return None
 
 
-def request_role(request: dict[str, Any]) -> str | None:
-    roles = set(request.get("roles", []))
-    if roles & {"kv_producer", "prefill", "producer", "P"}:
+def summary_role(summary: dict[str, Any]) -> str | None:
+    role = summary.get("kv_role", summary.get("role"))
+    if role in ("P", "p", "prefill", "producer", "kv_producer"):
         return "p"
-    if roles & {"kv_consumer", "decode", "consumer", "D"}:
+    if role in ("D", "d", "decode", "consumer", "kv_consumer"):
         return "d"
     return None
+
+
+def measurement_role(
+    measurement: dict[str, Any], request_records: list[dict[str, Any]]
+) -> str | None:
+    domain = measurement.get("domain")
+    if not isinstance(domain, list) or len(domain) < 3:
+        return None
+    roles = {
+        summary_role(record)
+        for record in request_records
+        if [record.get("host"), record.get("pid"), record.get("run_id")] == domain[:3]
+        and summary_role(record) is not None
+    }
+    return next(iter(roles)) if len(roles) == 1 else None
 
 
 def stage_observation(measurement: dict[str, Any], event: str) -> dict[str, Any]:
@@ -126,13 +141,17 @@ def convert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     for request in dashboard["requests"]:
         request_records = [records[index] for index in request["record_indices"]]
-        phase = request_role(request)
         missing = ["model", "tokens.prompt", "tokens.output", "latency_ms.e2e"]
-        if phase is None:
-            missing.append("route.role")
 
+        summaries = [
+            row for row in request_records if row["event"] == "request_summary"
+        ]
+        roles_by_side = {"p": [], "d": []}
+        for summary in summaries:
+            role = summary_role(summary)
+            if role is not None:
+                roles_by_side[role].append(summary)
         ttft = {"p": {}, "d": {}}
-        selected_phase = ttft[phase] if phase else None
         for overview in request["overview"]:
             event = overview["event"]
             if event == "scheduler_schedule":
@@ -142,8 +161,11 @@ def convert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if stage.get("state") != "missing"
                 ]
                 observations = [stage_observation(stage, event) for stage in stages]
-                if selected_phase is not None:
-                    add_stage(selected_phase, "schedule", observations, 1)
+                for observation in observations:
+                    role = measurement_role(observation, request_records)
+                    if role is None:
+                        continue
+                    add_stage(ttft[role], "schedule", [observation], 1)
                     for execution_id in request["execution_ids"]:
                         execution = executions.get(execution_id)
                         if execution is None:
@@ -156,7 +178,7 @@ def convert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         if len(matching) != 1:
                             continue
                         ranges = matching[0].get("manager_ranges_ns", {})
-                        sub = selected_phase.setdefault("schedule_sub", {})
+                        sub = ttft[role].setdefault("schedule_sub", {})
                         for source, name in (
                             ("queue", "queue_time"),
                             ("hash", "hash"),
@@ -177,18 +199,19 @@ def convert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     for stage in overview["measurements"]
                     if stage.get("state") != "missing"
                 ]
-                if selected_phase is not None:
-                    by_rank: dict[str, list[dict[str, Any]]] = defaultdict(list)
-                    for observation in observations:
+                by_side_rank: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(
+                    list
+                )
+                for observation in observations:
+                    role = measurement_role(observation, request_records)
+                    if role is not None:
                         domain = observation.get("domain") or []
                         rank = str(domain[-1]) if domain else "unknown"
-                        by_rank[rank].append(observation)
-                    name = WORKER_EVENTS[event]
-                    for rank, rank_observations in by_rank.items():
-                        worker = selected_phase.setdefault("worker_tp", {}).setdefault(
-                            rank, {}
-                        )
-                        add_stage(worker, name, rank_observations, 1)
+                        by_side_rank[(role, rank)].append(observation)
+                name = WORKER_EVENTS[event]
+                for (role, rank), rank_observations in by_side_rank.items():
+                    worker = ttft[role].setdefault("worker_tp", {}).setdefault(rank, {})
+                    add_stage(worker, name, rank_observations, 1)
 
         task_rows = [tasks[key] for key in request["task_keys"] if key in tasks]
         save_tasks = [
@@ -230,12 +253,19 @@ def convert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             else None
             for name in ("e2e_latency", "time_to_first_token")
         }
+        if official.get("first_token_observed") is False:
+            official_ms["time_to_first_token"] = None
         value = lambda name, metrics=metrics: metrics[name]["value"]
         missing = [
             name
             for name, metric in metrics.items()
             if isinstance(metric, dict)
             and metric.get("state") in ("missing", "ambiguous")
+            and not (
+                len(summaries) > 1
+                and name
+                in {"input_tokens", "output_tokens", "cached_tokens", "decode_ms"}
+            )
         ]
         output.append(
             {
@@ -260,8 +290,8 @@ def convert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 ),
                 "ts": wall_timestamp(request_records),
                 "route": {
-                    "p": "prefill" if phase == "p" else None,
-                    "d": "decode" if phase == "d" else None,
+                    "p": "prefill" if roles_by_side["p"] else None,
+                    "d": "decode" if roles_by_side["d"] else None,
                     "retries": 0,
                 },
                 "result": {
@@ -270,19 +300,19 @@ def convert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "http_status": api_terminal.get("http_status"),
                 },
                 "tokens": {
-                    "prompt": value("input_tokens"),
-                    "cached": value("cached_tokens"),
+                    "prompt": value("input_tokens") if len(summaries) == 1 else None,
+                    "cached": value("cached_tokens") if len(summaries) == 1 else None,
                     "cached_local": value("hbm_cached_tokens"),
                     "cached_ext": value("external_cached_tokens"),
                     "prefill_compute": value("prefill_compute_tokens"),
-                    "output": value("output_tokens"),
+                    "output": value("output_tokens") if len(summaries) == 1 else None,
                 },
                 "request_metrics": metrics,
                 "latency_ms": {
-                    "e2e": official_ms["e2e_latency"],
+                    "e2e": official_ms["e2e_latency"] if len(summaries) == 1 else None,
                     "starts_at": "engine",
                     "ttft": official_ms["time_to_first_token"],
-                    "decode": value("decode_ms"),
+                    "decode": value("decode_ms") if len(summaries) == 1 else None,
                     "tpot": None,
                     "p_total": None,
                     "d_total": None,
@@ -299,6 +329,11 @@ def convert(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "attempts": 1,
                 "missing": missing,
                 "request_summaries": summaries,
+                "request_summary_by_side": {
+                    side: side_summaries
+                    for side, side_summaries in roles_by_side.items()
+                    if side_summaries
+                },
                 "associated_tasks": [task_json(task, records) for task in task_rows],
             }
         )

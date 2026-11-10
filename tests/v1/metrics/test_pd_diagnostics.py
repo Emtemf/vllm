@@ -5,6 +5,7 @@ import asyncio
 import importlib.util
 import json
 import logging
+import sys
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -112,6 +113,95 @@ def test_api_observations_survive_root_path_mount(caplog, root_path, path):
     assert terminal["status"] == "completed"
     assert ingress["observation_id"] == terminal["observation_id"]
     assert received == response
+
+
+@pytest.fixture
+def exporter_modules(monkeypatch):
+    root = Path(__file__).resolve().parents[3]
+    report_spec = importlib.util.spec_from_file_location(
+        "pd_metrics_report", root / "tools" / "pd_metrics_report.py")
+    report = importlib.util.module_from_spec(report_spec)
+    report_spec.loader.exec_module(report)
+    monkeypatch.setitem(sys.modules, "pd_metrics_report", report)
+    modules = {"report": report}
+    for name, module_name in (("request", "pd_request_json"),
+                              ("grafana", "pd_grafana_json")):
+        spec = importlib.util.spec_from_file_location(
+            module_name, root / "tools" / f"{module_name}.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        modules[name] = module
+    return modules
+
+
+def test_paired_export_keeps_sides_separate_and_no_token_ttft_missing(
+    exporter_modules,
+):
+    summaries = [
+        {"event": "request_summary", "request_id": "req", "host": "P", "pid": 10,
+         "run_id": "p", "kv_role": "kv_producer",
+         "first_token_observed": False, "time_to_first_token": 2.5,
+         "e2e_latency": 4.0, "num_prompt_tokens": 100,
+         "num_generation_tokens": 0},
+        {"event": "request_summary", "request_id": "req", "host": "D", "pid": 20,
+         "run_id": "d", "kv_role": "kv_consumer",
+         "first_token_observed": True, "time_to_first_token": 1.25,
+         "e2e_latency": 3.0, "num_prompt_tokens": 0,
+         "num_generation_tokens": 4},
+    ]
+    request = exporter_modules["request"].convert(summaries)
+    assert [row["route"] for row in request] == [
+        {"p": "prefill", "d": None, "retries": 0},
+        {"p": None, "d": "decode", "retries": 0},
+    ]
+    assert [row["latency_ms"]["ttft"] for row in request] == [None, 1250.0]
+    native = [{**row, "display_ms": {
+        "time_to_first_token": row["time_to_first_token"] * 1000,
+        "e2e_latency": row["e2e_latency"] * 1000,
+    }} for row in summaries]
+    fixture = {"dashboard": {"requests": [{
+        "key": "request-1", "label": "req", "roles": ["producer"],
+        "observations": summaries, "native_summaries": native, "mainline": [],
+        "metrics": {}, "statuses": [],
+    }], "executions": [], "tasks": [], "unresolved_links": [], "native_links": []}}
+    row = exporter_modules["grafana"].flatten(fixture)["requests"][0]
+    assert row["ttft_ms"] is None and row["p_ttft_ms"] is None
+    assert row["d_ttft_ms"] == 1250
+
+
+def test_shared_api_output_attaches_only_to_unique_explicit_request(report_module):
+    request_id = "internal-1_0-ab12cd34"
+    records = [
+        report_record("api_ingress", observation_id="api-1"),
+        report_record("api_request_link", observation_id="api-1",
+                      api_request_id="client-1", external_req_id="internal-1_0"),
+        report_record("request_id_link", api_request_id="client-1",
+                      external_req_id="internal-1_0", request_id=request_id),
+        report_record("engine_submit", api_request_id="client-1",
+                      external_req_id="internal-1_0", request_id=request_id),
+        report_record("engine_core_received", host="CORE", pid=30,
+                      run_id="engine", request_id=request_id),
+        report_record("api_output_received", host="API", pid=20, run_id="frontend",
+                      request_ids=[request_id], batch_shared=True,
+                      output_batch_id="batch-1"),
+        report_record("api_output_endpoint", host="API", pid=20, run_id="frontend",
+                      request_ids=[request_id], batch_shared=True,
+                      output_batch_id="batch-1", iteration_timestamp=1.0),
+    ]
+    dashboard = report_module.build_dashboard(records)
+    assert len(dashboard["requests"]) == 1
+    request = dashboard["requests"][0]
+    assert request["output_endpoints"][0]["iteration_timestamp"] == 1.0
+    assert request["key"] in dashboard["output_batches"][0]["request_keys"]
+
+    duplicate = records + [
+        report_record("engine_submit", host="OTHER", pid=40, run_id="other",
+                      request_id=request_id),
+    ]
+    ambiguous = report_module.build_dashboard(duplicate)
+    assert all(not request["output_endpoints"]
+               for request in ambiguous["requests"])
+
 
 
 @pytest.fixture
@@ -1013,7 +1103,7 @@ def test_report_shared_output_identity_is_evidence_not_network_latency(report_mo
     batch = dashboard["output_batches"][0]
     assert batch["duration_ns"] is None
     assert batch["shared"] is True
-    assert len(batch["request_keys"]) == 4  # Never join bare IDs across hosts.
+    assert len(batch["request_keys"]) == 4  # Legacy local IDs stay process scoped.
     send = next(r for r in batch["evidence"] if r["event"] == "engine_output_send")
     receive = next(r for r in batch["evidence"] if r["event"] == "api_output_received")
     endpoint = next(r for r in batch["evidence"] if r["event"] == "api_output_endpoint")

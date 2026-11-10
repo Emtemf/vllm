@@ -776,7 +776,7 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
             for other in roots:
                 parent[other] = first
 
-    # Only request-specific fields join aliases. Batch members never join.
+    # Request aliases are local to identified API/process observations.
     for index, record in enumerate(records):
         nodes = []
         for kind in ("observation_id", "api_request_id", "request_id",
@@ -785,13 +785,48 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
             if value is not None:
                 nodes.append(node(kind, value, record, index))
         join(nodes)
+        if record["event"] == "api_request_link":
+            api_key = node("api_request_id", record.get("api_request_id"),
+                           record, index)
+            external_key = node("external_req_id", record.get("external_req_id"),
+                                 record, index)
+            join([key for key in (api_key, external_key) if key is not None])
+        else:
+            join(nodes)
         if record["event"] == "request_child_link":
             ancestor = node("request_id", record.get("parent_request_id"),
                             record, index)
             join(nodes + ([ancestor] if ancestor is not None else []))
-        for value in record.get("request_ids", []):
-            node("request_id", value, record, index)
+        shared_api_batch = (
+            record["event"] in ("api_output_received", "api_output_endpoint")
+            and record.get("batch_shared") is True
+        )
+        if not shared_api_batch:
+            for value in record.get("request_ids", []):
+                node("request_id", value, record, index)
         record_nodes.append(nodes)
+    api_roots_by_external: dict[str, set[tuple]] = defaultdict(set)
+    core_roots_by_external: dict[str, set[tuple]] = defaultdict(set)
+    for index, record in enumerate(records):
+        external = record.get("external_req_id")
+        if external is None:
+            continue
+        if record["event"] == "api_request_link":
+            api_roots_by_external[str(external)].update(
+                root(alias) for alias in record_nodes[index]
+                if alias[0] == "api_request_id"
+            )
+        elif record["event"] == "request_id_link":
+            core_roots_by_external[str(external)].update(
+                root(alias) for alias in record_nodes[index]
+                if alias[0] == "request_id"
+                and alias[-1] == str(record.get("request_id"))
+            )
+    for external in api_roots_by_external.keys() & core_roots_by_external.keys():
+        api_roots = api_roots_by_external[external]
+        core_roots = core_roots_by_external[external]
+        if len(api_roots) == len(core_roots) == 1:
+            join([*api_roots, *core_roots])
 
     executions: dict[str, dict] = {}
     execution_anchors: dict[str, list[tuple[dict, int]]] = defaultdict(list)
@@ -867,9 +902,10 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
             candidates = execution_nodes(record.get("execution_id"),
                                          record["request_id"])
             join(record_nodes[index] + candidates)
-        for value in record.get("request_ids", []):
-            local = node("request_id", value, record, index)
-            join([local] + execution_nodes(record.get("execution_id"), value))
+        if record["event"] not in ("api_output_received", "api_output_endpoint"):
+            for value in record.get("request_ids", []):
+                local = node("request_id", value, record, index)
+                join([local] + execution_nodes(record.get("execution_id"), value))
 
     # assign_request_id emits the randomized transport identity before
     # AsyncLLM sends that exact EngineCoreRequest to EngineCore.add_request.
@@ -926,6 +962,26 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
                 "reason": "随机化来源、唯一提交/接收或完整进程身份不足；仅候选，不归入耗时",
             })
 
+    # API output batches carry EngineCore request IDs. Attach them only after
+    # the explicit request-id, submit, and receive bridge has joined the API
+    # request's randomized transport identity. Never infer a link from clocks.
+    for index, record in enumerate(records):
+        if record["event"] not in ("api_output_received", "api_output_endpoint"):
+            continue
+        member_ids = record.get("request_ids", [])
+        linked = set()
+        for value in member_ids:
+            matches = [link for link in transport_links
+                       if link["request_id"] == str(value)]
+            if len(matches) != 1:
+                linked = set()
+                break
+            sender = matches[0]["sender_record_index"]
+            linked.add(root(record_nodes[sender][0]))
+        if linked:
+            record_nodes[index].extend(
+                alias for alias in parent if root(alias) in linked
+            )
     offers: dict[tuple[str, str], list[tuple]] = defaultdict(list)
     for index, record in enumerate(records):
         if record["event"] == "pd_transfer_offer":
@@ -978,7 +1034,9 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     def keys_for(record: dict, index: int) -> list[str]:
         nodes = list(record_nodes[index])
-        ids = list(record.get("request_ids", []))
+        ids = ([] if record["event"] in ("api_output_received", "api_output_endpoint")
+               and record.get("batch_shared") is True
+               else list(record.get("request_ids", [])))
         for field in ("finished_sending", "finished_recving", "failed_recving"):
             ids.extend(record.get(field, []))
         for value in ids:

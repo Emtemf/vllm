@@ -28,13 +28,20 @@ API observation supports root-path mounts, token-ID-only generated responses,
 and delayed closure of resumable input. Request summaries preserve the native
 timing formulas. `first_token_observed=false` marks a terminal output with no
 generated token: its native first-output timestamp is not proof of a first
-token, even when the native TTFT field is nonzero.
+token. Request/report/Grafana display TTFT must be null in that case, even when
+the original native TTFT field is nonzero; retain the original field as evidence.
 
-To inspect collected observations:
+To inspect collected observations with the container's existing Python (no uv
+or vLLM import is required by these standalone converters):
 
 ```bash
-uv run --no-project .venv/bin/python tools/pd_metrics_report.py prefill.log decode.log -o pd-report.json
-uv run --no-project .venv/bin/python tools/pd_metrics_report.py prefill.log decode.log -o pd-report.html --html
+cd /vllm-workspace/vllm
+PD_PYTHON=/usr/local/python3.12.16/bin/python
+mkdir -p /vllm-workspace/pd-metrics-output
+"$PD_PYTHON" tools/pd_metrics_report.py prefill.log decode.log -o /vllm-workspace/pd-metrics-output/report.json &&
+"$PD_PYTHON" tools/pd_metrics_report.py prefill.log decode.log -o /vllm-workspace/pd-metrics-output/report.html --html &&
+"$PD_PYTHON" tools/pd_request_json.py prefill.log decode.log -o /vllm-workspace/pd-metrics-output/requests.json &&
+"$PD_PYTHON" tools/pd_grafana_json.py /vllm-workspace/pd-metrics-output/report.json -o /vllm-workspace/pd-metrics-output/rows.json
 ```
 
 The HTML report starts with five non-additive mainline groups:
@@ -189,6 +196,117 @@ first-to-last-batch request-generation envelope have separate scopes;
 submitted/succeeded/failed byte classifications are not measured wire bytes.
 Missing or conflicting evidence remains null with an explicit state.
 
+The report and request converters accept one or more original log paths, not
+report JSON or shell glob strings. Expand globs in Bash and use each original
+file once; do not also input a concatenated copy. The Grafana converter accepts
+exactly one **report JSON**, not raw logs or request JSON. Output directories
+must already exist. Report conversion writes parse errors to its JSON and exits
+with status 2 if any record is invalid; request conversion rejects invalid
+records before writing output. Stop the pipeline on either failure and inspect
+the original file/line instead of serving a stale rows file. Request JSON is
+one object for one request and an array for zero or multiple requests.
+
+P and D official summaries stay separate, including when explicit transport
+links associate them with one request. The report retains `native_summaries`;
+request JSON retains `request_summary_by_side.p/d`; Grafana rows retain
+`native_summary_by_side.P/D` and `p_ttft_ms`, `d_ttft_ms`, `p_e2e_ms`,
+`d_e2e_ms`, and side-specific token fields. Generic single-summary fields remain
+null when several summaries are present. Do not pick the first summary or add
+P and D TTFT/E2E into client latency. Missing role evidence remains unknown;
+the CLI does not accept a side manifest or infer side from filenames. Keep a
+collection manifest for the operator's deployment-side provenance.
+
+### Linux log capture
+
+On **each** container, retain the existing model, network and KV launch options.
+Set `PD_SIDE=P` on P and `PD_SIDE=D` on D. Replace only `PD_START_SCRIPT` with
+the existing serving startup script; this example runs that script in the
+foreground with its child API/Core/Worker output captured together:
+
+```bash
+set -o pipefail
+PD_SIDE=P
+PD_START_SCRIPT=/absolute/path/to/your/existing-start.sh
+PD_CAPTURE=/vllm-workspace/pd-metrics-logs/$PD_SIDE/$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$PD_CAPTURE"
+{
+  printf 'side=%s\nhost=%s\nstart_utc=%s\n' "$PD_SIDE" "$(hostname)" "$(date -u +%FT%TZ)"
+  printf 'source_timezone=%s\n' "$(date +%z)"
+  git -C /vllm-workspace/vllm rev-parse HEAD
+  git -C /vllm-workspace/vllm-ascend rev-parse HEAD
+  /usr/local/python3.12.16/bin/python -m pip show mooncake-transfer-engine
+} > "$PD_CAPTURE/manifest.txt"
+export VLLM_LOGGING_LEVEL=INFO PYTHONUNBUFFERED=1 GLOG_logtostderr=1
+bash "$PD_START_SCRIPT" 2>&1 | tee "$PD_CAPTURE/serving.log"
+```
+
+Start capture before startup and send the real request through the deployment's
+existing P/D entrypoint from another terminal. Keep capture through request
+termination and asynchronous save completion. The emitter uses INFO logging;
+there is no extra `PD_DIAG` enable flag. A custom logging configuration must
+retain that logger. `GLOG_logtostderr=1` requests native glog on stderr; if the
+launch script overrides logging, collect its actual native files too. A script
+that daemonizes or starts workers in other containers requires those workers'
+own complete log streams; this pipeline alone cannot capture detached output.
+
+For an already-running Docker service, capture from its Linux host using its
+actual container name, separately for P and D:
+
+```bash
+PD_CONTAINER=your-existing-p-container
+PD_CAPTURE=./pd-metrics-logs/P
+mkdir -p "$PD_CAPTURE"
+docker logs --timestamps --since 30m --follow "$PD_CONTAINER" > "$PD_CAPTURE/serving.log" 2>&1
+```
+
+Stop following only after the request and save work finish. Docker logs cover
+container stdout/stderr, not arbitrary files. Ascend's default file-handler
+directory is `~/ascend/log/vllm_ascend`, configurable by `ascend_log_path`;
+preserve the original and rotated files if that handler is active. Do not feed
+both file and stdout copies of the same native timing records. Preserve full
+lines, original source files, timezone and host/PID/TID/run identities. In
+particular, `pool_native_call` and matching `[BatchPutTiming]` /
+`[BatchUpsertTiming]` must remain in the same input source; filtering down to
+`[PD_DIAG]` alone loses native details. Copy P and D logs to one analysis host
+without overwriting their separate directories, then run the conversions above
+with the actual collected paths. Shared batch durations are never divided by
+member count; parallel TP and overlapping stages are never summed or subtracted
+from another process/host clock.
+
+### Grafana snapshot hand-off
+
+`rows.json` contains `requests`, `observations`, `tasks`, `hbm`, `pd_transfers`
+and `quality` arrays. It is a diagnostic snapshot, not Prometheus time-series
+data, and the Grafana time picker does not filter it. The companion delivery
+assets are outside this source repository: `ttft-patches/grafana_rows_api.py`,
+`ttft-patches/grafana_pd_request_dashboard.json`, and
+`ttft-patches/grafana-demo/README.md`. Stage the first two on Linux, for example
+under `/vllm-workspace/pd-grafana`, before starting the read-only adapter:
+
+```bash
+/usr/local/python3.12.16/bin/python /vllm-workspace/pd-grafana/grafana_rows_api.py /vllm-workspace/pd-metrics-output/rows.json --host 127.0.0.1 --port 8765
+```
+
+The adapter loads once at startup; restart it after regenerating rows. In a
+second terminal, `curl -fsS http://127.0.0.1:8765/requests` retrieves the request
+keys. Use `curl -fsS --get --data-urlencode 'request_key=KEY_FROM_REQUESTS'
+http://127.0.0.1:8765/observations` for one request; the other five endpoint
+names match the arrays above. An empty array means no rows for that scope,
+not measured zero. Install Grafana JSON API plugin
+`marcusolsson-json-datasource` (demo: 1.4.4 on Grafana OSS 12.0.2), create that
+datasource with the adapter base URL, import the delivered dashboard JSON, and
+select it in **Rows datasource**, then choose **Request**. For container/remote
+Grafana, configure an address reachable from the Grafana server; its loopback
+is not the analysis host's loopback. See the companion delivery guide for Linux
+Docker startup and exact import/query steps.
+
+The supplied sample log, sample JSON and portable Grafana screenshots are
+**synthetic demo data**, not Linux/NPU inference measurements. Keep the demo's
+synthetic labels; use a separately named dashboard for collected real logs and
+record their manifest. Null/missing evidence must remain null throughout
+Grafana queries and transformations. A rendered dashboard does not establish
+NPU execution or distributed inference correctness.
+
 ### Paired P/D container deployment
 
 Use `tools/deploy_pd_metrics_d.sh` on both P and D. Copy it outside the two
@@ -197,7 +315,14 @@ deployment so source checkout cannot remove the rollback entrypoint. Stop
 serving and transfer-client workers through the normal supervisor first;
 leave the independent shared `mooncake_master` running.
 
+Use the final verified and published 40-character core commit supplied with the
+release, for both the downloaded script and the explicit source override:
+
 ```bash
+PD_RELEASE_CORE=FINAL_VERIFIED_PUBLISHED_40_CHARACTER_CORE_SHA
+curl -fL "https://raw.githubusercontent.com/Emtemf/vllm/$PD_RELEASE_CORE/tools/deploy_pd_metrics_d.sh" -o /vllm-workspace/deploy_pd_metrics_d.sh &&
+PD_DEPLOY_CORE_PIN="$PD_RELEASE_CORE" \
+PD_DEPLOY_ASCEND_PIN=afdbf1e3e3057b32cfe22075244e552a25113330 \
 bash /vllm-workspace/deploy_pd_metrics_d.sh --apply
 ```
 
@@ -207,11 +332,15 @@ roots must be `/vllm-workspace/vllm` and `/vllm-workspace/vllm-ascend`, or suppl
 through `--vllm-dir` and `--ascend-dir`. Existing compiled extensions and editable
 registration are preserved; vLLM and Ascend are not rebuilt or reinstalled.
 
-The script pins core `a707a07ab5e7f0e3b3d384685bbc5b910758e964` and imagebase
-Ascend `afdbf1e3e3057b32cfe22075244e552a25113330`. It fetches missing history
-before checking both approved baselines, refuses unrelated or dirty trees,
-saves source identity and wheel copies, then switches to detached commits.
-The original branch tips remain available for rollback.
+The script's committed default core pin is
+`f8b9de31a9e3a1b8ad76dee78917534121be39d1`, and its imagebase Ascend pin is
+`afdbf1e3e3057b32cfe22075244e552a25113330`. These identities alone do not prove
+publication or final release validation. The final release command must use
+`PD_DEPLOY_CORE_PIN` for the newer verified commit; do not pull a newer branch
+and then apply an older default. It fetches missing history before checking
+both approved baselines, refuses unrelated or dirty trees, saves source identity
+and wheel copies, then switches to detached commits. The original branch tips
+remain available for rollback.
 
 Compatible `mooncake-transfer-engine==0.3.13` diagnostic wheels are discovered
 under known Mooncake build directories and `/vllm-workspace` staging. Distinct
