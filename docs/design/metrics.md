@@ -44,6 +44,15 @@ mkdir -p /vllm-workspace/pd-metrics-output
 "$PD_PYTHON" tools/pd_grafana_json.py /vllm-workspace/pd-metrics-output/report.json -o /vllm-workspace/pd-metrics-output/rows.json
 ```
 
+For Grafana rows only, convert raw logs in one command without intermediate files:
+
+```bash
+"$PD_PYTHON" tools/pd_grafana_json.py --logs prefill.log decode.log -o rows.json
+```
+
+Malformed diagnostic records or logs without diagnostic records cause exit code 2
+before writing output. The existing report-JSON input remains supported.
+
 The HTML report starts with five non-additive mainline groups:
 
 1. API input: req_resolve, render, tokenize, input assembly, registration, send.
@@ -186,7 +195,7 @@ remains unknown. CPU regression checks do not establish NPU performance or
 distributed serving correctness; validate the paired build on the target stack.
 
 Request exports are available through `tools/pd_request_json.py` (raw logs to
-request JSON) and `tools/pd_grafana_json.py` (report JSON to dashboard rows).
+request JSON) and `tools/pd_grafana_json.py` (raw logs or report JSON to dashboard rows).
 Terminal `scheduler_queue_summary.decode_steps` counts decode scheduling
 iterations, including MTP iterations; observed execution counts are separate.
 `request_cache_lookup` reports effective HBM/connector hit boundaries, not

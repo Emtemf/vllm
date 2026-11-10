@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Flatten a vLLM P/D report JSON into Grafana-friendly row arrays.
+"""Convert P/D logs or a report JSON into Grafana-friendly row arrays.
 
 The output is a static export/API payload, not a Grafana datasource or service.
 """
@@ -406,10 +406,26 @@ def _task_rank(records: list[dict[str, Any]]) -> int | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("report", type=Path)
+    parser.add_argument("report", nargs="?", type=Path)
+    parser.add_argument("--logs", nargs="+", type=Path,
+                        help="Read raw P/D logs directly; no report file needed.")
     parser.add_argument("-o", "--out", required=True, type=Path)
     args = parser.parse_args()
-    report = json.loads(args.report.read_text(encoding="utf-8"))
+    if (args.report is None) == (args.logs is None):
+        parser.error("provide either a report JSON or --logs LOG [LOG ...]")
+    if args.logs is not None:
+        from pd_metrics_report import read_records, summarize
+
+        records, errors = read_records(args.logs)
+        if errors:
+            parser.exit(
+                2, "Invalid diagnostic records:\n" + "\n".join(errors[:3]) + "\n"
+            )
+        if not records:
+            parser.exit(2, "No diagnostic records found in input logs.\n")
+        report = summarize(records, [])
+    else:
+        report = json.loads(args.report.read_text(encoding="utf-8"))
     payload = flatten(report)
     args.out.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
