@@ -189,115 +189,53 @@ first-to-last-batch request-generation envelope have separate scopes;
 submitted/succeeded/failed byte classifications are not measured wire bytes.
 Missing or conflicting evidence remains null with an explicit state.
 
-### P-side source refresh
+### Paired P/D container deployment
 
-Validate P first while leaving the current D, proxy, and installed Mooncake
-wheel unchanged. Stop P's serving workers through the normal supervisor before
-changing source; do not stop the shared Mooncake master. Resolve the currently
-imported vLLM and Ascend source roots in the serving environment, and update
-those checkouts rather than an unrelated clone. Preserve the existing
-PYTHONPATH/editable setup and compiled extensions.
-
-Fetch the core `feature/pd-metrics-v0.32.0` and Ascend
-`feature/pd-metrics-v0.32.0-imagebase` branches from the corresponding Emtemf
-forks. Refuse dirty trees and in-progress Git operations, record both original
-HEADs, and require a fast-forward on both roots before applying either update.
-The D utility below has separate pinned commits and a wheel-installation step;
-it is not the P-only source-refresh command.
-
-Restart P using its existing launch command, complete one request through the
-unchanged D/proxy, then run the updated report with the full P log as its only
-input. Keep the full log and generated HTML; native phases without sufficient
-boundary evidence remain pending, not inferred from the timing display.
-
-
-### Guarded D-side deployment
-
-`tools/deploy_pd_metrics_d.sh` is a standalone Bash utility. Copy the reviewed
-script **outside both source trees** on D (for example,
-`/vllm-workspace/deploy_pd_metrics_d.sh`) so it remains available after source
-checkout and for rollback. No source snapshot is converted into a Git repository.
-The existing vLLM and Ascend installs must already be editable installs from the
-specified clean Git roots in the selected Python 3.12 interpreter. The utility
-does not rebuild or reinstall either project or their extensions.
-
-Stop D's serving/transfer-client workers through the normal supervisor first,
-**not the independent/shared `mooncake_master`**; it may remain running unchanged.
-Use this single block. Set `mode=apply` only when ready to deploy; `check` is the
-default and never fetches, installs, creates a state directory, or checks out sources.
-Replace both wheel paths with real absolute filenames: the diagnostic wheel
-must be the **P-built, non-`-npu` distribution `mooncake-transfer==0.3.13`**; the
-backup must be the exact original official wheel, not another diagnostic build.
+Use `tools/deploy_pd_metrics_d.sh` on both P and D. Copy it outside the two
+source roots, for example `/vllm-workspace/deploy_pd_metrics_d.sh`, before
+deployment so source checkout cannot remove the rollback entrypoint. Stop
+serving and transfer-client workers through the normal supervisor first;
+leave the independent shared `mooncake_master` running.
 
 ```bash
-(
-  set -euo pipefail
-  mode=check # Change to apply for the guarded cutover.
-  bash /vllm-workspace/deploy_pd_metrics_d.sh --"$mode" \
-    --vllm-dir /vllm-workspace/vllm \
-    --ascend-dir /vllm-workspace/vllm-ascend \
-    --python /usr/local/python3.12.16/bin/python3.12 \
-    --wheel /absolute/path/to/P-built/mooncake_transfer-0.3.13-cp312-cp312-manylinux_2_35_aarch64.whl \
-    --backup-wheel /absolute/path/to/original/mooncake_transfer-0.3.13-cp312-cp312-manylinux_2_35_aarch64.whl \
-    --state-dir /vllm-workspace/pd-metrics-deploy-state
-)
+bash /vllm-workspace/deploy_pd_metrics_d.sh --apply
 ```
 
-`--help` lists the full interface. `uv`, Git, and the interpreter's existing
-`packaging` module are required. Inspection uses
-`uv run --no-project --no-sync --offline --python ...` and top-level import specs
-plus editable metadata, not imports of vLLM, Ascend, Torch or NPU extensions.
-Wheel tags, ZIP/RECORD hashes, native-module presence and `BatchPutTiming` in the
-store payload are checked without loading native modules. Installed Mooncake
-payload must match one of the two supplied wheels, so an unrelated installation
-cannot be silently overwritten. If D already has the diagnostic wheel, both
-wheels are still required; apply is not a source-only shortcut.
+The default interpreter is `/usr/local/python3.12.16/bin/python`; Git and the
+interpreter's existing pip/packaging are required, not uv. The existing editable
+roots must be `/vllm-workspace/vllm` and `/vllm-workspace/vllm-ascend`, or supplied
+through `--vllm-dir` and `--ascend-dir`. Existing compiled extensions and editable
+registration are preserved; vLLM and Ascend are not rebuilt or reinstalled.
 
-The reviewed source pins are core
-`75330b299b0212d9ecf7e50e977b50c95282c5c0` from
-`https://github.com/Emtemf/vllm.git` and Ascend
-`bd339decd1697dc9bb7c1fa683a32625aa16c577` from
-`https://github.com/Emtemf/vllm-ascend.git`. Approved baselines are respectively
-`5df63a7203cdb9328d824a27b682e77c7b9928be` and
-`fd4be4dbcf751fcff0dd99d18389caf40680e9e7`. Only these baselines or proven
-first-parent diagnostic ancestors up to the exact pins are accepted; unrelated
-histories, later commits, dirty/untracked changes and in-progress Git operations
-are refused. An offline check requires the pinned commits already in the local
-object databases; when missing, it explains that only apply may fetch them.
-Apply fetches missing objects from the explicit fork URLs, completes both-root
-preflight, saves private wheel copies and a JSON rollback record, then switches
-to detached pinned HEADs, preserving existing branch tips. Mooncake installation
-alone uses `uv pip install --offline --python ... --force-reinstall --no-deps`.
+The script pins core `a707a07ab5e7f0e3b3d384685bbc5b910758e964` and imagebase
+Ascend `afdbf1e3e3057b32cfe22075244e552a25113330`. It fetches missing history
+before checking both approved baselines, refuses unrelated or dirty trees,
+saves source identity and wheel copies, then switches to detached commits.
+The original branch tips remain available for rollback.
 
-Save the printed state path. If a source switch or wheel installation fails, use
-the printed rollback command; partial apply is recoverable with the same record.
-For example:
+Compatible `mooncake-transfer-engine==0.3.13` diagnostic wheels are discovered
+under known Mooncake build directories and `/vllm-workspace` staging. Distinct
+valid builds are ambiguous; identical copies are deduplicated. The candidate
+must contain Ascend transport, store, master and `BatchPutTiming`. If it already
+matches the installed payload, it also provides exact rollback. Otherwise the
+script locates the exact original wheel or downloads the image's official
+Huawei wheel over verified HTTPS and compares its payload with the installed
+files before accepting it. Optional `--wheel` and `--backup-wheel` select explicit
+files. If P's build directory is not mounted on D, copy the built `.whl` from
+`/data/y00624827/Mooncake-wheelbase/mooncake-wheel/dist/` into
+`/vllm-workspace/wheels/` on D. No compatible artifact means no cutover.
 
-```bash
-(
-  set -euo pipefail
-  bash /vllm-workspace/deploy_pd_metrics_d.sh \
-    --python /usr/local/python3.12.16/bin/python3.12 \
-    --rollback /vllm-workspace/pd-metrics-deploy-state/run-REPLACE/state.json
-)
-```
+`--check` performs no Git fetch, checkout, installation or data-file writes;
+it may validate an absent original wheel through an in-memory HTTPS download.
+`--apply` installs only the saved Mooncake wheel through the selected
+interpreter's `-m pip install --no-index --force-reinstall --no-deps`.
+Keep the printed state directory and rollback command. Rollback restores the
+recorded source branches/commits and exact prior wheel payload; changed source
+or saved wheel state is refused. No mode stops or restarts services. Restart
+each service with its existing launch command after successful deployment,
+complete a real request, and collect full API/core/worker logs from both sides.
+CPU checks do not establish Linux/NPU serving or model correctness.
 
-Rollback restores the recorded branches/commits and the previously installed
-wheel (original or already-diagnostic), and refuses unexpected HEADs, dirty
-trees, changed branch tips or changed saved wheels. Keep the entire state
-directory, not just its JSON file. No mode kills/restarts services, stashes,
-resets, forces checkout, removes local files, or downloads a wheel. Worker
-detection is deliberately conservative (including Ray/Torch/multiprocessing
-workers); insufficient `/proc` visibility is a refusal, not evidence of stopped
-services. Explicit `mooncake_master` executables and Python console-script
-launchers are exempt: a running shared master retains its already-loaded binary.
-Wheel installation/rollback replaces its on-disk binary and CLI for the **next
-launch** only; coordinate any later master restart separately, without restarting
-P's shared master as part of D migration. The utility cannot prevent an external
-supervisor restarting workers mid-run: disable D-worker automatic restarts and
-keep those workers stopped until completion. Start D workers manually only after
-successful apply or rollback; target-stack smoke/performance validation remains
-a separate operator step.
 
 ## Background
 
