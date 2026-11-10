@@ -285,6 +285,9 @@ class EngineCoreOutputs(
     # Weight version used for this step.
     weight_version: str | None = None
 
+    # Optional diagnostic identity shared by all members of this transport batch.
+    output_batch_id: str | None = None
+
     def __post_init__(self):
         if self.timestamp == 0.0:
             self.timestamp = time.monotonic()

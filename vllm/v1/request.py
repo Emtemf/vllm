@@ -235,6 +235,7 @@ class Request:
         self.pd_initial_wait_ns: int | None = None
         self.pd_queue_valid = True
         self.pd_executions = 0
+        self.pd_decode_steps = 0
         self.pd_execution_id: str | None = None
 
         self.block_hashes: list[BlockHash] = []
@@ -463,6 +464,7 @@ class Request:
                 complete=start is None and self.pd_queue_valid,
                 status=self.status.name,
                 executions=self.pd_executions, preemptions=self.num_preemptions,
+                decode_steps=self.pd_decode_steps,
                 hash_duration_ns=self.pd_hash_duration_ns,
                 hash_calls=self.pd_hash_calls, hash_blocks=self.pd_hash_blocks,
             )

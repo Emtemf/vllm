@@ -1109,6 +1109,19 @@ class Scheduler(SchedulerInterface):
                         connector_prefix_cache_hits = 0
                         num_computed_tokens = 0
                         load_kv_async = False
+                    diag.emit(
+                        "request_cache_lookup", request_id=request.request_id,
+                        num_prompt_tokens=request.num_prompt_tokens,
+                        num_local_cached_tokens=num_new_local_computed_tokens,
+                        num_external_cached_tokens=num_external_computed_tokens,
+                        num_prompt_uncached_tokens=max(
+                            request.num_prompt_tokens - num_computed_tokens, 0
+                        ),
+                        status="lookup_complete", local_source="hbm",
+                        external_source=(
+                            "connector" if num_external_computed_tokens else None
+                        ),
+                    )
 
                     # Skip request with pending mm encoding prefetches
                     if self._ec_transfer_pending(request, num_computed_tokens):
@@ -1603,6 +1616,9 @@ class Scheduler(SchedulerInterface):
             request = self.requests[request_id]
             request.pd_execution_id = scheduler_output.pd_execution_id
             request.pd_executions += 1
+            if (scheduled_tokens > 0
+                    and request.num_computed_tokens >= request.num_prompt_tokens):
+                request.pd_decode_steps += 1
             request.pd_emit_hash_ranges()
             members.append({
                 "request_id": request_id,

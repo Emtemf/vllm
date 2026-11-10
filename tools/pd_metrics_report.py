@@ -103,6 +103,8 @@ def union_duration(records: list[dict[str, Any]]) -> int | None:
     """Union only validated ranges from one explicitly identified clock."""
     if not records:
         return None
+    if any(r.get("event") in _POSITION_EVENTS for r in records):
+        return None
     domains = {clock(r) for r in records}
     if len(domains) != 1 or any(v is None for v in next(iter(domains))):
         return None
@@ -232,11 +234,23 @@ def _number(value: Any) -> bool:
     )
 
 
+_POSITION_EVENTS = {
+    "engine_input_received", "engine_input_enqueued", "engine_input_dequeued",
+    "engine_output_enqueued", "engine_output_dequeued",
+    "engine_batch_enqueued", "engine_batch_dequeued",
+    "api_output_received", "api_output_endpoint",
+    "frontend_request_registered", "request_id_link",
+}
+
+
 def _measurement(records: list[dict[str, Any]]) -> dict[str, Any]:
     """One clock/event only; never turn partial evidence into a complete total."""
     result: dict[str, Any] = {"state": "missing", "duration_ns": None,
                               "observations": len(records)}
     if not records:
+        return result
+    if all(r.get("event") in _POSITION_EVENTS for r in records):
+        result.update(state="observed", note="瞬时位置证据，不是计时器")
         return result
     statuses = [r.get("status") for r in records]
     if all(s == "skipped" for s in statuses):
@@ -273,9 +287,63 @@ def _stage_rows(records: list[dict[str, Any]], events: dict[str, str]) -> list[d
             groups[(*clock(record), record["event"], category)].append(record)
     return [
         {"event": key[-2], "label": events[key[-2]], "domain": list(key[:-2]),
+         "shared": key[-2].startswith(
+             ("engine_output_", "engine_batch_", "api_output_"))
+             or key[-2] == "engine_scheduler_update",
          **_measurement(group)}
         for key, group in groups.items()
     ]
+
+def _queue_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pair object residence, never the time spent blocking on an empty get."""
+    rows = []
+    for name, fallback in (("input", "request_id"), ("output", "output_batch_id")):
+        events = (f"engine_{name}_enqueued", f"engine_{name}_dequeued")
+        groups: dict[tuple, list[dict]] = defaultdict(list)
+        for index, record in enumerate(records):
+            if record["event"] not in events:
+                continue
+            field = ("input_message_id" if name == "input"
+                     and record.get("input_message_id") is not None else fallback)
+            identity = record.get(field)
+            # An unknown clock or object ID must not pair with another unknown.
+            key = (*clock(record), field, identity)
+            if identity is None or any(v is None for v in clock(record)):
+                key = (*key, index)
+            groups[key].append(record)
+        for group in groups.values():
+            enqueued = [r for r in group if r["event"] == events[0]]
+            dequeued = [r for r in group if r["event"] == events[1]]
+            first = group[0]
+            field = ("input_message_id" if name == "input"
+                     and first.get("input_message_id") is not None else fallback)
+            metric = {"state": "missing", "duration_ns": None,
+                      "note": "缺少唯一、同域、同对象的有效入队/出队位置"}
+            if (len(enqueued) == len(dequeued) == 1
+                    and len({clock(r) for r in group}) == 1
+                    and all(v is not None for v in clock(first))
+                    and first.get(field) is not None
+                    and (name == "output" or (
+                        first.get("request_id") is not None
+                        and len({r.get("request_id") for r in group}) == 1))):
+                start, end = (enqueued[0].get("queue_enter_ns"),
+                              dequeued[0].get("queue_exit_ns"))
+                if (_number(start) and _number(end) and end >= start
+                        and all(r.get("valid") is not False
+                                and r.get("complete") is not False for r in group)):
+                    metric = {"state": "measured", "duration_ns": end - start,
+                              "note": "对象在本进程队列的驻留；不含空队列 get 阻塞"}
+            rows.append({
+                "event": f"engine_{name}_queue_wait", "domain": list(clock(first)),
+                field: first.get(field), "request_id": first.get("request_id"),
+                "shared": name == "output",
+                "request_ids": list(dict.fromkeys(
+                    value for r in group for value in r.get("request_ids", []))),
+                "evidence": group, **metric,
+            })
+    return rows
+
+
 
 def _worker_stages(records: list[dict], labels: dict[str, str],
                    domain: tuple) -> list[dict]:
@@ -494,9 +562,11 @@ def _native_thread_links(records: list[dict], tasks: list[dict]) -> list[dict]:
                     if records[i].get(field) is not None
                 }
                 owner[field] = next(iter(ranks)) if len(ranks) == 1 else None
-            owner["task_candidates"] = list(
-                dict.fromkeys(task_by_record[i] for i in indices if i in task_by_record)
-            )
+            task_indices = [i for i in indices if i in task_by_record]
+            task_keys = list(dict.fromkeys(task_by_record[i] for i in task_indices))
+            owner["task_candidates"] = task_keys
+            owner["task_key"] = task_keys[0] if len(task_keys) == 1 else None
+            owner["task_evidence_record_indices"] = task_indices
             candidates.append(owner)
         matching_calls = [
             index
@@ -507,12 +577,16 @@ def _native_thread_links(records: list[dict], tasks: list[dict]) -> list[dict]:
         ]
         call_index = matching_calls[0] if len(matching_calls) == 1 else None
         owner = candidates[0] if len(candidates) == 1 else None
-        if call_index is not None:
+        if owner is None and call_index is not None:
             owner = next(
-                candidate
-                for candidate in candidates
+                candidate for candidate in candidates
                 if candidate["domain"] == list(clock(records[call_index]))
             )
+        if owner is None:
+            task_owners = [candidate for candidate in candidates if candidate["task_key"]]
+            if len(task_owners) == 1:
+                owner = task_owners[0]
+        task_owner = owner.get("task_key") if owner is not None else None
         links.append(
             {
                 "native": record,
@@ -535,10 +609,127 @@ def _native_thread_links(records: list[dict], tasks: list[dict]) -> list[dict]:
                     else "unavailable_no_call_boundary"
                 ),
                 "call_record_index": call_index,
-                "task_key": task_by_record.get(call_index),
+                "task_key": task_by_record.get(call_index) if call_index is not None else None,
+                "task_association": (
+                    "unique_call_boundary"
+                    if call_index is not None
+                    else "unique_thread_task"
+                    if task_owner is not None
+                    else "unresolved"
+                ),
+                "task_candidate_keys": (
+                    owner.get("task_candidates", []) if owner is not None else []
+                ),
             }
         )
     return links
+
+
+def _request_metrics(request: dict, observations: list[dict]) -> dict:
+    """Expose request facts without merging clocks, ranks or transfer scopes."""
+    metrics = {}
+
+    def scalar(name, values, unit, source, note=None):
+        valid = [value for value in values if _number(value)]
+        unique = set(valid)
+        state = "measured" if len(unique) == 1 else "ambiguous" if unique else "missing"
+        metrics[name] = {
+            "value": valid[0] if state == "measured" else None,
+            "unit": unit, "state": state, "source": source, "note": note,
+        }
+
+    summaries = [r for r in observations if r["event"] == "request_summary"]
+    scalar("input_tokens", [r.get("num_prompt_tokens") for r in summaries],
+           "tokens", "request_summary.num_prompt_tokens")
+    scalar("output_tokens", [r.get("num_generation_tokens") for r in summaries],
+           "tokens", "request_summary.num_generation_tokens")
+    scalar("cached_tokens", [r.get("num_cached_tokens") for r in summaries],
+           "tokens", "request_summary.num_cached_tokens")
+    scalar("decode_ms", [r.get("decode_time") * 1000 for r in summaries
+                         if _number(r.get("decode_time"))],
+           "ms", "request_summary.decode_time",
+           "官方首 token 到末 token 的 wall 时间；不是 forward 累计")
+    lookups = [r for r in observations if r["event"] == "request_cache_lookup"]
+    for name, field in (("hbm_cached_tokens", "num_local_cached_tokens"),
+                        ("external_cached_tokens", "num_external_cached_tokens"),
+                        ("prefill_compute_tokens", "num_prompt_uncached_tokens")):
+        scalar(name, [r.get(field) for r in lookups], "tokens",
+               "request_cache_lookup." + field,
+               "逐次 lookup 的有效命中边界，不证明 load 成功或发生了 forward")
+    decode_steps = set()
+    decode_request_ids = {alias["value"] for alias in request["aliases"]
+                          if alias["kind"] == "request_id"}
+    for record in observations:
+        if record["event"] != "scheduler_execution":
+            continue
+        for member in record.get("members", []):
+            before = member.get("num_computed_tokens_before")
+            prompt = member.get("num_prompt_tokens")
+            scheduled = member.get("scheduled_tokens")
+            if (member.get("request_id") in decode_request_ids
+                    and _number(before) and _number(prompt) and _number(scheduled)
+                    and before >= prompt and scheduled > 0
+                    and record.get("execution_id") is not None):
+                decode_steps.add((*clock(record), record["execution_id"]))
+    metrics["observed_decode_steps"] = {
+        "value": len(decode_steps), "unit": "steps", "state": "observed",
+        "source": "scheduler_execution.members",
+        "note": "输入日志中的 decode 调度次数；MTP 多 token 仍记一步",
+    }
+    terminal = [r for r in observations if r["event"] == "scheduler_queue_summary"]
+    scalar("decode_steps", [r.get("decode_steps") for r in terminal],
+           "steps", "scheduler_queue_summary.decode_steps",
+           "整个请求的 decode 调度次数，不含 prefill；不等同成功完成的 forward 次数")
+    metrics["summaries"] = summaries
+    metrics["cache_lookups"] = lookups
+    metrics["hbm_snapshots"] = [
+        r for r in observations if r["event"] in ("kv_cache_request", "request_kv_hbm")
+    ]
+    metrics["hbm_physical_use"] = [
+        r for r in observations if r["event"] == "kv_cache_physical_use"
+    ]
+    transfers = [r for r in observations
+                 if r["event"] in ("pd_transfer_batch_finished",
+                                    "pd_transfer_request_finished")]
+    metrics["pd_transfers"] = []
+    for record in transfers:
+        batch = record["event"] == "pd_transfer_batch_finished"
+        if batch:
+            duration = _measurement([record]).get("duration_ns")
+        else:
+            value = record.get("transfer_duration_ns")
+            duration = value if _number(value) else None
+        metrics["pd_transfers"].append({
+            "event": record["event"],
+            "request_generation": record.get("request_generation"),
+            "task_id": record.get("task_id"), "domain": list(clock(record)),
+            "tp_rank": record.get("tp_rank"), "dp_rank": record.get("dp_rank"),
+            "pp_rank": record.get("pp_rank"), "shared": False,
+            "status": record.get("status"),
+            "submitted_bytes": record.get("submitted_bytes"),
+            "succeeded_bytes": record.get("succeeded_bytes"),
+            "failed_bytes": record.get("failed_bytes"), "duration_ns": duration,
+            "scope": "native_batch" if batch else "request_generation_envelope",
+            "log_source": record.get("log_source"),
+            "byte_semantics": record.get("byte_semantics") or
+                              "submitted_lengths_classified_by_batch_status",
+        })
+    request_transfers = [r for r in metrics["pd_transfers"]
+                         if r["event"] == "pd_transfer_request_finished"]
+    scalar("pd_transfer_ms", [r["duration_ns"] / 1e6 for r in request_transfers
+                              if r["duration_ns"] is not None],
+           "ms", "pd_transfer_request_finished.transfer_duration_ns",
+           "首末 native batch 时间包络，含批间空档；不同 TP/generation 不合并")
+    if len(request_transfers) > 1:
+        metrics["pd_transfer_ms"].update(value=None, state="ambiguous")
+    metrics["cache_source"] = {
+        "hbm": metrics["hbm_cached_tokens"],
+        "connector": metrics["external_cached_tokens"],
+        "mooncake_local_tokens": None, "mooncake_remote_tokens": None,
+        "note": "connector 外部命中；Mooncake exists 不报告本地/远端位置",
+    }
+    metrics["note"] = "HBM 为块引用容量快照；PD 为提交载荷；TP 行与重试不合并"
+    return metrics
 
 
 def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -598,6 +789,8 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
             ancestor = node("request_id", record.get("parent_request_id"),
                             record, index)
             join(nodes + ([ancestor] if ancestor is not None else []))
+        for value in record.get("request_ids", []):
+            node("request_id", value, record, index)
         record_nodes.append(nodes)
 
     executions: dict[str, dict] = {}
@@ -674,6 +867,9 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
             candidates = execution_nodes(record.get("execution_id"),
                                          record["request_id"])
             join(record_nodes[index] + candidates)
+        for value in record.get("request_ids", []):
+            local = node("request_id", value, record, index)
+            join([local] + execution_nodes(record.get("execution_id"), value))
 
     # assign_request_id emits the randomized transport identity before
     # AsyncLLM sends that exact EngineCoreRequest to EngineCore.add_request.
@@ -786,12 +982,55 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
         for field in ("finished_sending", "finished_recving", "failed_recving"):
             ids.extend(record.get(field, []))
         for value in ids:
+            local = ("request_id",
+                     (*domain(record, index), str(record["observation_id"]))
+                     if record.get("observation_id") is not None
+                     else domain(record, index), str(value))
+            if local in parent:
+                nodes.append(local)
             nodes.extend(execution_nodes(record.get("execution_id"), value))
         for member in record.get("members", []):
             if isinstance(member, dict):
                 nodes.extend(execution_nodes(record.get("execution_id"),
                                              member.get("request_id")))
         return list(dict.fromkeys(requests[root(n)]["key"] for n in nodes))
+
+    # Shared batches contribute evidence to each member without joining members.
+    requests_by_key = {request["key"]: request for request in requests.values()}
+    for index, record in enumerate(records):
+        for key in keys_for(record, index):
+            request = requests_by_key[key]
+            if index not in request["record_indices"]:
+                request["record_indices"].append(index)
+
+    output_batches: dict[str, dict] = {}
+    for index, record in enumerate(records):
+        identity = record.get("output_batch_id")
+        if identity is None or record["event"] not in {
+            "engine_output_enqueued", "engine_output_dequeued", "engine_output_send",
+            "api_output_received", "api_output_endpoint",
+        }:
+            continue
+        batch = output_batches.setdefault(str(identity), {
+            "output_batch_id": identity, "shared": True, "request_keys": [],
+            "evidence": [], "duration_ns": None,
+            "note": "批次身份关联证据；不将 Core send 与 API receive 跨进程相减",
+        })
+        batch["evidence"].append({
+            "record_index": index, "event": record["event"],
+            "domain": list(clock(record)), "timestamp_ns": record.get("timestamp_ns"),
+            "iteration_timestamp": record.get("iteration_timestamp"),
+            "received_ns": record.get("received_ns"),
+            "queue_enter_ns": record.get("queue_enter_ns"),
+            "queue_exit_ns": record.get("queue_exit_ns"),
+            "request_ids": record.get("request_ids", []),
+            "execution_id": record.get("execution_id"),
+            **(_measurement([record]) if record["event"] == "engine_output_send"
+               else {"state": "observed", "duration_ns": None}),
+        })
+        for key in keys_for(record, index):
+            if key not in batch["request_keys"]:
+                batch["request_keys"].append(key)
 
     scheduler_labels = {
         "scheduler_schedule": "调度 schedule（共享外框）",
@@ -867,52 +1106,96 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
             if record["event"] != "request_hash_ranges":
                 continue
             for part in record.get("ranges", []):
-                if (part.get("execution_id") is not None
-                        and str(part["execution_id"]) == identity
-                        and clock(record) in {clock(r) for r, _ in
-                                              execution_anchors.get(identity, [])}):
+                if (
+                    part.get("execution_id") is not None
+                    and str(part["execution_id"]) == identity
+                    and clock(record)
+                    in {clock(r) for r, _ in execution_anchors.get(identity, [])}
+                ):
                     shared.append({**record, **part, "event": "request_hash_call"})
-        execution["shared"] = _stage_rows(shared, {
-            "scheduler_schedule": scheduler_labels["scheduler_schedule"],
-            "engine_execute_submit": "Engine 执行提交（非 Worker 计算完成）",
-            "engine_sample_submit": "Engine 采样提交",
-            "request_hash_call": "↳ hash 实际调用（显式本步身份）",
-            "scheduler_external_lookup": "External KV 查询（实际调用）",
-            "engine_scheduler_update": "Engine update_from_output",
-        })
+        execution["shared"] = _stage_rows(
+            shared,
+            {
+                "scheduler_schedule": scheduler_labels["scheduler_schedule"],
+                "engine_execute_submit": "Engine 执行提交（非 Worker 计算完成）",
+                "engine_sample_submit": "Engine 采样提交",
+                "request_hash_call": "↳ hash 实际调用（显式本步身份）",
+                "scheduler_external_lookup": "External KV 查询（实际调用）",
+                "engine_scheduler_update": "Engine update_from_output",
+            },
+        )
         for record in shared:
             if record["event"] != "scheduler_schedule":
                 continue
-            labels = {"lookup": "本地缓存 lookup", "alloc": "KV 分配 alloc",
-                      "free": "KV 释放", "remove_skipped": "跳过块处理",
-                      "detach_for_deferred_free": "延迟释放摘除"}
+            labels = {
+                "lookup": "本地缓存 lookup",
+                "alloc": "KV 分配 alloc",
+                "free": "KV 释放",
+                "remove_skipped": "跳过块处理",
+                "detach_for_deferred_free": "延迟释放摘除",
+            }
             for stage, value in record.get("manager_ranges_ns", {}).items():
-                execution["shared"].append({
-                    "event": f"manager_ranges_ns.{stage}",
-                    "label": "↳ " + labels.get(stage, stage),
-                    "domain": list(clock(record)), "state": (
-                        "measured" if _number(value) else "missing"),
-                    "duration_ns": value if _number(value) else None,
-                    "note": "生产者非重叠 manager 调用累计；不再叠加父项",
-                })
+                execution["shared"].append(
+                    {
+                        "event": f"manager_ranges_ns.{stage}",
+                        "label": "↳ " + labels.get(stage, stage),
+                        "domain": list(clock(record)),
+                        "state": ("measured" if _number(value) else "missing"),
+                        "duration_ns": value if _number(value) else None,
+                        "note": "生产者非重叠 manager 调用累计；不再叠加父项",
+                    }
+                )
             if "external_lookup_ns" in record:
                 value = record["external_lookup_ns"]
-                execution["shared"].append({
-                    "event": "external_lookup", "label": "↳ external lookup",
-                    "domain": list(clock(record)),
-                    "state": "measured" if _number(value) else "missing",
-                    "duration_ns": value if _number(value) else None,
-                    "note": "实际 connector 调用累计；含未能调度的尝试",
-                })
+                execution["shared"].append(
+                    {
+                        "event": "external_lookup",
+                        "label": "↳ external lookup",
+                        "domain": list(clock(record)),
+                        "state": "measured" if _number(value) else "missing",
+                        "duration_ns": value if _number(value) else None,
+                        "note": "实际 connector 调用累计；含未能调度的尝试",
+                    }
+                )
             if "other_ns" in record:
                 value = record["other_ns"]
-                execution["shared"].append({
-                    "event": "other_ns", "label": "↳ 其他 / 未细分",
-                    "domain": list(clock(record)), "state": (
-                        "measured" if _number(value) else "missing"),
-                    "duration_ns": value if _number(value) else None,
-                    "note": record.get("other_source"),
-                })
+                execution["shared"].append(
+                    {
+                        "event": "other_ns",
+                        "label": "↳ 其他 / 未细分",
+                        "domain": list(clock(record)),
+                        "state": ("measured" if _number(value) else "missing"),
+                        "duration_ns": value if _number(value) else None,
+                        "note": record.get("other_source"),
+                    }
+                )
+        # Per-request detail rows: scheduler_kv_range events carry request_id.
+        # Batch cells above stay batch-level; these rows let the renderer
+        # attribute lookup/alloc/hash to one request when it is selected.
+        per_request = defaultdict(list)
+        for record in shared:
+            if record["event"] == "scheduler_kv_range":
+                per_request[str(record.get("request_id"))].append(record)
+        for request_id, items in per_request.items():
+            for stage in ("lookup", "alloc", "hash"):
+                stage_items = [r for r in items if r.get("stage") == stage]
+                if not stage_items:
+                    continue
+                total = sum(
+                    r.get("duration_ns", 0)
+                    for r in stage_items
+                    if _number(r.get("duration_ns")) is not None
+                )
+                execution["shared"].append(
+                    {
+                        "event": f"kv_range.{stage}",
+                        "request_id": request_id,
+                        "domain": list(clock(stage_items[0])),
+                        "state": "measured",
+                        "duration_ns": total,
+                        "note": f"请求 {request_id} 的 {stage} 实际调用累计",
+                    }
+                )
         observed_stages = {stage["event"] for stage in execution["shared"]}
         for event, label in (
             ("request_hash_call", "↳ hash 实际调用（未发出本步区间）"),
@@ -922,10 +1205,15 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
             ("other_ns", "↳ 其他 / 未细分"),
         ):
             if event not in observed_stages:
-                execution["shared"].append({
-                    "event": event, "label": label, "state": "missing",
-                    "duration_ns": None, "note": "没有该阶段的实际已发出证据；未补零",
-                })
+                execution["shared"].append(
+                    {
+                        "event": event,
+                        "label": label,
+                        "state": "missing",
+                        "duration_ns": None,
+                        "note": "没有该阶段的实际已发出证据；未补零",
+                    }
+                )
         execution["scheduler_gaps"] = (
             "仅使用带原始 execution_id 的 hash ranges；其他 hash 见请求实际区间"
             "及成员累计值，不从累计值反推本步。hash 可能包含在 other 内，不能相加。"
@@ -1025,9 +1313,12 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
             by_key[key]["task_keys"].append(task["key"])
 
     overview_events = {
-        "api_resolve": "req_resolve / API 解析校验",
+        "api_resolve": "req_resolve（ASGI → typed handler，通常在官方起点外）",
         "render": "模板 / render", "tokenize": "tokenizer",
-        "engine_submit": "add_request / 本地提交调用",
+        "input_process": "req_build（input_process / 输入组装）",
+        "frontend_request_registered": "req_register（frontend_request_registered / 登记位置）",
+        "request_id_link": "events（request_id_link / ID 关联位置）",
+        "engine_submit": "req_send（engine_submit / 本地提交调用）",
         "scheduler_queue_episode": "排队（各次 episode 的有效并集）",
     }
     for request in requests.values():
@@ -1084,8 +1375,12 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
         for event, label in (
             ("scheduler_schedule", "schedule（共享 execution，详见下表）"),
             ("kv.load_submit", "load（分步 × TP，入口返回非传输完成）"),
+            ("runner.input_prepare", "input_prepare（runner.input_prepare）"),
             ("runner.forward", "forward（分步 × TP 主机调用）"),
+            ("runner.logits", "logits（runner.logits）"),
             ("runner.sampling", "sampling（实际采样，分步 × TP）"),
+            ("runner.draft", "draft（runner.draft）"),
+            ("runner.output_prepare", "output_build（runner.output_prepare）"),
             ("kv.save_wait", "save（等待 / Pool 任务独立展示）"),
         ):
             measurements = []
@@ -1104,26 +1399,17 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
                             "duration_ns": None, "reasons": ["no_forward=true"],
                             "shared": True,
                         })
-            if event == "kv.save_wait":
-                for task in tasks.values():
-                    if task["key"] not in request["task_keys"]:
-                        continue
-                    if not any("save" in operation for operation in task["operation"]):
-                        continue
-                    measurements.extend({
-                        **envelope, "domain": task["domain"],
-                        "task_key": task["key"], "shared": len(task["members"]) > 1,
-                        "note": "独立 Pool 保存任务外框，不与 Worker save wait 相加",
-                    } for envelope in task["envelopes"])
             request["overview"].append({
                 "event": event, "label": label,
                 "measurements": measurements or [{"state": "missing",
                                                    "duration_ns": None}],
             })
-        order = ("api_resolve", "render", "tokenize", "engine_submit",
+        order = ("api_resolve", "render", "tokenize", "input_process",
+                 "frontend_request_registered", "request_id_link", "engine_submit",
                  "scheduler_queue_episode", "scheduler_schedule", "kv.load_submit",
-                 "runner.forward", "runner.sampling", "detokenize_duration_ns",
-                 "kv.save_wait")
+                 "runner.input_prepare", "runner.forward", "runner.logits",
+                 "runner.sampling", "runner.draft", "runner.output_prepare",
+                 "detokenize_duration_ns", "kv.save_wait")
         request["overview"].sort(key=lambda stage: order.index(stage["event"]))
         request["api_boundaries"] = _stage_rows(
             observations, {"api_terminal": "API 完整响应外框（非首 token）"})
@@ -1155,6 +1441,17 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
                     "response_time_to_first_token", "inference_time")
             }} for r in observations if r["event"] == "request_summary"
         ]
+        cache_events = [r for r in observations
+                        if r["event"] == "request_cache_lookup"]
+        request["metrics"] = _request_metrics(request, observations)
+        request["cache_lookups"] = cache_events
+        request["input_tokens"] = request["metrics"]["input_tokens"]
+        request["output_tokens"] = request["metrics"]["output_tokens"]
+        request["decode_ms"] = request["metrics"]["decode_ms"]
+        request["decode_steps"] = request["metrics"]["decode_steps"]
+        request["pd_transfer_ms"] = request["metrics"]["pd_transfer_ms"]
+        request["hbm_snapshots"] = request["metrics"]["hbm_snapshots"]
+        request["pd_transfers"] = request["metrics"]["pd_transfers"]
         request["hash_ranges"] = [
             {"domain": list(clock(r)), "request_id": r.get("request_id"),
              "complete": r.get("complete"), "dropped_ranges": r.get("dropped_ranges"),
@@ -1173,12 +1470,91 @@ def build_dashboard(records: list[dict[str, Any]]) -> dict[str, Any]:
             candidate for candidate in transport_candidates
             if request["key"] in candidate["sender_keys"]
         ]
+        request["queue_boundaries"] = _queue_rows(observations)
+        request["output_batches"] = [
+            batch for batch in output_batches.values()
+            if request["key"] in batch["request_keys"]
+        ]
+        request["output_endpoints"] = [
+            {"domain": list(clock(r)), "output_batch_id": r.get("output_batch_id"),
+             "iteration_timestamp": r.get("iteration_timestamp"),
+             "timestamp_ns": r.get("timestamp_ns"), "duration_ns": None,
+             "note": "官方 IterationStats wall 端点；不重新定义 TTFT 或跨域相减"}
+            for r in observations if r["event"] == "api_output_endpoint"
+        ]
+        position_rows = _stage_rows(observations, {
+            event: event for event in _POSITION_EVENTS
+        })
+        timer_rows = _stage_rows(observations, {
+            "engine_request_init": "engine_request_init（preprocess 原调用）",
+            "engine_execute_submit": "execute_submit（EngineCore 提交调用，共享批次）",
+            "engine_execute_wait": "result_collect（engine_execute_wait / 回收等待，共享批次）",
+            "engine_sample_call": "result_collect（engine_sample_call / sample 调用，共享批次）",
+            "engine_scheduler_update": "state_update（engine_scheduler_update / 共享批次）",
+            "engine_output_send": "engine_output_send（共享批次编码 + 发送调用）",
+        })
+        overview = {stage["event"]: stage for stage in request["overview"]}
+        overview["frontend_request_registered"] = {
+            **overview["frontend_request_registered"],
+            "label": "req_register（ID关联 / 本地登记事件）",
+            "measurements": _stage_rows(observations, {
+                "frontend_request_registered": "本地登记位置",
+                "request_id_link": "ID关联位置",
+            }) or [{"state": "missing", "duration_ns": None}],
+        }
+        overview["request_hash_ranges"] = {
+            "event": "request_hash_ranges", "label": "block hash（初始化 / 追加的实际区间）",
+            "measurements": [
+                {"domain": row["domain"], **row["measurement"]}
+                for row in request["hash_ranges"]
+            ] or [{"state": "missing", "duration_ns": None}],
+        }
+        request["mainline"] = []
+        for name, label, events in (
+            ("api_input", "1 · API 输入处理",
+             ("api_resolve", "render", "tokenize", "input_process",
+              "frontend_request_registered", "engine_submit")),
+            ("core_input", "2 · EngineCore 接收 / 初始化 / 调度提交",
+             ("engine_input_received", "engine_request_init", "request_hash_ranges",
+              "engine_input_queue_wait", "scheduler_queue_episode",
+              "scheduler_schedule", "engine_execute_submit", "engine_batch_enqueued")),
+            ("worker", "3 · Worker 模型 / KV load-save",
+             ("runner.input_prepare", "kv.load_submit", "runner.forward",
+              "runner.logits", "runner.sampling", "runner.draft",
+              "runner.output_prepare", "kv.save_wait")),
+            ("core_output", "4 · EngineCore 回收 / 更新 / 回传",
+             ("engine_batch_dequeued", "engine_execute_wait", "engine_sample_call",
+              "engine_scheduler_update", "engine_output_queue_wait",
+              "engine_output_send")),
+            ("api_output", "5 · API 接收 / 官方端点",
+             ("api_output_received", "api_output_endpoint")),
+        ):
+            stages = []
+            for event in events:
+                if event in overview:
+                    stages.append(overview[event])
+                else:
+                    rows = [r for r in [
+                        *position_rows, *timer_rows, *request["queue_boundaries"]
+                    ] if r["event"] == event]
+                    stages.append({
+                        "event": event,
+                        "label": rows[0].get("label", event) if rows else event,
+                        "measurements": rows or [
+                            {"state": "missing", "duration_ns": None}],
+                    })
+            request["mainline"].append({
+                "name": name, "label": label, "stages": stages,
+                "duration_ns": None,
+                "note": "主线分组，不是可相加 TTFT 分区；共享 batch 不分摊",
+            })
     return {
         "version": 1, "order": "first_observed_in_input",
         "requests": list(requests.values()), "executions": list(executions.values()),
         "tasks": list(tasks.values()), "unresolved_links": unresolved_links,
         "transport_links": transport_links,
         "transport_candidates": transport_candidates,
+        "output_batches": list(output_batches.values()),
         "native_links": _native_thread_links(records, list(tasks.values())),
         "notes": [
             "全部耗时以 ms 展示；原生 summary 的秒值仅在显示层乘 1000。",
@@ -1206,6 +1582,14 @@ def render_html(report: dict[str, Any]) -> str:
             return '<span class="missing">不适用</span>'
         if state == "fused":
             return '<span class="missing">融合于 render</span>'
+        if state == "observed":
+            return '<span title="瞬时位置证据，不是计时器">已观测（瞬时）</span>'
+        if metric.get("event") == "request_hash_call" and state == "missing":
+            return (
+                '<span class="missing" title="没有携带本步 execution_id 的 hash 区间；'
+                '初始化 hash 可在调度前发生，缺少记录不等于耗时为零或未执行">'
+                '无本步记录</span>'
+            )
         value = metric.get("duration_ns")
         if state != "measured" or not _number(value):
             return (
@@ -1238,118 +1622,84 @@ def render_html(report: dict[str, Any]) -> str:
     if dashboard is None:
         dashboard = build_dashboard(evidence)
 
-    # Fixed business workflow: missing observations leave cells missing; they
-    # never create an alternative call-stack hierarchy.
+    # Paths generate the nested table header; data stays on request or TP rows.
     columns = [
         ("ttft", ("请求总计", "native TTFT")),
         ("api_resolve", ("请求入口", "req_resolve")),
         ("render", ("请求入口", "render")),
         ("tokenize", ("请求入口", "tokenizer")),
-        ("engine_submit", ("请求入口", "add_request")),
-        ("scheduler_queue_episode", ("Scheduler · execution 共享", "排队")),
-        ("request_hash_call", ("Scheduler · execution 共享", "block hash")),
-        ("scheduler_schedule", ("Scheduler · execution 共享", "schedule")),
-        ("manager_ranges_ns.lookup", ("Scheduler · execution 共享", "local lookup")),
-        ("external_lookup", ("Scheduler · execution 共享", "external lookup")),
-        ("manager_ranges_ns.alloc", ("Scheduler · execution 共享", "alloc")),
-        ("other_ns", ("Scheduler · execution 共享", "other")),
+        ("input_process", ("请求入口", "组装 EngineCoreRequest")),
+        ("engine_submit", ("请求入口", "发送")),
+        ("scheduler_queue_episode", ("EngineCore · 调度", "排队")),
+        ("scheduler_schedule", ("EngineCore · 调度", "schedule", "总耗时 · 批次共享")),
+        ("request_hash_call", ("EngineCore · 调度", "block hash 计算 · 本步")),
+        (
+            "manager_ranges_ns.lookup",
+            ("EngineCore · 调度", "schedule", "local lookup"),
+        ),
+        (
+            "external_lookup",
+            ("EngineCore · 调度", "schedule", "external lookup"),
+        ),
+        ("manager_ranges_ns.alloc", ("EngineCore · 调度", "schedule", "alloc")),
+        ("other_ns", ("EngineCore · 调度", "schedule", "other")),
+        ("engine_execute_submit", ("EngineCore · 调度", "Worker 提交")),
+        ("tp_rank", ("Worker · 当前 TP", "TP")),
         ("kv.load_submit", ("Worker · 当前 TP", "start_load_kv")),
-        ("runner.execute", ("Worker · 当前 TP", "forward / 执行", "runner execute")),
         (
             "runner.input_prepare",
-            ("Worker · 当前 TP", "forward / 执行", "input_prepare"),
+            ("Worker · 当前 TP", "execute_model", "input_prepare"),
         ),
-        ("runner.forward", ("Worker · 当前 TP", "forward / 执行", "forward")),
-        ("runner.logits", ("Worker · 当前 TP", "forward / 执行", "logits")),
+        ("runner.forward", ("Worker · 当前 TP", "execute_model", "forward")),
+        ("runner.logits", ("Worker · 当前 TP", "execute_model", "logits")),
+        ("kv.finish_forward", ("Worker · 当前 TP", "execute_model", "finish_forward")),
+        ("runner.sampling", ("Worker · 当前 TP", "sample_tokens", "sampling")),
+        ("runner.draft", ("Worker · 当前 TP", "sample_tokens", "MTP / draft")),
         (
-            "kv.mamba_state_copy",
-            ("Worker · 当前 TP", "forward / 执行", "Mamba state copy"),
+            "runner.output_prepare",
+            ("Worker · 当前 TP", "sample_tokens", "output_prepare"),
         ),
-        ("kv.finish_forward", ("Worker · 当前 TP", "保存入口", "finish_forward")),
-        ("worker.sample_tokens", ("Worker · sampling / MTP", "sample_tokens")),
-        ("runner.sample_tokens", ("Worker · sampling / MTP", "runner sample")),
-        ("runner.sampling", ("Worker · sampling / MTP", "sampling")),
-        ("runner.draft", ("Worker · sampling / MTP", "MTP / draft")),
-        ("runner.output_prepare", ("Worker · sampling / MTP", "output_prepare")),
-        ("runner.postprocess", ("Worker · sampling / MTP", "postprocess")),
-        ("kv.transfer_results", ("Worker · sampling / MTP", "get_transfer_results")),
-        ("kv.save_wait", ("wait_for_save / 保存相关明细", "等待接口")),
-        ("pool_save_fence", ("wait_for_save / 保存相关明细", "释放前 fence")),
-        ("task_total", ("wait_for_save / 保存相关明细", "独立任务外框")),
-        ("queue_submission", ("wait_for_save / 保存相关明细", "enqueue")),
-        ("queue_wait", ("wait_for_save / 保存相关明细", "q_wait")),
-        ("build_key", ("wait_for_save / 保存相关明细", "build_key")),
-        ("lookup", ("wait_for_save / 保存相关明细", "lookup")),
-        ("prepare", ("wait_for_save / 保存相关明细", "prepare")),
-        ("sync", ("wait_for_save / 保存相关明细", "sync")),
-        ("backend_put", ("wait_for_save / 保存相关明细", "put", "Backend.put")),
+        ("runner.postprocess", ("Worker · 当前 TP", "sample_tokens", "postprocess")),
+        ("kv.save_wait", ("Worker · 当前 TP", "wait_for_save", "connector 总耗时")),
+        ("save.queue_submission", ("Worker · 当前 TP", "wait_for_save", "enqueue")),
+        ("save.queue_wait", ("Worker · 当前 TP", "wait_for_save", "q_wait")),
+        ("save.build_key", ("Worker · 当前 TP", "wait_for_save", "build_key")),
+        ("save.lookup", ("Worker · 当前 TP", "wait_for_save", "lookup")),
+        ("save.prepare", ("Worker · 当前 TP", "wait_for_save", "prepare")),
+        ("save.sync", ("Worker · 当前 TP", "wait_for_save", "sync")),
         (
-            "backend_mooncake_put",
-            ("wait_for_save / 保存相关明细", "put", "Mooncake Python 调用"),
+            "save.backend_put",
+            ("Worker · 当前 TP", "wait_for_save", "put", "Python 总耗时"),
         ),
-        ("phase1_start_batch_put", ("wait_for_save / 保存相关明细", "put", "start")),
-        ("phase2_submit_transfers", ("wait_for_save / 保存相关明细", "put", "submit")),
-        ("phase3_wait_transfers", ("wait_for_save / 保存相关明细", "put", "wait")),
         (
-            "phase4_finalize_batch_put",
-            ("wait_for_save / 保存相关明细", "put", "finalize"),
+            "save.native.phase1_start_batch_put",
+            ("Worker · 当前 TP", "wait_for_save", "put", "start"),
         ),
-        ("native_total", ("wait_for_save / 保存相关明细", "put", "total · 原记录")),
-        ("task_keys", ("wait_for_save / 保存相关明细", "keys · 提交")),
-        ("task_mib", ("wait_for_save / 保存相关明细", "MiB · 提交载荷")),
-        ("task_counters", ("wait_for_save / 保存相关明细", "结果计数")),
-        ("task_status", ("wait_for_save / 保存相关明细", "结果")),
-        ("engine_scheduler_update", ("Engine", "update_from_output")),
+        (
+            "save.native.phase2_submit_transfers",
+            ("Worker · 当前 TP", "wait_for_save", "put", "submit"),
+        ),
+        (
+            "save.native.phase3_wait_transfers",
+            ("Worker · 当前 TP", "wait_for_save", "put", "wait"),
+        ),
+        (
+            "save.native.phase4_finalize_batch_put",
+            ("Worker · 当前 TP", "wait_for_save", "put", "finalize"),
+        ),
+        (
+            "save.native.total",
+            ("Worker · 当前 TP", "wait_for_save", "put", "native total · 按 scope"),
+        ),
+        ("save.keys", ("Worker · 当前 TP", "wait_for_save", "keys")),
+        ("save.MiB", ("Worker · 当前 TP", "wait_for_save", "MiB")),
+        ("save.status", ("Worker · 当前 TP", "wait_for_save", "状态")),
+        ("save.put_calls", ("Worker · 当前 TP", "wait_for_save", "put", "调用次数")),
+        ("save.task", ("Worker · 当前 TP", "wait_for_save", "task ID")),
+        ("engine_execute_wait", ("EngineCore · 收尾", "等待 Worker 结果")),
+        ("engine_scheduler_update", ("EngineCore · 收尾", "update_from_output")),
         ("detokenize_duration_ns", ("Frontend · 请求级（非 Worker）", "detokenizer")),
     ]
-    for phase in ("execute", "sample"):
-        for field, label in (
-            ("duration_ns", "实际耗时"),
-            ("covered_ns", "已覆盖 union"),
-            ("uncovered_ns", "局部未覆盖"),
-        ):
-            columns.append(
-                (
-                    f"coverage.{phase}.{field}",
-                    ("Worker-local coverage · 当前 TP", phase, label),
-                )
-            )
-    columns.extend(
-        [
-            ("backend_get", ("Pool load · 非 put", "Backend.get")),
-            ("backend_mooncake_get", ("Pool load · 非 put", "Mooncake get")),
-            ("pd_transfer_task_finished", ("P/D read · 非 Pool put", "任务外框")),
-            ("pd_queue_wait", ("P/D read · 非 Pool put", "q_wait")),
-            ("pd_transfer_meta_fetch", ("P/D read · 非 Pool put", "metadata fetch")),
-            ("pd_transfer_prepare", ("P/D read · 非 Pool put", "prepare")),
-            (
-                "pd_transfer_batch_finished",
-                ("P/D read · 非 Pool put", "batch_transfer_sync_read"),
-            ),
-            ("pd_transfer_reformat", ("P/D read · 非 Pool put", "reformat")),
-        ]
-    )
-    session_events = sorted(
-        {
-            stage["event"]
-            for task in dashboard["tasks"]
-            for stage in task["stages"]
-            if stage["event"].startswith("backend_batch_")
-        }
-    )
-    columns.extend(
-        (
-            event,
-            (
-                "Pool load · 非 put"
-                if event.startswith("backend_batch_get")
-                else "wait_for_save / 保存相关明细",
-                "get" if event.startswith("backend_batch_get") else "put",
-                event.removeprefix("backend_"),
-            ),
-        )
-        for event in session_events
-    )
     branch_order: dict[tuple, int] = {}
     for _, path in columns:
         for depth in range(1, len(path) + 1):
@@ -1360,14 +1710,28 @@ def render_html(report: dict[str, Any]) -> str:
         )
     )
     keys = [key for key, _ in columns]
-    by_request = {r["key"]: r for r in dashboard["requests"]}
+    by_request = {request["key"]: request for request in dashboard["requests"]}
     step_numbers = {
-        e["execution_id"]: str(i + 1) for i, e in enumerate(dashboard["executions"])
+        execution["execution_id"]: str(index + 1)
+        for index, execution in enumerate(dashboard["executions"])
     }
+    maintenance = [
+        execution
+        for execution in dashboard["executions"]
+        if execution["no_forward"] is True
+        and not any(
+            stage["event"] == "runner.forward" and stage.get("state") == "measured"
+            for worker in execution["workers"]
+            for stage in worker["stages"]
+        )
+    ]
+    maintenance_ids = {execution["execution_id"] for execution in maintenance}
 
     def labels(request_keys: list[str]) -> str:
         return (
-            " + ".join(by_request[k]["label"] for k in request_keys if k in by_request)
+            " + ".join(
+                by_request[key]["label"] for key in request_keys if key in by_request
+            )
             or "未关联"
         )
 
@@ -1396,10 +1760,20 @@ def render_html(report: dict[str, Any]) -> str:
                 "api_resolve",
                 "render",
                 "tokenize",
+                "input_process",
+                "request_id_link",
+                "frontend_request_registered",
                 "engine_submit",
+                "engine_input_received",
+                "engine_request_init",
+                "engine_input_queue_wait",
+                "request_hash_ranges",
                 "scheduler_queue_episode",
                 "detokenize_duration_ns",
-                "request_hash_call",
+                "engine_output_enqueued",
+                "engine_output_send",
+                "api_output_received",
+                "api_output_endpoint",
             },
             "shared-row": {
                 "scheduler_schedule",
@@ -1408,17 +1782,16 @@ def render_html(report: dict[str, Any]) -> str:
                 "external_lookup",
                 "manager_ranges_ns.alloc",
                 "other_ns",
+                "engine_execute_submit",
+                "engine_execute_wait",
                 "engine_scheduler_update",
             },
             "worker-row": {
-                key for key in keys if key.startswith(("worker.", "runner.", "kv."))
-            },
-            "task-row": set(values),
-            "fence-row": {"pool_save_fence"},
-            "native-row": {
-                key for key in keys if key.startswith("phase") or key == "native_total"
+                key for key in keys if key.startswith(("runner.", "kv.", "save."))
             },
         }.get(kind, set(values))
+        if kind == "worker-row":
+            applicable.update(("runner.execute", "runner.sample_tokens"))
         empty = {
             key: (
                 '<span class="missing">未采集</span>'
@@ -1427,6 +1800,27 @@ def render_html(report: dict[str, Any]) -> str:
             )
             for key in keys
         }
+        cells = []
+        identity_span = shared_span if kind == "worker-row" else 1
+        for key in keys:
+            if key == "tp_rank":
+                cells.append(
+                    '<td class="tp" data-stage="tp_rank">' + escape(tp) + "</td>"
+                )
+                continue
+            if kind == "worker-row" and key in shared_cells:
+                if shared_span:
+                    cells.append(
+                        f'<td rowspan="{shared_span}" data-stage="{escape(key)}">'
+                        + shared_cells[key]
+                        + "</td>"
+                    )
+                continue
+            cells.append(
+                f'<td data-stage="{escape(key)}">'
+                + values.get(key, empty[key])
+                + "</td>"
+            )
         return (
             '<tr class="'
             + kind
@@ -1435,37 +1829,24 @@ def render_html(report: dict[str, Any]) -> str:
             + '" title="'
             + escape(title)
             + '">'
-            + '<td class="request">'
-            + escape(
-                identity_label if identity_label is not None else labels(request_keys)
-            )
-            + "</td>"
-            + '<td class="step">'
-            + escape(step)
-            + "</td>"
-            + '<td class="tp">'
-            + escape(tp)
-            + "</td>"
-            + "".join(
-                (
-                    '<td rowspan="'
-                    + str(shared_span)
-                    + '" data-stage="'
-                    + escape(key)
-                    + '">'
-                    + shared_cells[key]
-                    + "</td>"
-                )
-                if kind == "worker-row" and key in shared_cells and shared_span
-                else ""
-                if kind == "worker-row" and key in shared_cells
-                else '<td data-stage="'
-                + escape(key)
+            + (
+                '<td class="request" rowspan="'
+                + str(identity_span)
                 + '">'
-                + values.get(key, empty[key])
+                + escape(
+                    identity_label
+                    if identity_label is not None
+                    else labels(request_keys)
+                )
+                + '</td><td class="step" rowspan="'
+                + str(identity_span)
+                + '">'
+                + escape(step)
                 + "</td>"
-                for key in keys
+                if identity_span
+                else ""
             )
+            + "".join(cells)
             + '<td class="note">'
             + escape(note)
             + "</td></tr>"
@@ -1493,17 +1874,18 @@ def render_html(report: dict[str, Any]) -> str:
                 + '" data-path="'
                 + escape(" / ".join(path[: depth + 1]))
                 + '">'
+                + ('<span class="process-label">' if depth == 0 else "")
                 + escape(path[depth])
+                + ("</span>" if depth == 0 else "")
                 + "</th>"
             )
             index = end
     pinned = (
         f'<th class="request" rowspan="{header_depth}">请求</th>'
         f'<th class="step" rowspan="{header_depth}">step</th>'
-        f'<th class="tp" rowspan="{header_depth}">TP</th>'
     )
     head = "<tr>" + pinned + "".join(headers[0])
-    head += f'<th rowspan="{header_depth}">tokens / 状态 / 任务</th></tr>'
+    head += f'<th rowspan="{header_depth}">批次成员 / 说明</th></tr>'
     head += "".join("<tr>" + "".join(h) + "</tr>" for h in headers[1:])
     body = []
     for request in dashboard["requests"]:
@@ -1513,6 +1895,9 @@ def render_html(report: dict[str, Any]) -> str:
                 "api_resolve",
                 "render",
                 "tokenize",
+                "input_process",
+                "request_id_link",
+                "frontend_request_registered",
                 "engine_submit",
                 "scheduler_queue_episode",
                 "detokenize_duration_ns",
@@ -1545,12 +1930,31 @@ def render_html(report: dict[str, Any]) -> str:
         )
         if request.get("candidate_for"):
             note = "关联待确认；不计入其他请求"
-        if request["hash_ranges"]:
-            values["request_hash_call"] = "<br>".join(
-                duration(h["measurement"])
-                + ("（区间不完整）" if h["complete"] is not True else "")
-                for h in request["hash_ranges"]
-            )
+        for phase in request["mainline"]:
+            for stage in phase["stages"]:
+                event = stage["event"]
+                if (
+                    event in keys
+                    and event not in values
+                    and event
+                    not in {
+                        "scheduler_schedule",
+                        "engine_execute_submit",
+                        "engine_execute_wait",
+                        "engine_scheduler_update",
+                        "kv.load_submit",
+                        "kv.save_wait",
+                    }
+                    and not event.startswith("runner.")
+                ):
+                    values[event] = "<br>".join(
+                        duration(item) for item in stage["measurements"]
+                    )
+        for batch in request["output_batches"]:
+            for item in batch["evidence"]:
+                event = item["event"]
+                if event in keys and event not in values:
+                    values[event] = duration(item)
         body.append(
             row(
                 [request["key"]],
@@ -1564,142 +1968,198 @@ def render_html(report: dict[str, Any]) -> str:
         )
 
     shown_tasks = set()
-    native_task_keys = {
-        link["task_key"]
-        for link in dashboard.get("native_links", [])
-        if link.get("task_key")
-    }
 
-    def compact_task(task: dict) -> bool:
-        return (
-            task["idle"]
-            and task["key"] not in native_task_keys
-            and not task["stages"]
-            and not task["counters"]
-            and bool(task["statuses"])
-            and set(task["statuses"])
-            <= {"no_task", "missing_load_spec", "nothing_to_do"}
-        )
-
-    def task_row(task: dict) -> str:
-        shown_tasks.add(task["key"])
-        values = measures(task["stages"])
-        values["task_status"] = escape(" / ".join(task["statuses"]))
-        submitted_keys = []
-        submitted_mib = []
-        result_counts = []
-        for counters in task["counters"]:
-            # Outer put and nested Mooncake counters describe the same work.
-            # Range submissions and commit metadata are different semantics.
-            operation = next(
-                (
-                    name
-                    for name in (
+    def save_values(execution: dict, worker: dict) -> dict[str, str]:
+        domain = worker["domain"]
+        result: dict[str, list[str]] = defaultdict(list)
+        for task in dashboard["tasks"]:
+            if task["execution_ids"] != [execution["execution_id"]]:
+                continue
+            if task["domain"] != domain[:3]:
+                continue
+            records = [
+                record
+                for record in evidence
+                if str(record.get("task_id")) == task["task_id"]
+                and list(clock(record)) == task["domain"]
+            ]
+            ranks = {
+                record.get("tp_rank")
+                for record in records
+                if record.get("tp_rank") is not None
+            }
+            if ranks != {domain[-1]}:
+                continue
+            candidates = [
+                candidate
+                for candidate in execution["workers"]
+                if candidate["domain"][:3] == task["domain"]
+                and candidate["domain"][-1] == domain[-1]
+            ]
+            if len(candidates) != 1:
+                continue
+            if any(
+                record.get(field) is not None and record[field] != domain[index]
+                for record in records
+                for field, index in (("dp_rank", 3), ("pp_rank", 4))
+            ):
+                continue
+            if not any(
+                "save" in operation or operation == "mooncake_put"
+                for operation in task["operation"]
+            ):
+                continue
+            shown_tasks.add(task["key"])
+            is_submission = set(task["operation"]) == {"save_submit"}
+            if is_submission and "no_task" in task["statuses"] and not task["stages"]:
+                for key in keys:
+                    if key.startswith("save."):
+                        result[key] = [
+                            "未执行保存（无任务）"
+                            if key == "save.status"
+                            else "—"
+                        ]
+                continue
+            values = measures(task["stages"])
+            is_submission = set(task["operation"]) == {"save_submit"}
+            if is_submission:
+                values = {
+                    key: value
+                    for key, value in values.items()
+                    if key == "queue_submission"
+                }
+                if not values and "no_task" in task["statuses"]:
+                    values["status"] = "未执行保存（无任务）"
+                    values["task"] = "—"
+                elif values:
+                    submit_states = {
+                        "submission_returned": "已提交（后台结果独立记录）",
+                        "no_task": "未执行保存（无任务）",
+                    }
+                    values["status"] = escape(
+                        "/".join(submit_states.get(state, state)
+                                 for state in task["statuses"])
+                        or "提交状态未知"
+                    )
+                    values["task"] = escape(task["task_id"])
+            else:
+                states = {
+                    "no_task": "未执行保存（无任务）",
+                    "all_hit": "查重全命中（未 PUT）",
+                    "succeeded": "保存成功",
+                    "backend_failure": "保存失败",
+                }
+                values["status"] = escape(
+                    "/".join(states.get(state, state) for state in task["statuses"])
+                    or "状态未知"
+                )
+                values["task"] = escape(task["task_id"])
+            no_work = (
+                bool(task["statuses"])
+                and set(task["statuses"]) <= {"no_task", "all_hit"}
+                and not any(
+                    stage["event"].startswith("backend_") for stage in task["stages"]
+                )
+            )
+            for field, divisor in (("keys", 1), ("MiB", 1048576)):
+                suffix = "submitted_keys" if field == "keys" else "submitted_bytes"
+                counts = []
+                for counter in task["counters"]:
+                    for operation in (
                         "put",
                         "batch_put_from_multi_buffer_ranges",
                         "mooncake_put",
-                    )
-                    if name + "_submitted_keys" in counters
-                    or name + "_submitted_bytes" in counters
-                ),
-                None,
-            )
-            if operation is None:
-                continue
-            prefix = escape(operation) + ": "
-            submitted_keys.append(
-                prefix + escape(counters.get(operation + "_submitted_keys"))
-            )
-            payload = counters.get(operation + "_submitted_bytes")
-            submitted_mib.append(
-                prefix + (f"{payload / 1048576:,.6f}" if _number(payload) else "—")
-            )
-            for suffix, label in (
-                ("succeeded_keys", "成功"),
-                ("failed_keys", "失败"),
-                ("unknown_result_keys", "未知"),
-                ("unreported_keys", "未报告"),
+                    ):
+                        value = counter.get(operation + "_" + suffix)
+                        if _number(value):
+                            counts.append(f"{value / divisor:g}")
+                            break
+                if counts:
+                    values[field] = "<br>".join(counts)
+            links = [
+                link
+                for link in dashboard.get("native_links", [])
+                if link.get("task_key") == task["key"]
+                and link.get("call_record_index") is not None
+            ]
+            calls: dict[int, list[dict]] = defaultdict(list)
+            for link in links:
+                calls[link["call_record_index"]].append(link["native"])
+            if calls:
+                values["put_calls"] = str(len(calls))
+            for field in (
+                "phase1_start_batch_put",
+                "phase2_submit_transfers",
+                "phase3_wait_transfers",
+                "phase4_finalize_batch_put",
+                "total",
             ):
-                value = counters.get(operation + "_" + suffix)
-                if value is not None:
-                    result_counts.append(label + ": " + escape(value))
-        values["task_keys"] = "<br>".join(submitted_keys) or "—"
-        values["task_mib"] = "<br>".join(submitted_mib) or "—"
-        values["task_counters"] = "<br>".join(result_counts) or "—"
-        native_values: dict[str, list[str]] = defaultdict(list)
-        associations = []
-        for link in dashboard.get("native_links", []):
-            if link.get("task_key") != task["key"]:
-                continue
-            native = link["native"]
-            association = link.get("call_association") or link.get(
-                "association", "exact task"
-            )
-            associations.append(str(association))
-            for field, value in native["duration_fields_ns"].items():
-                field = "native_total" if field == "total" else field
-                rendered = duration({"state": "measured", "duration_ns": value})
-                if (
-                    field == "native_total"
-                    and native["timing_scope"] == "prefer_same_node_remaining"
-                ):
-                    rendered = "phase2–4: " + rendered
-                native_values[field].append(
-                    '<span title="'
-                    + escape(
-                        str(native.get("log_source"))
-                        + "; "
-                        + str(association)
-                        + "; timing_scope="
-                        + native["timing_scope"]
-                        + "; call_record_index="
-                        + str(link.get("call_record_index"))
+                durations = []
+                details = []
+                for number, natives in enumerate(calls.values(), 1):
+                    observed = [
+                        native
+                        for native in natives
+                        if field in native.get("duration_fields_ns", {})
+                    ]
+                    # Split scopes fill different phases of one call. Repeated
+                    # measurements of the same phase cannot be added or chosen.
+                    value = (
+                        observed[0]["duration_fields_ns"][field]
+                        if len(observed) == 1
+                        else None
                     )
-                    + '">'
-                    + rendered
-                    + "</span>"
-                )
-        values.update(
-            {field: "<br>".join(items) for field, items in native_values.items()}
-        )
-        if "pd_transfer_task_finished" in values:
-            if "queue_wait" in values:
-                values["pd_queue_wait"] = values.pop("queue_wait")
-        else:
-            values["task_total"] = "<br>".join(
-                duration(e) for e in task["envelopes"] if e["event"] == "pool_task"
-            ) or duration({})
-        ranks = list(
-            dict.fromkeys(
-                str(r["tp_rank"])
-                for r in evidence
-                if str(r.get("task_id")) == task["task_id"]
-                and list(clock(r)) == task["domain"]
-                and r.get("tp_rank") is not None
-            )
-        )
-        steps = [step_numbers[e] for e in task["execution_ids"] if e in step_numbers]
-        note = (
-            "/".join(task["operation"])
-            + " · task="
-            + task["task_id"]
-            + " · execution="
-            + ",".join(task["execution_ids"])
-            + " · "
-            + "/".join(task["statuses"])
-            + (" · native: " + "; ".join(associations) if associations else "")
-        )
-        return row(
-            task["request_keys"],
-            ",".join(steps) or "未关联",
-            ",".join(ranks) if ranks else "—",
-            values,
-            note,
-            "task-row",
-            str(task["domain"]) + "; " + str(task["counters"]),
-        )
+                    durations.append(value)
+                    scope = "/".join(
+                        native.get("timing_scope", "unspecified") for native in observed
+                    )
+                    details.append(f"PUT #{number} · {scope}: {value} ns")
+                if calls:
+                    complete = all(_number(value) for value in durations)
+                    if field == "total":
+                        scopes = {
+                            native.get("timing_scope", "unspecified")
+                            for natives in calls.values()
+                            for native in natives
+                            if "total" in native.get("duration_fields_ns", {})
+                        }
+                        complete = complete and len(scopes) == 1
+                    metric = {
+                        "state": "measured" if complete else "missing",
+                        "duration_ns": sum(durations) if complete else None,
+                    }
+                    label = f"{len(calls)} 次 PUT；同阶段累计；" + "; ".join(details)
+                    values["native." + field] = (
+                        '<span title="'
+                        + escape(label)
+                        + '">'
+                        + duration(metric)
+                        + "</span>"
+                    )
+            if no_work:
+                for key in keys:
+                    field = key.removeprefix("save.")
+                    if key.startswith("save.") and field not in values:
+                        values[field] = "—"
+            for field, value in values.items():
+                key = "save." + field
+                if key not in keys:
+                    continue
+                if is_submission and field != "queue_submission":
+                    continue
+                if not is_submission and field == "queue_submission":
+                    continue
+                if field in {"status", "task", "keys", "MiB", "put_calls"}:
+                    if not is_submission:
+                        result[key] = [value]
+                    continue
+                title = "" if no_work or values.get("task") == "—" else escape(task["task_id"])
+                result[key].append('<span title="' + title + '">' + value + '</span>')
+        return {key: "<br>".join(values) for key, values in result.items()}
 
     for execution in dashboard["executions"]:
+        if execution["execution_id"] in maintenance_ids:
+            continue
         step = step_numbers[execution["execution_id"]]
         members = "; ".join(
             f"{m['request_id']}: {m.get('scheduled_tokens', '?')} tokens"
@@ -1714,6 +2174,72 @@ def render_html(report: dict[str, Any]) -> str:
             )
             note += "; 无请求成员证据；Worker 进程：" + str(domain)
         shared_cells = measures(execution["shared"])
+        shared_cells.update(
+            measures(
+                _stage_rows(
+                    [
+                        record
+                        for record in evidence
+                        if record.get("execution_id") == execution["execution_id"]
+                        and record.get("tp_rank") is None
+                    ],
+                    {"engine_execute_wait": "等待 Worker 结果"},
+                )
+            )
+        )
+        for key in (
+            "scheduler_schedule",
+            "request_hash_call",
+            "manager_ranges_ns.lookup",
+            "external_lookup",
+            "manager_ranges_ns.alloc",
+            "other_ns",
+            "engine_execute_submit",
+            "engine_execute_wait",
+            "engine_scheduler_update",
+        ):
+            shared_cells.setdefault(key, '<span class="missing">未采集</span>')
+        # Multi-request batches: detail cells carry per-request values so a
+        # selected request sees only its own lookups/allocs; the batch total
+        # moves to the tooltip. Single-request batches keep batch values
+        # (identical to the per-request values there).
+        member_requests = {str(m.get("request_id")) for m in execution["members"]} - {
+            "None"
+        }
+        if len(member_requests) > 1:
+
+            def per_request_cell(
+                stage: str, batch_value: str, shared=execution["shared"]
+            ) -> str:
+                rows = [s for s in shared if s["event"] == f"kv_range.{stage}"]
+                if not rows:
+                    return batch_value
+                per_req = "<br>".join(
+                    duration({"state": "measured", "duration_ns": s["duration_ns"]})
+                    + f' <span class="missing">({escape(s["request_id"])})</span>'
+                    for s in sorted(rows, key=lambda s: str(s["request_id"]))
+                )
+                return (
+                    f'<span title="批级合计（含其他请求）：{escape(batch_value)}">'
+                    + per_req
+                    + "</span>"
+                )
+
+            shared_cells["manager_ranges_ns.lookup"] = per_request_cell(
+                "lookup", shared_cells.get("manager_ranges_ns.lookup", "—")
+            )
+            shared_cells["manager_ranges_ns.alloc"] = per_request_cell(
+                "alloc", shared_cells.get("manager_ranges_ns.alloc", "—")
+            )
+        workers = sorted(
+            execution["workers"],
+            key=lambda w: (
+                str(w["domain"][3:5]),
+                w["domain"][-1] if isinstance(w["domain"][-1], int) else -1,
+                str(w["domain"][:3]),
+            ),
+        )
+        # Schedule and Core observations are shared across this step's TP rows.
         if not execution["workers"]:
             body.append(
                 row(
@@ -1726,28 +2252,14 @@ def render_html(report: dict[str, Any]) -> str:
                     execution["execution_id"],
                 )
             )
-        workers = sorted(
-            execution["workers"],
-            key=lambda w: (
-                str(w["domain"][3:5]),
-                w["domain"][-1] if isinstance(w["domain"][-1], int) else -1,
-                str(w["domain"][:3]),
-            ),
-        )
         shared_span = len(workers)
+        for key, path in columns:
+            if path[0] != "Worker · 当前 TP":
+                shared_cells.setdefault(key, '<span class="missing">—</span>')
         for worker in workers:
             domain = worker["domain"]
             values = measures(worker["stages"])
-            for phase, coverage in worker.get("coverage", {}).items():
-                for field in ("duration_ns", "covered_ns", "uncovered_ns"):
-                    value = coverage.get(field)
-                    values[f"coverage.{phase}.{field}"] = (
-                        '<span title="'
-                        + escape(coverage.get("state"))
-                        + '">'
-                        + duration({"state": "measured", "duration_ns": value})
-                        + "</span>"
-                    )
+            values.update(save_values(execution, worker))
             if execution["no_forward"] is True and "runner.forward" not in values:
                 values["runner.forward"] = "不执行"
             body.append(
@@ -1763,115 +2275,58 @@ def render_html(report: dict[str, Any]) -> str:
             )
             shared_span = 0
         shared_cells = {}
-        for task in dashboard["tasks"]:
-            if (
-                task["key"] not in shown_tasks
-                and execution["execution_id"] in task["execution_ids"]
-                and not compact_task(task)
-            ):
-                body.append(task_row(task))
-    compact_groups: dict[tuple, list[dict]] = defaultdict(list)
-    for task in dashboard["tasks"]:
-        if task["key"] in shown_tasks:
-            continue
-        if compact_task(task):
-            compact_groups[
-                (
-                    tuple(task["execution_ids"]),
-                    tuple(task["operation"]),
-                    tuple(task["statuses"]),
-                    tuple(task["request_keys"]),
-                )
-            ].append(task)
-        else:
-            body.append(task_row(task))
-    for (
-        execution_ids,
-        operations,
-        statuses,
-        request_keys,
-    ), tasks in compact_groups.items():
-        ranks = sorted(
-            {
-                str(record["tp_rank"])
-                for task in tasks
-                for record in evidence
-                if str(record.get("task_id")) == task["task_id"]
-                and list(clock(record)) == task["domain"]
-                and record.get("tp_rank") is not None
-            }
-        )
-        body.append(
-            row(
-                list(request_keys),
-                ",".join(step_numbers[e] for e in execution_ids if e in step_numbers)
-                or "未关联",
-                ",".join(ranks) or "—",
-                {},
-                "/".join(operations)
-                + f" × {len(tasks)} 个空任务 · "
-                + "/".join(statuses),
-                "idle-row",
-                "; ".join(task["key"] for task in tasks),
-            )
-        )
-        shown_tasks.update(task["key"] for task in tasks)
-    for record in evidence:
-        if record["event"] == "pool_save_fence":
-            body.append(
-                row(
-                    [
-                        r["key"]
-                        for r in dashboard["requests"]
-                        if any(
-                            a["kind"] == "request_id"
-                            and a["value"] in record.get("request_ids", [])
-                            and a.get("domain") == list(clock(record))
-                            for a in r["aliases"]
-                        )
-                    ],
-                    "释放前",
-                    str(record.get("tp_rank", "?")),
-                    {"pool_save_fence": duration(_measurement([record]))},
-                    "释放请求的保存 fence；不计入后续 step",
-                    "fence-row",
-                    str(clock(record)),
-                )
-            )
+
+    pending_tasks = [
+        task for task in dashboard["tasks"] if task["key"] not in shown_tasks
+    ]
     pending_native = [
         link
         for link in dashboard.get("native_links", [])
-        if not link.get("task_key") or link["task_key"] not in shown_tasks
+        if link.get("task_key") not in shown_tasks
+        or link.get("call_record_index") is None
     ]
-
     out = [
-        '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        "<title>TTFT · step × TP 业务阶段表</title><style>"
-        "body{font:14px/1.5 system-ui,sans-serif;margin:20px;color:#213047;background:#fff}"
-        "h1{font-size:22px;margin:0 0 8px}p{margin:8px 0;color:#536174}"
-        "select{padding:6px;max-width:80%}.sheet{overflow:auto;max-height:80vh;margin-top:12px}"
-        "table{border-collapse:separate;border-spacing:0;font-size:13px;white-space:nowrap}"
-        "th,td{border-right:1px solid #d5dfeb;border-bottom:1px solid #d5dfeb;"
-        "padding:7px 6px;text-align:right;min-width:54px}"
-        "thead{position:sticky;top:0;z-index:4}th{text-align:center;color:#182635}"
-        "th.l1{background:#edf4ff}th.l2{background:#eef7f1}th.l3{background:#fff4df}"
-        ".request,.step,.tp{position:sticky;z-index:2;background:inherit;text-align:left}"
-        ".request{left:0;min-width:120px;max-width:120px;overflow:hidden;text-overflow:ellipsis}"
-        ".step{left:133px;min-width:50px;max-width:50px;text-align:center}"
-        ".tp{left:196px;min-width:36px;max-width:36px;text-align:center;font-weight:bold}"
-        "thead .request,thead .step,thead .tp{background:#f5f8fa;z-index:5}"
-        ".request-row{background:#eaf1fa;font-weight:600}.shared-row{background:#eff4f8}"
-        ".worker-row{background:#fff}.task-row{background:#eff8f1}"
-        ".note{text-align:left;max-width:350px;white-space:normal;min-width:200px}"
-        ".missing{color:#b1bac5}details{margin-top:16px}summary{cursor:pointer}"
-        "pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:60vh;overflow:auto}"
-        "[hidden]{display:none!important}</style></head><body>"
-        "<h1>TTFT · step × TP 业务阶段表</h1>"
-        "<p>单位 ms · 按业务阶段横向阅读；Scheduler 在同一 execution 的 TP 行间共享。"
-        "请求总计与 TP 实际工作分行，左侧三列固定。</p>"
-        '<label for="request-select">请求：</label><select id="request-select">'
-        '<option value="all">全部请求</option>',
+        (
+            '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            "<title>TTFT · step × TP</title><style>"
+            "body{font:14px/1.5 system-ui,sans-serif;margin:20px;"
+            "color:#213047;background:#fff}"
+            "h1{font-size:22px;margin:0 0 8px}p{margin:8px 0;color:#536174}"
+            "select{padding:6px;max-width:80%}.sheet{overflow:auto;max-height:80vh;margin-top:12px}"
+            "table{border-collapse:separate;border-spacing:0;font-size:13px;white-space:nowrap}"
+            "th,td{border-right:1px solid #d5dfeb;border-bottom:1px solid #d5dfeb;"
+            "padding:7px 6px;text-align:right;min-width:54px}"
+            "thead{position:sticky;top:0;z-index:4}th{text-align:center;color:#182635}"
+            "th.l1{background:#edf4ff;text-align:left}th.l2{background:#eef7f1}"
+            "th.l3{background:#fff4df}"
+            ".process-label{position:sticky;left:255px;display:inline-block}"
+            ".request,.step{position:sticky;z-index:2;background:#fff;text-align:left}"
+            ".request{left:0;min-width:120px;max-width:120px;overflow:hidden;text-overflow:ellipsis}"
+            ".step{left:133px;min-width:50px;max-width:50px;text-align:center}"
+            ".tp{min-width:36px;text-align:center;font-weight:bold}"
+            "thead .request,thead .step,thead .tp{background:#f5f8fa;z-index:5}"
+            ".request-row{background:#eaf1fa;font-weight:600}.shared-row{background:#f0f3f6;color:#3f4a55;font-weight:600}"
+            ".worker-row{background:#fff}.worker-row:nth-of-type(even){background:#f7f9fb}"
+            ".note{text-align:left;max-width:350px;white-space:normal;min-width:200px}"
+            ".missing{color:#c1c8cf}"
+            'td[data-stage^="save."]{background:#f4faf6}'
+            "td[rowspan]{vertical-align:top;background:#f1f5fa}"
+            ".worker-row:hover td{background:#eff8f4}"
+            "details{margin-top:16px}"
+            "summary{cursor:pointer;font-weight:650;padding:7px 0}"
+            "pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:60vh;overflow:auto}"
+            "[hidden]{display:none!important}</style></head><body>"
+            "<h1>TTFT · 请求 / step × TP</h1>"
+            "<p>单位 ms · 请求总计一行，每个 step 按 TP 展开；"
+            "schedule / Core 共享单元格跨 TP 合并。</p>"
+            "<p><strong>普通 step 的控制顺序：</strong>API Server → EngineCore.schedule"
+            " → Worker.execute_model → 必要时 EngineCore 调用 sample_tokens"
+            " → Worker.sample_tokens（采样 / MTP）→ EngineCore.update_from_output"
+            " → API Server 输出处理。批队列路径可重叠不同 step。</p>"
+            '<label for="request-select">请求：</label><select id="request-select">'
+            '<option value="all">全部请求</option>'
+        ),
     ]
     for request in dashboard["requests"]:
         out.append(
@@ -1882,15 +2337,46 @@ def render_html(report: dict[str, Any]) -> str:
             + "</option>"
         )
     out.append(
-        "</select><p>请求级行看 API、TTFT 及 sampling 之后的 Frontend detokenizer；"
-        "数字 TP 行看 Worker；任务子行保留原始 task / execution / TP 身份。"
-        "— 是本行不适用；未采集是没有有效计时；未关联是缺少身份关联。"
-        "wait_for_save 下方为保存相关明细，不代表相加等于等待接口时间；"
-        "异步任务外框、put 子阶段、并行 TP 均不相加。计数原样展示，"
-        "keys 是标注 API 的提交计数（range 不等于完整 KV key），MiB 是提交载荷，"
-        "不叠加外层与 Mooncake 内层计数，也不是网络实测。"
-        "coverage 仅取当前 Worker 的派生证据；列顺序是业务分组，不断言所有分支的调用先后。</p>"
+        "</select><p>wait_for_save 在同一 TP 行内横向展开 "
+        "q_wait / build_key / lookup / prepare / sync / put。"
+        "put 下分 start / submit / wait / finalize；keys / MiB 为当前任务提交量。</p>"
+        '<div class="sheet" id="step-details"><table id="step-table"><thead>'
+        + head
+        + "</thead><tbody>"
+        + "".join(body)
+        + "</tbody></table></div>"
     )
+    metric_columns = {
+        "input_tokens": "输入 tokens", "output_tokens": "输出 tokens",
+        "cached_tokens": "KVC 命中 tokens（官方）",
+        "hbm_cached_tokens": "HBM 命中 tokens",
+        "external_cached_tokens": "外部命中 tokens",
+        "prefill_compute_tokens": "需计算 prompt tokens",
+        "decode_ms": "decode 总时间 ms", "decode_steps": "decode 总步数",
+        "observed_decode_steps": "日志观测 decode 步数",
+    }
+    out.append('<h2>请求级容量 / 缓存 / decode</h2><table id="request-metrics"><thead>'
+               '<tr><th>请求 ID</th>' + ''.join(
+                   '<th>' + escape(label) + '</th>'
+                   for label in metric_columns.values())
+               + '<th>HBM / P-D 传输明细</th></tr></thead><tbody>')
+    for request in dashboard["requests"]:
+        metrics = request.get("metrics", {})
+        out.append('<tr data-requests="' + escape(request["key"]) + '"><td>'
+                   + escape(request["label"]) + '</td>')
+        for name in metric_columns:
+            metric = metrics.get(name, {})
+            value = metric.get("value")
+            text = str(value) if value is not None else "未采集"
+            note = metric.get("note") or metric.get("source", "")
+            out.append('<td title="' + escape(note)
+                       + '">' + escape(text) + '</td>')
+        detail = {name: metrics.get(name) for name in
+                  ("cache_source", "hbm_snapshots", "pd_transfers")}
+        out.append('<td><details><summary>按组 / TP / 调用查看</summary><pre>'
+                   + escape(json.dumps(detail, ensure_ascii=False, indent=2))
+                   + '</pre></details></td></tr>')
+    out.append('</tbody></table>')
     native_count = len(report.get("native_timings", []))
     out.append(
         "<p>采集检查：external lookup 实际事件 "
@@ -1907,23 +2393,44 @@ def render_html(report: dict[str, Any]) -> str:
         )
         + "</p>"
     )
+    out.append(
+        "<details><summary>表格口径与异步任务说明</summary><p>"
+        "schedule 是共享批次范围；wait_for_save 是当前 TP 的 connector 边界。"
+        "后台 task 与 Mooncake phases 横向展示在同一 TP 行；"
+        "同一 task 的 native 同阶段按调用累计，悬停查看调用次数、各次值和 scope。"
+        "native phases 不与 task 外框或 wait_for_save 相加。"
+        "主表只展示本步 hash；明确无 forward 的维护轮次默认折叠，不按耗时过滤。"
+        "start_load_kv 是入口调用计时，返回不证明搬运完成。"
+        "keys 是 API 提交计数；MiB 是提交载荷，不是网络实测。"
+        "未关联的 native 记录只保留证据，不按邻近时间强行归属。"
+        "— 表示不属于该层；未采集表示该层没有有效计时；零是实测零。"
+        "</p></details>"
+    )
+    if maintenance:
+        out.append(
+            '<details id="maintenance-steps"><summary>维护轮次（未执行 forward）：'
+            + str(len(maintenance))
+            + "</summary><pre>"
+            + escape(json.dumps(maintenance, ensure_ascii=False, indent=2))
+            + "</pre></details>"
+        )
     if report.get("parse_errors"):
         out.append("<p>部分日志解析失败，详见末尾证据。</p>")
     if not dashboard["requests"]:
         out.append("<p>没有可关联的请求。</p>")
-    out.append(
-        '<div class="sheet"><table><thead>'
-        + head
-        + "</thead><tbody>"
-        + "".join(body)
-        + "</tbody></table></div>"
-    )
+    if pending_tasks:
+        out.append(
+            '<details id="pending-tasks"><summary>'
+            "未能唯一填入 step × TP 的任务证据</summary><pre>"
+            + escape(json.dumps(pending_tasks, ensure_ascii=False, indent=2))
+            + "</pre></details>"
+        )
     if pending_native:
         out.append(
-            '<details id="pending-native"><summary>Mooncake 待关联证据（'
+            '<details id="pending-native"><summary>Mooncake 原生记录（'
             + str(len(pending_native))
-            + " 条；不计入请求 / TP）</summary>"
-            "<p>线程归属不等于保存任务身份；仅精确 task_key 关联的阶段进入原保存任务 put 单元格。</p><pre>"
+            + " 条；未能唯一关联到任务）</summary>"
+            "<p>无法唯一绑定的原生记录不计入请求或任务；线程候选和调用边界状态仅作为排查证据。</p><pre>"
             + escape(json.dumps(pending_native, ensure_ascii=False, indent=2))
             + "</pre></details>"
         )

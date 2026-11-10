@@ -865,11 +865,41 @@ class AsyncLLM(EngineClient):
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
+                    received_ns = time.monotonic_ns()
                     num_outputs = len(outputs.outputs)
-
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
                     )
+
+                    # These boundaries are shared by the whole output batch,
+                    # not the request whose context created this background task.
+                    batch_fields = {
+                        "output_batch_id": getattr(outputs, "output_batch_id", None),
+                        "request_ids": list(
+                            dict.fromkeys(
+                                [out.request_id for out in outputs.outputs]
+                                + sorted(outputs.finished_requests or ())
+                            )
+                        ),
+                        "execution_id": getattr(outputs, "execution_id", None),
+                        "batch_shared": True,
+                        "request_id": None,
+                        "observation_id": None,
+                        "external_req_id": None,
+                        "parent_request_id": None,
+                        "api_request_id": None,
+                        "prompt_index": None,
+                    }
+                    diag.emit(
+                        "api_output_received", received_ns=received_ns, **batch_fields
+                    )
+
+                    if iteration_stats is not None:
+                        diag.emit(
+                            "api_output_endpoint",
+                            iteration_timestamp=iteration_stats.iteration_timestamp,
+                            **batch_fields,
+                        )
 
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the

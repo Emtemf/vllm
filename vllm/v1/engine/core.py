@@ -9,7 +9,7 @@ import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -672,21 +672,36 @@ class EngineCore:
         return False
 
     @contextmanager
-    def _pd_execution_span(self, event: str, output: SchedulerOutput, **fields):
+    def _pd_execution_scope(self, output: SchedulerOutput, **fields):
         """Restore identity from the queued object, not ambient execution state."""
-        if event == "engine_execute_submit" and output.pd_execution_id is None:
-            # Custom schedulers can omit diagnostics. This identity observes
-            # submission only; it does not imply measured scheduler subranges.
-            output.pd_execution_id = diag.new_id("execution")
         with diag.scope(
+            request_id=None,
+            observation_id=None,
+            external_req_id=None,
+            parent_request_id=None,
+            api_request_id=None,
+            prompt_index=None,
+            batch_shared=True,
             execution_id=output.pd_execution_id,
             request_ids=list(output.num_scheduled_tokens),
             engine_id=getattr(self.scheduler, "_pd_engine_id", None),
             dp_rank=self.vllm_config.parallel_config.data_parallel_index,
             no_forward=output.total_num_scheduled_tokens == 0,
             **fields,
-        ), diag.span(event) as observation:
+        ):
+            yield
+
+    @contextmanager
+    def _pd_execution_span(self, event: str, output: SchedulerOutput, **fields):
+        if event == "engine_execute_submit" and output.pd_execution_id is None:
+            # Custom schedulers may omit identity before actual submission.
+            output.pd_execution_id = diag.new_id("execution")
+        with self._pd_execution_scope(output, **fields), diag.span(event) as observation:
             if event == "engine_execute_submit":
+                # ============================================================
+                # TTFT诊断新增：记录本轮 batch 真正提交给 Worker 的执行身份。
+                # execution_id 是“一轮调度/执行”的 ID，不是单个 request 的 ID。
+                # ============================================================
                 diag.emit(
                     "engine_execution", execution_id=output.pd_execution_id,
                     request_ids=list(output.num_scheduled_tokens),
@@ -707,6 +722,12 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        # ============================================================
+        # TTFT诊断新增：以下四个 span 描述同一轮 batch 的生命周期：
+        # submit 只表示提交了异步任务；wait 才表示 future.result() 返回；
+        # sample 只有 Worker 未返回采样结果时才会发生；update 把结果写回 Scheduler。
+        # 它们是 batch/execution 范围，不能直接当作某个 request 的独占耗时。
+        # ============================================================
         with self._pd_execution_span("engine_execute_submit", scheduler_output):
             future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
@@ -731,6 +752,72 @@ class EngineCore:
         self._attach_weight_version(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    @staticmethod
+    def _pd_input_dequeued(
+        request_type: EngineCoreRequestType, request: Any, *, queue_exit_ns: int
+    ) -> None:
+        if request_type == EngineCoreRequestType.ADD:
+            # ============================================================
+            # TTFT诊断新增：记录 ADD 请求从 input_queue 取出的时刻。
+            # queue_exit_ns - queue_enter_ns = Core 输入队列驻留时间。
+            # input_message_id 把同一个 ADD 对象的入队和出队两条日志连起来。
+            # ============================================================
+            diag.emit(
+                "engine_input_dequeued",
+                request_id=request[0].request_id,
+                input_message_id=getattr(request[0], "_pd_input_message_id", None),
+                queue_exit_ns=queue_exit_ns,
+            )
+
+    @staticmethod
+    def _pd_output_fields(outputs: EngineCoreOutputs) -> dict[str, Any]:
+        # ============================================================
+        # TTFT诊断新增：为一个共享输出批次准备关联字段。
+        # 一个 outputs 可能包含多个 request；因此 batch_shared=True 且 request_id=None。
+        # request_ids 只用于关联，不能把整个批次耗时归给列表中的第一个请求。
+        # ============================================================
+        request_ids = list(dict.fromkeys(
+            [output.request_id for output in outputs.outputs]
+            + list(outputs.finished_requests or ())
+        ))
+        return dict(
+            output_batch_id=outputs.output_batch_id,
+            request_ids=request_ids,
+            batch_shared=True,
+            request_id=None,
+            observation_id=None,
+            external_req_id=None,
+            parent_request_id=None,
+            api_request_id=None,
+            prompt_index=None,
+        )
+
+    def _enqueue_output(self, client_index: int, outputs: EngineCoreOutputs) -> None:
+        if (
+            client_index != -1
+            and outputs.utility_output is None
+            and (outputs.outputs or outputs.finished_requests)
+        ):
+            if outputs.output_batch_id is None:
+                # ============================================================
+                # utility output 和内部控制输出不进入这个业务输出诊断事件。
+                # ============================================================
+                outputs.output_batch_id = diag.new_id("output-batch")
+            fields = self._pd_output_fields(outputs)
+        else:
+            fields = None
+        queue_enter_ns = time.monotonic_ns()
+        self.output_queue.put_nowait((client_index, outputs))
+        if fields is not None:
+            # ============================================================
+            # TTFT诊断新增：记录输出进入 output_queue 的时间。
+            # 这不是 API 已收到时间；API 侧需要用同一个 output_batch_id 继续关联。
+            # ============================================================
+            diag.emit(
+                "engine_output_enqueued", queue_enter_ns=queue_enter_ns, **fields
+            )
+
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -805,11 +892,10 @@ class EngineCore:
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
                 batch_queue.appendleft((future, scheduler_output, exec_future))
-                with self._pd_execution_span(
-                    "engine_batch_enqueued", scheduler_output,
-                    queue_depth=len(batch_queue),
+                with self._pd_execution_scope(
+                    scheduler_output, queue_depth=len(batch_queue)
                 ):
-                    pass
+                    diag.emit("engine_batch_enqueued")
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
@@ -825,10 +911,10 @@ class EngineCore:
 
         # Block until the next result is available.
         future, scheduler_output, exec_model_fut = batch_queue.pop()
-        with self._pd_execution_span(
-            "engine_batch_dequeued", scheduler_output, queue_depth=len(batch_queue)
+        with self._pd_execution_scope(
+            scheduler_output, queue_depth=len(batch_queue)
         ):
-            pass
+            diag.emit("engine_batch_dequeued")
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -877,11 +963,11 @@ class EngineCore:
             ):
                 future = self.model_executor.sample_tokens(grammar_output, non_block=True)
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
-            with self._pd_execution_span(
-                "engine_batch_enqueued", deferred_scheduler_output,
+            with self._pd_execution_scope(
+                deferred_scheduler_output,
                 queue_depth=len(batch_queue), deferred=True,
             ):
-                pass
+                diag.emit("engine_batch_enqueued")
 
         return engine_core_outputs, model_executed
 
@@ -1644,6 +1730,56 @@ class EngineCoreProc(EngineCore):
             )
             self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))
 
+    @staticmethod
+    def _pd_input_dequeued(
+        request_type: EngineCoreRequestType, request: Any, *, queue_exit_ns: int
+    ) -> None:
+        if request_type == EngineCoreRequestType.ADD:
+            diag.emit(
+                "engine_input_dequeued",
+                request_id=request[0].request_id,
+                input_message_id=getattr(request[0], "_pd_input_message_id", None),
+                queue_exit_ns=queue_exit_ns,
+            )
+
+    @staticmethod
+    def _pd_output_fields(outputs: EngineCoreOutputs) -> dict[str, Any]:
+        """One shared transport batch, not a span owned by its first request."""
+        request_ids = list(dict.fromkeys(
+            [output.request_id for output in outputs.outputs]
+            + list(outputs.finished_requests or ())
+        ))
+        return dict(
+            output_batch_id=outputs.output_batch_id,
+            request_ids=request_ids,
+            execution_id=None,
+            batch_shared=True,
+            request_id=None,
+            observation_id=None,
+            external_req_id=None,
+            parent_request_id=None,
+            api_request_id=None,
+            prompt_index=None,
+        )
+
+    def _enqueue_output(self, client_index: int, outputs: EngineCoreOutputs) -> None:
+        if (
+            client_index != -1
+            and outputs.utility_output is None
+            and (outputs.outputs or outputs.finished_requests)
+        ):
+            if outputs.output_batch_id is None:
+                outputs.output_batch_id = diag.new_id("output-batch")
+            fields = self._pd_output_fields(outputs)
+        else:
+            fields = None
+        queue_enter_ns = time.monotonic_ns()
+        self.output_queue.put_nowait((client_index, outputs))
+        if fields is not None:
+            diag.emit(
+                "engine_output_enqueued", queue_enter_ns=queue_enter_ns, **fields
+            )
+
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
         waited = False
@@ -1660,6 +1796,7 @@ class EngineCoreProc(EngineCore):
             block = self.process_input_queue_block
             try:
                 req = self.input_queue.get(block=block)
+                self._pd_input_dequeued(*req, queue_exit_ns=time.monotonic_ns())
                 self._handle_client_request(*req)
             except queue.Empty:
                 break
@@ -1672,6 +1809,7 @@ class EngineCoreProc(EngineCore):
         # Handle any more client requests.
         while not self.input_queue.empty():
             req = self.input_queue.get_nowait()
+            self._pd_input_dequeued(*req, queue_exit_ns=time.monotonic_ns())
             self._handle_client_request(*req)
 
     def _process_engine_step(self) -> bool:
@@ -1679,8 +1817,8 @@ class EngineCoreProc(EngineCore):
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
-        for output in outputs.items() if outputs else ():
-            self.output_queue.put_nowait(output)
+        for client_index, output in outputs.items() if outputs else ():
+            self._enqueue_output(client_index, output)
         # Post-step hook.
         self.post_step(model_executed)
 
@@ -1973,8 +2111,21 @@ class EngineCoreProc(EngineCore):
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        # ============================================================
+                        # TTFT诊断新增：ADD 已完成消息解码；此时还没有执行 preprocess。
+                        # input_message_id 只用于连接这条消息的入队/出队事件。
+                        # ============================================================
+                        input_message_id = diag.new_id("input-message")
+                        diag.emit(
+                            "engine_input_received", request_id=req.request_id,
+                            input_message_id=input_message_id,
+                        )
                         try:
-                            request = self.preprocess_add_request(req)
+                            with diag.span(
+                                "engine_request_init", request_id=req.request_id,
+                                input_message_id=input_message_id,
+                            ):
+                                request = self.preprocess_add_request(req)
                         except MultiModalCacheMissError as e:
                             # P0/P1 shadow drift -- return a retryable signal (P0
                             # drops the stale entry, client resends with data).
@@ -2002,7 +2153,22 @@ class EngineCoreProc(EngineCore):
                             self.aborts_queue.put_nowait(request)
 
                     # Push to input queue for core busy loop.
+                    if request_type == EngineCoreRequestType.ADD:
+                        # The original Request object crosses this local queue.
+                        # No queue tuple change or request-id side map is needed.
+                        request[0]._pd_input_message_id = input_message_id
+                    queue_enter_ns = time.monotonic_ns()
                     self.input_queue.put_nowait((request_type, request))
+                    if request_type == EngineCoreRequestType.ADD:
+                        # ============================================================
+                        # TTFT诊断新增：记录 ADD 进入 EngineCore input_queue 的时刻。
+                        # 与 engine_input_dequeued 配对后，差值是 Core 输入队列等待。
+                        # ============================================================
+                        diag.emit(
+                            "engine_input_enqueued", request_id=req.request_id,
+                            input_message_id=input_message_id,
+                            queue_enter_ns=queue_enter_ns,
+                        )
 
     def process_output_sockets(
         self, output_paths: list[str], coord_output_path: str | None, engine_index: int
@@ -2040,6 +2206,7 @@ class EngineCoreProc(EngineCore):
 
             while True:
                 output = self.output_queue.get()
+                queue_exit_ns = time.monotonic_ns()
                 if output == EngineCoreProc.ENGINE_CORE_DEAD:
                     for socket in sockets:
                         socket.send(output)
@@ -2055,6 +2222,16 @@ class EngineCoreProc(EngineCore):
                     coord_socket.send_multipart(encoder.encode(outputs))
                     continue
 
+                fields = (
+                    self._pd_output_fields(outputs)
+                    if outputs.output_batch_id is not None
+                    else None
+                )
+                if fields is not None:
+                    diag.emit(
+                        "engine_output_dequeued", queue_exit_ns=queue_exit_ns, **fields
+                    )
+
                 # Reclaim buffers that zmq is finished with.
                 while pending and pending[-1][0].done:
                     reclaimed = pending.pop()[1]
@@ -2062,10 +2239,14 @@ class EngineCoreProc(EngineCore):
                         reuse_buffers.append(reclaimed)
 
                 buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
-                buffers = encoder.encode_into(outputs, buffer)
-                tracker = self._send_msg_tracking_payload(
-                    sockets[client_index], buffers
-                )
+                with (
+                    diag.span("engine_output_send", **fields)
+                    if fields is not None else nullcontext()
+                ):
+                    buffers = encoder.encode_into(outputs, buffer)
+                    tracker = self._send_msg_tracking_payload(
+                        sockets[client_index], buffers
+                    )
                 if not tracker.done:
                     pending.appendleft((tracker, buffer))
                 elif len(reuse_buffers) < max_reuse_bufs:
@@ -2088,22 +2269,20 @@ class EngineCoreProc(EngineCore):
             request.request_id,
             err.mm_hashes,
         )
-        self.output_queue.put_nowait(
-            (
-                request.client_index,
-                EngineCoreOutputs(
-                    engine_index=self.engine_index,
-                    finished_requests={request.request_id},
-                    outputs=[
-                        EngineCoreOutput(
-                            request_id=request.request_id,
-                            new_token_ids=[],
-                            finish_reason=FinishReason.ERROR,
-                            mm_cache_miss_hashes=err.mm_hashes,
-                        )
-                    ],
-                ),
-            )
+        self._enqueue_output(
+            request.client_index,
+            EngineCoreOutputs(
+                engine_index=self.engine_index,
+                finished_requests={request.request_id},
+                outputs=[
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=FinishReason.ERROR,
+                        mm_cache_miss_hashes=err.mm_hashes,
+                    )
+                ],
+            ),
         )
 
     @staticmethod
@@ -2191,7 +2370,7 @@ class EngineCoreProc(EngineCore):
             for req_id in req_ids
         ]
         eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)
-        self.output_queue.put_nowait((client_index, eco))
+        self._enqueue_output(client_index, eco)
 
     def _send_abort_outputs_to_client(
         self, req_ids: list[str], client_index: int

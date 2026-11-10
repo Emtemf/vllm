@@ -37,21 +37,105 @@ uv run --no-project .venv/bin/python tools/pd_metrics_report.py prefill.log deco
 uv run --no-project .venv/bin/python tools/pd_metrics_report.py prefill.log decode.log -o pd-report.html --html
 ```
 
-The HTML report follows a fixed business-stage worksheet: request totals,
-preprocessing, shared Scheduler work, per-TP load/forward/sampling, save-related
-details, and frontend output processing. Detokenizer is a request-level frontend
-total displayed after sampling, never copied into each TP row. Missing timings
-remain missing cells, not invented parent nodes. Shared Scheduler cells span
-the execution's TP rows. Worker execute/sample actual time, observed same-thread
-stage union, and local uncovered time are independent coverage columns, not a
-request residual.
+The HTML report starts with five non-additive mainline groups:
 
-The save-related header expands queue/key/lookup/preparation/synchronization and
-put into native start/submit/wait/finalize columns. It groups related work; it
-does not assert that backend-task durations add up to the wait interface time.
-Actual tasks retain their original execution, TP and task identity. Pool get
-and P/D read work remain distinct from put; parallel TP values are never summed.
-The first three columns stay fixed during horizontal scrolling. The request
+1. API input: req_resolve, render, tokenize, input assembly, registration, send.
+2. EngineCore receipt, initialization/block hash, input queue residence,
+   scheduler queue/schedule, and execute submission.
+3. Worker input_prepare, forward, logits, sample, draft, output_build, and KV
+   load/save entry points.
+4. EngineCore result collection, scheduler update, output queue, and send.
+5. API output receipt and the official endpoint.
+
+These are process-owned navigation groups, not five latency totals or dozens
+of additive TTFT components. Core return traffic is not placed inside API
+output processing. A single step × TP table shows shared schedule details,
+Worker stages, and horizontal `wait_for_save` columns for Pool queue/key/lookup/
+prepare/sync work and Mooncake put start/submit/wait/finalize. Save tasks must
+have one explicit execution and a unique matching Worker lifecycle/rank before
+their values enter that row. Neither tasks nor native phases are added to the
+connector boundary.
+Missing stage timing is distinct from a task with no work.
+Request-level detokenizer is supplemental work outside the official endpoint,
+not a sixth stage or part of stage five; it is never copied into TP rows.
+
+`engine_input_received` marks successful input decoding;
+`engine_request_init` spans the original preprocessing call. Input queue
+positions pair by complete host/PID/run identity and `input_message_id`.
+Older evidence without a message ID can pair only a unique request-ID pair;
+repeated streaming/resume handoffs remain ambiguous rather than being zipped
+or matched by proximity. Output queue positions pair by the same clock domain
+and `output_batch_id`. Queue residence uses explicit `queue_enter_ns` and
+`queue_exit_ns`, not log-emission timestamps or time blocked on an empty get.
+Missing, inverted, incomplete, or ambiguous pairs remain unknown, not zero.
+
+`engine_output_send` measures the shared batch's encoding and host send call;
+it does not establish transport completion. The optional `output_batch_id`
+links Core output positions/send to `api_output_received` and
+`api_output_endpoint` as identity evidence only. Old outputs lacking the ID
+remain usable without an invented batch or latency. `api_output_received`
+preserves the handler's actual local acquisition boundary in `received_ns`,
+separate from emission time. API endpoint
+`iteration_timestamp` reuses the existing `IterationStats` wall timestamp;
+it is not subtracted from monotonic clocks or used to redefine native TTFT.
+The emitter's `timestamp_ns` is process-local monotonic evidence, not a
+cross-host timeline.
+
+`engine_batch_enqueued` and `engine_batch_dequeued` retain execution-position
+evidence but are not timers. Even historical records with tiny pass-span
+durations are displayed as instantaneous positions, not latency. Business
+aliases retain their real source events: req_build is the single `input_process`
+assembly timer, req_send is `engine_submit`, and req_resolve is `api_resolve`.
+Registration and ID-link positions use `frontend_request_registered` and
+`request_id_link`, not invented `req_register` or `events` timers. req_resolve
+measures ASGI ingress to the typed handler, usually outside the official request
+start; it is not labeled model/business validation. No renamed-timer
+compatibility layer is introduced.
+
+Each request has one request-level row, followed by its compute step rows.
+The TP column starts inside the Worker header. Request/step identity and non-TP
+cells merge across each step's Worker rows. Explicit `no_forward` rounds without
+a measured forward remain in collapsed maintenance evidence; no duration cutoff
+is used, and short measured forward calls remain visible. Assembly and send are
+timers; instantaneous ID matching/registration stay in raw evidence, not columns.
+
+The primary table omits preprocessing initialization, input-queue residence,
+output send timing, and Mamba-state copy. These observations remain available
+in raw evidence; hiding a column does not remove instrumentation. Initialization
+and output send are host-call timers, and input-queue residence is an interval,
+not an instantaneous event. The per-step `block hash` column measures actual
+hash computation with explicit execution identity, not queue time or a request
+cumulative value. It is separate from the schedule header: hashes may be computed
+during output update. Initial prompt hashes normally precede the first schedule
+and have no execution identity. Missing per-step ranges display as no step record,
+not measured zero or proof that hash computation did not run.
+
+The second-level `schedule` header spans `local lookup / external lookup /
+alloc / other` alongside its batch total. In multi-request batches, local lookup and
+allocation cells list request-specific `scheduler_kv_range` values, with the
+batch aggregate in the tooltip. Only hash ranges with an original execution ID
+enter the step column; request cumulative hash stays in raw evidence.
+These detail columns are not promised to form an additive decomposition.
+
+`wait_for_save` is shown on the Worker TP row as the connector boundary. It is
+not an additive breakdown of asynchronous Pool work: after save submission, a
+background task continues in its own process/thread lifecycle. The same TP row
+shows enqueue, queue wait, build_key, lookup, prepare, sync, Python put, native
+phase1–4, keys/MiB, status, and task ID under nested headers. Submission tasks
+fill enqueue only, without missing placeholders in backend columns. Native
+split scopes merge by their unique `pool_native_call` boundary. Within each
+task, phases accumulate over distinct calls, with call count and per-call values
+in tooltips; repeated same-phase evidence stays unknown. Totals with different
+scope are not added. `no_task` means no save work, not failed request association.
+Unbound or cross-step tasks remain in collapsed evidence. Load entry timing does
+not prove transfer completion, and missing independent transfer-wait timings
+are not inferred. The ordinary-step control flow is displayed above the table:
+EngineCore schedules and dispatches execute, conditionally dispatches sampling,
+then updates from the result. Batch-queue execution may overlap steps; column
+order is not a universal timeline. Worker execute/sample interval coverage
+remains separate from request TTFT and is not a request residual.
+
+The request and step columns stay fixed during horizontal scrolling. The request
 selector filters rows; detailed provenance and raw JSON are collapsed last.
 Prefill-only logs are supported: omit `decode.log` to inspect P without D.
 Explicit lifecycle and transport links establish request association. Ambiguous
@@ -93,6 +177,17 @@ The report does not add parallel TP intervals, subtract clocks from different
 processes, or treat submitted bytes as measured wire traffic. Missing evidence
 remains unknown. CPU regression checks do not establish NPU performance or
 distributed serving correctness; validate the paired build on the target stack.
+
+Request exports are available through `tools/pd_request_json.py` (raw logs to
+request JSON) and `tools/pd_grafana_json.py` (report JSON to dashboard rows).
+Terminal `scheduler_queue_summary.decode_steps` counts decode scheduling
+iterations, including MTP iterations; observed execution counts are separate.
+`request_cache_lookup` reports effective HBM/connector hit boundaries, not
+successful KV loading. Request block references measure referenced capacity,
+not exclusive physical HBM allocation. P/D native batch timings and the
+first-to-last-batch request-generation envelope have separate scopes;
+submitted/succeeded/failed byte classifications are not measured wire bytes.
+Missing or conflicting evidence remains null with an explicit state.
 
 ### P-side source refresh
 
