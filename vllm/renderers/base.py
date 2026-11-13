@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Generic, overload
 from typing_extensions import TypeVar
 
 from vllm.exceptions import VLLMValidationError
-from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.inputs import (
     EmbedsInput,
     EmbedsPrompt,
@@ -51,6 +50,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import make_async
 from vllm.utils.counter import AtomicCounter
 from vllm.utils.torch_utils import set_default_torch_num_threads
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.stats import MultiModalCacheStats
 
 from .embed_utils import safe_load_prompt_embeds
@@ -637,11 +637,23 @@ class BaseRenderer(ABC, Generic[_T]):
         if want_offsets:
             kwargs = {**kwargs, "return_offsets_mapping": True}
         encoding = tokenizer(prompt["prompt"], **kwargs)
-        return self._build_tokens_prompt(
+        tokenizer_end = time.monotonic_ns()
+        # Capture in the tokenizer's executing thread, before token construction
+        # and before an async executor delivers its result to the event loop.
+        boundary = {
+            **diag.clock_domain(),
+            "boundary_id": diag.new_id("tokenizer_end"),
+            "end_ns": tokenizer_end,
+            "status": "ok",
+            "source": "tokenizer_return",
+        }
+        result = self._build_tokens_prompt(
             encoding["input_ids"],
             prompt,
             offset_mapping=encoding["offset_mapping"] if want_offsets else None,
         )
+        result["pd_tokenization"] = boundary
+        return result
 
     def _detokenize_prompt(self, prompt: TokensPrompt) -> TokensPrompt:
         tokenizer = self.get_tokenizer()
@@ -690,8 +702,21 @@ class BaseRenderer(ABC, Generic[_T]):
                 timing["num_output_tokens"] = len(prompt["prompt_token_ids"])
             prompt = self._apply_prompt_char_offset(prompt, prompt_char_offset)
         else:
-            diag.emit("tokenize", status="skipped", reason="pretokenized_or_embeds",
-                      duration_ns=None)
+            diag.emit(
+                "tokenize",
+                status="skipped",
+                reason="pretokenized_or_embeds",
+                duration_ns=None,
+            )
+            prompt = dict(prompt)  # Do not mutate a caller's reusable token input.
+            prompt["pd_tokenization"] = {
+                **diag.clock_domain(),
+                "boundary_id": diag.new_id("input_ready"),
+                "end_ns": time.monotonic_ns(),
+                "status": "skipped",
+                "reason": "pretokenized_or_embeds",
+                "source": "tokenizer_skipped",
+            }
 
         if params.needs_detokenization and "prompt" not in prompt:
             if "prompt_token_ids" not in prompt:
@@ -735,8 +760,21 @@ class BaseRenderer(ABC, Generic[_T]):
                 timing["num_output_tokens"] = len(prompt["prompt_token_ids"])
             prompt = self._apply_prompt_char_offset(prompt, prompt_char_offset)
         else:
-            diag.emit("tokenize", status="skipped", reason="pretokenized_or_embeds",
-                      duration_ns=None)
+            diag.emit(
+                "tokenize",
+                status="skipped",
+                reason="pretokenized_or_embeds",
+                duration_ns=None,
+            )
+            prompt = dict(prompt)
+            prompt["pd_tokenization"] = {
+                **diag.clock_domain(),
+                "boundary_id": diag.new_id("input_ready"),
+                "end_ns": time.monotonic_ns(),
+                "status": "skipped",
+                "reason": "pretokenized_or_embeds",
+                "source": "tokenizer_skipped",
+            }
 
         if params.needs_detokenization and "prompt" not in prompt:
             if "prompt_token_ids" not in prompt:
@@ -1199,6 +1237,29 @@ class BaseRenderer(ABC, Generic[_T]):
             skip_decoder_start_token=self._get_skip_decoder_start_token(),
         )
 
+    @staticmethod
+    def _pd_tokenization_boundary(prompt: TokPrompt) -> dict[str, Any]:
+        if "encoder_prompt" in prompt:
+            parts = [prompt["encoder_prompt"], prompt["decoder_prompt"]]
+            boundaries = [
+                part.get("pd_tokenization") for part in parts if part is not None
+            ]
+            measured = [b for b in boundaries if b and b.get("status") == "ok"]
+            if measured:
+                return max(measured, key=lambda b: b["end_ns"])
+        else:
+            boundary = prompt.get("pd_tokenization")
+            if boundary is not None:
+                return boundary
+        return {
+            **diag.clock_domain(),
+            "boundary_id": diag.new_id("input_ready"),
+            "end_ns": time.monotonic_ns(),
+            "status": "missing",
+            "reason": "no_separate_tokenizer_boundary",
+            "source": "rendered_prompt_ready",
+        }
+
     def process_for_engine(
         self,
         prompt: TokPrompt,
@@ -1216,6 +1277,7 @@ class BaseRenderer(ABC, Generic[_T]):
             )
 
         engine_input["arrival_time"] = arrival_time
+        engine_input["pd_tokenization"] = self._pd_tokenization_boundary(prompt)
 
         return engine_input
 
@@ -1239,6 +1301,7 @@ class BaseRenderer(ABC, Generic[_T]):
             )
 
         engine_input["arrival_time"] = arrival_time
+        engine_input["pd_tokenization"] = self._pd_tokenization_boundary(prompt)
 
         return engine_input
 
@@ -1282,7 +1345,9 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_cmpl_tok_params
 
-        with diag.span("render", source="render_prompts_async", num_inputs=len(prompts)):
+        with diag.span(
+            "render", source="render_prompts_async", num_inputs=len(prompts)
+        ):
             dict_prompts = await self.render_prompts_async(prompts)
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
 
@@ -1311,8 +1376,9 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_chat_tok_params
 
-        with diag.span("render", source="render_messages",
-                       num_inputs=len(conversations)):
+        with diag.span(
+            "render", source="render_messages", num_inputs=len(conversations)
+        ):
             rendered = [
                 self.render_messages(conversation, chat_params)
                 for conversation in conversations
@@ -1360,8 +1426,9 @@ class BaseRenderer(ABC, Generic[_T]):
 
         out_conversations = list[list["ConversationMessage"]]()
         dict_prompts = list[DictPrompt]()
-        with diag.span("render", source="render_messages_async",
-                       num_inputs=len(conversations)):
+        with diag.span(
+            "render", source="render_messages_async", num_inputs=len(conversations)
+        ):
             for conv, prompt in await asyncio.gather(*rendered):
                 out_conversations.append(conv)
                 dict_prompts.append(prompt)

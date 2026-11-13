@@ -160,6 +160,12 @@ class EngineCoreRequest(
     session_id: str | None = None
     kv_hints: KvHintsEnvelope | None = None
 
+    # Explicit frontend observation identity survives process transport/fanout.
+    pd_identity: dict[str, Any] | None = None
+
+    # Frontend timing evidence; only comparable within its saved clock domain.
+    pd_tokenization: dict[str, Any] | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
@@ -238,6 +244,11 @@ class EngineCoreOutput(
 
     # [num_scored_rows, num_token_ids]; appended last for array_like compatibility.
     prompt_token_id_logprobs: torch.Tensor | None = None
+
+    # Diagnostic ownership from the actual completed execution. Keep appended
+    # defaults for array_like compatibility, including pre-execution errors.
+    pd_execution_id: str | None = None
+    output_batch_id: str | None = None
 
     @property
     def finished(self) -> bool:

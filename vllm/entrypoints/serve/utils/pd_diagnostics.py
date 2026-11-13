@@ -22,29 +22,29 @@ def install(app) -> None:
 
 def typed_handler(request, *, stream: bool) -> None:
     state = _observation.get()
-    if state is None:
+    if state is None or state["typed"]:
         return
     state["typed"] = True
     state["stream"] = stream
     now = monotonic_ns()
-    diag.emit(
-        "api_resolve",
+    state["batch"].add_stage(
+        "req_resolve",
         start_ns=state["start_ns"],
         end_ns=now,
-        duration_ns=now - state["start_ns"],
-        status="ok",
         source="asgi_ingress_to_typed_handler",
     )
-    diag.emit("api_handler", stream=stream)
+    state["batch"].update(stream=stream)
 
 
 def request_link(api_request_id: str, external_req_id: str, index: int) -> None:
-    diag.emit(
-        "api_request_link",
-        api_request_id=api_request_id,
-        external_req_id=external_req_id,
-        prompt_index=index,
-    )
+    owner = diag.current_batch()
+    if owner is not None:
+        owner.add_link(
+            "api_request",
+            api_request_id=api_request_id,
+            external_req_id=external_req_id,
+            prompt_index=index,
+        )
 
 
 def generated(
@@ -54,13 +54,15 @@ def generated(
     if state is None or state.get("generated"):
         return
     state["generated"] = True
-    diag.emit(
-        "api_first_generated",
-        api_request_id=request_id,
-        output_kind=kind,
-        stream=stream,
-        choice_index=choice_index,
-        source="serving_generated_event" if stream else "full_response_assembly",
+    state["batch"].update(
+        first_generated={
+            "api_request_id": request_id,
+            "output_kind": kind,
+            "stream": stream,
+            "choice_index": choice_index,
+            "timestamp_ns": monotonic_ns(),
+            "source": "serving_generated_event" if stream else "full_response_assembly",
+        }
     )
 
 
@@ -97,7 +99,15 @@ class PDRequestMiddleware:
             return await self.app(scope, receive, send)
         observation_id = diag.new_id("api")
         start = monotonic_ns()
-        state: dict[str, Any] = {"start_ns": start, "typed": False}
+        owner = diag.Batch(
+            "api_summary",
+            scope="http",
+            observation_id=observation_id,
+            route=scope["path"],
+            method=scope.get("method"),
+            start_ns=start,
+        )
+        state: dict[str, Any] = {"start_ns": start, "typed": False, "batch": owner}
         scope.setdefault("state", {})["pd_observation_id"] = observation_id
         token = _observation.set(state)
         status_code = None
@@ -118,26 +128,27 @@ class PDRequestMiddleware:
             await send(message)
             if message["type"] == "http.response.start":
                 status_code = message["status"]
-                diag.emit("api_response_start", http_status=status_code)
+                owner.update(
+                    response_start={
+                        "http_status": status_code,
+                        "timestamp_ns": monotonic_ns(),
+                    }
+                )
             elif message["type"] == "http.response.body":
                 if message.get("body") and not state.get("first_body"):
                     state["first_body"] = True
-                    diag.emit(
-                        "api_first_body",
-                        stream=state.get("stream"),
-                        source="asgi_send_return_not_client_receipt",
+                    owner.update(
+                        first_body={
+                            "stream": state.get("stream"),
+                            "timestamp_ns": monotonic_ns(),
+                            "source": "asgi_send_return_not_client_receipt",
+                        }
                     )
                 if not message.get("more_body", False):
                     terminal = True
 
         try:
-            with diag.scope(observation_id=observation_id):
-                diag.emit(
-                    "api_ingress",
-                    start_ns=start,
-                    route=scope["path"],
-                    method=scope.get("method"),
-                )
+            with diag.scope(observation_id=observation_id), diag.collect(owner):
                 try:
                     return await self.app(scope, observed_receive, observed_send)
                 except asyncio.CancelledError as exc:
@@ -163,22 +174,20 @@ class PDRequestMiddleware:
                         else "incomplete"
                     )
                     if not state["typed"]:
-                        diag.emit(
-                            "api_resolve",
+                        owner.add_stage(
+                            "req_resolve",
                             start_ns=start,
                             end_ns=end,
-                            duration_ns=end - start,
                             status=status,
                             source="asgi_ingress_to_framework_terminal",
                             typed_handler_entered=False,
                         )
-                    diag.emit(
-                        "api_terminal",
-                        start_ns=start,
-                        end_ns=end,
-                        duration_ns=end - start,
+                    owner.finish(
                         status=status,
+                        end_ns=end,
                         http_status=status_code,
+                        complete=terminal and status in ("completed", "rejected"),
+                        completion="http_terminal",
                         response_complete=terminal,
                         disconnect_observed=disconnected,
                         error_type=error_type or state.get("generation_error"),

@@ -71,6 +71,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.outputs import (
     DraftTokenIds,
     ECConnectorOutput,
@@ -128,8 +129,6 @@ from vllm.v1.worker.gpu.kv_connector import (
     KVConnector,
     get_kv_connector,
 )
-from vllm.v1.metrics import pd_diagnostics as diag
-from vllm.v1.worker.worker_base import pd_execution, pd_sample
 from vllm.v1.worker.gpu.lora_utils import (
     LoraState,
     create_lora_capture_hook,
@@ -187,6 +186,7 @@ from vllm.v1.worker.utils import (
     copy_kv_cache_blocks_inplace,
     get_uniform_decode_token_count,
 )
+from vllm.v1.worker.worker_base import pd_execution, pd_sample
 from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
@@ -1609,14 +1609,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # before computing the partial-vocab logits, so that the all-to-all
             # produces full-vocab logits for just the locally-owned requests.
             sample_hidden_states = hidden_states[sorted_logits_indices]
-            with diag.span("runner.logits", completion="host_return"):
-                local_logits = self.model.compute_logits_local(sample_hidden_states)
+            local_logits = self.model.compute_logits_local(sample_hidden_states)
             logits = all_to_all_logits(local_logits, shard_metadata)
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
-            with diag.span("runner.logits", completion="host_return"):
-                logits = self.model.compute_logits(sample_hidden_states)
+            logits = self.model.compute_logits(sample_hidden_states)
 
         invalid_drafts = None
         # A diffusion prefill has no logit rows even when a bitmask row
@@ -1643,13 +1641,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sampler_output = None
         elif input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
-            with diag.span("runner.sampling", algorithm="sampler", completion="host_return"):
+            with diag.span(
+                "runner.sampling", algorithm="sampler", completion="host_return"
+            ):
                 sampler_output = self.sampler(logits, input_batch)
         else:
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
             assert self.speculator is not None
-            with diag.span("runner.sampling", algorithm="rejection", completion="host_return"):
+            with diag.span(
+                "runner.sampling", algorithm="rejection", completion="host_return"
+            ):
                 sampler_output = self.rejection_sampler(
                     logits,
                     input_batch,
@@ -1816,11 +1818,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
-            with diag.span("runner.input_prepare"):
-                input_batch = self.prepare_inputs(
-                    scheduler_output, batch_req_state, batch_desc, num_active_loras
-                )
-                block_tables, slot_mappings = self.prepare_attn(input_batch)
+            input_batch = self.prepare_inputs(
+                scheduler_output, batch_req_state, batch_desc, num_active_loras
+            )
+            block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -2011,7 +2012,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector.pre_forward(
                 scheduler_output, input_batch, attn_metadata=attn_metadata
             )
-            with diag.span("runner.forward", mode="full_graph", completion="host_return"):
+            with diag.span(
+                "runner.forward", mode="full_graph", completion="host_return"
+            ):
                 model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
@@ -2037,7 +2040,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.kv_connector.pre_forward(scheduler_output, input_batch)
                 if ubatch_state is not None:
                     assert self.ubatch_runner is not None
-                    with diag.span("runner.forward", mode="ubatch", completion="host_return"):
+                    with diag.span(
+                        "runner.forward", mode="ubatch", completion="host_return"
+                    ):
                         model_output = self.ubatch_runner.run(
                             self.model, model_inputs, ubatch_state
                         )
@@ -2046,13 +2051,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    with diag.span("runner.forward", mode="piecewise_graph", completion="host_return"):
+                    with diag.span(
+                        "runner.forward",
+                        mode="piecewise_graph",
+                        completion="host_return",
+                    ):
                         model_output = self.cudagraph_manager.run_pw_graph(
                             self.model, model_inputs
                         )
                 else:
                     # Eager (NONE): call the raw model directly.
-                    with diag.span("runner.forward", mode="eager", completion="host_return"):
+                    with diag.span(
+                        "runner.forward", mode="eager", completion="host_return"
+                    ):
                         model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
@@ -2194,16 +2205,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             pending_aux_output = self.aux_output_connector.prepare_output(input_batch)
 
         # Start async output copy here so that it can overlap with speculator proposal.
-        with diag.span("runner.output_prepare", completion="async_copy_submitted"):
-            async_output = AsyncOutput(
-                model_runner_output=model_runner_output,
-                sampler_output=sampler_output,
-                num_sampled_tokens=num_sampled,
-                main_stream=self.main_stream,
-                copy_stream=self.output_copy_stream,
-                check_ep_fault=self.check_ep_fault,
-                pending_aux_output=pending_aux_output,
-            )
+        async_output = AsyncOutput(
+            model_runner_output=model_runner_output,
+            sampler_output=sampler_output,
+            num_sampled_tokens=num_sampled,
+            main_stream=self.main_stream,
+            copy_stream=self.output_copy_stream,
+            check_ep_fault=self.check_ep_fault,
+            pending_aux_output=pending_aux_output,
+        )
 
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None
         # The encoder runner exists only on the first PP rank, so later ranks
@@ -2228,14 +2238,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
-        with diag.span("runner.postprocess"):
-            self.postprocess_sampled(
-                input_batch.idx_mapping,
-                sampler_output.sampled_token_ids,
-                num_sampled,
-                num_rejected,
-                input_batch.query_start_loc,
-            )
+        self.postprocess_sampled(
+            input_batch.idx_mapping,
+            sampler_output.sampled_token_ids,
+            num_sampled,
+            num_rejected,
+            input_batch.query_start_loc,
+        )
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -2250,9 +2259,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.prepare_watermarking(
                     self.sampler, input_batch.idx_mapping
                 )
-            with use_workspace_lane(self._draft_workspace_lane), diag.span(
-                "runner.draft", completion="host_return"
-            ):
+            with use_workspace_lane(self._draft_workspace_lane):
                 draft_tokens = self.speculator.propose(
                     input_batch,
                     attn_metadata,

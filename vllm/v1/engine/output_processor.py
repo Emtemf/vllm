@@ -2,10 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
-from time import monotonic_ns
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass
+from threading import get_ident, get_native_id
+from time import monotonic_ns
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -159,24 +160,50 @@ class RequestState:
         temperature: float | None = None,
         stream_input: bool = False,
         remote_prefill_cached_tokens: int | None = None,
+        pd_identity: dict[str, Any] | None = None,
     ):
         self.request_id = request_id
         self.external_req_id = external_req_id
         self.parent_req = parent_req
         self.request_index = request_index
-        # The output handler is shared: never use its inherited task context.
-        self.pd_identity = {
-            "observation_id": diag.current().get("observation_id"),
+        # Save explicit ownership before the shared output handler sees this state.
+        identity = {
+            "observation_id": (
+                pd_identity.get("observation_id")
+                if pd_identity is not None
+                else diag.current().get("observation_id")
+            ),
             "request_id": request_id,
+            "submission_id": (
+                pd_identity.get("submission_id")
+                if pd_identity is not None
+                else diag.current().get("submission_id")
+            ),
             "external_req_id": external_req_id,
             "parent_request_id": parent_req.request_id if parent_req else None,
             "choice_index": request_index,
         }
+        self.pd_batch = diag.Batch(
+            "api_summary",
+            scope="request",
+            official_status="unavailable" if log_stats else "missing",
+            **identity,
+        )
+        self.pd_batch.add_link(
+            "frontend",
+            observation_id=identity["observation_id"],
+            submission_id=identity["submission_id"],
+        )
         self.pd_detokenize_ns = 0
         self.pd_detokenize_calls = 0
         self.pd_detokenize_tokens = 0
+        self.pd_detokenize_ranges: list[dict[str, Any]] = []
+        self.pd_detokenize_ranges_dropped = 0
         self.pd_first_output = False
         self.pd_terminal_emitted = False
+        self.pd_detokenize_errors = 0
+        self.pd_detokenize_status = "ok"
+        self.pd_terminal_status = None
         self.lora_request = lora_request
         self.lora_name = lora_request.lora_name if lora_request is not None else None
         self.output_kind = output_kind
@@ -202,6 +229,8 @@ class RequestState:
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
+        if self.stats is not None:
+            self.stats.pd_batch = self.pd_batch
 
         # Routed experts accumulation (prompt + sample chunks)
         self.routed_experts_chunks: list[np.ndarray] = []
@@ -313,9 +342,8 @@ class RequestState:
             stream_interval=stream_interval,
             stream_input=request.resumable,
             remote_prefill_cached_tokens=remote_prefill_cached_tokens,
+            pd_identity=request.pd_identity or {},
         )
-        if state.stats is not None:
-            state.stats.pd_identity = state.pd_identity
         if state.stats is not None and sampling_params is not None:
             state.stats.is_watermarked = bool(sampling_params.watermarking)
             state.stats.is_watermark_skipped = sampling_params._watermarking_skipped
@@ -657,7 +685,15 @@ class OutputProcessor:
             stream_interval=self.stream_interval,
         )
         self.request_states[request_id] = req_state
-        diag.emit("frontend_request_registered", **req_state.pd_identity)
+        owner = diag.current_batch()
+        if owner is not None:
+            owner.add_link(
+                "engine_request",
+                request_id=request_id,
+                external_req_id=req_state.external_req_id,
+                parent_request_id=parent_req.request_id if parent_req else None,
+                choice_index=request_index,
+            )
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req
 
@@ -743,9 +779,13 @@ class OutputProcessor:
             new_token_ids = engine_core_output.new_token_ids
             if new_token_ids and not req_state.pd_first_output:
                 req_state.pd_first_output = True
-                diag.emit("engine_first_output", **req_state.pd_identity,
-                          num_new_tokens=len(new_token_ids),
-                          source="output_processor_engine_tokens")
+                req_state.pd_batch.update(
+                    engine_first_output={
+                        "num_new_tokens": len(new_token_ids),
+                        "source": "output_processor_engine_tokens",
+                        "timestamp_ns": monotonic_ns(),
+                    }
+                )
             pooling_output = engine_core_output.pooling_output
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
@@ -792,14 +832,59 @@ class OutputProcessor:
                 # 2) Detokenize the token ids into text and perform stop checks.
                 num_prev_tokens = req_state.detokenizer.num_output_tokens()
                 detokenize_start = monotonic_ns()
+                detokenize_error = None
                 try:
                     stop_string = req_state.detokenizer.update(
                         new_token_ids, finish_reason == FinishReason.STOP
                     )
+                except BaseException as exc:
+                    detokenize_error = exc
+                    req_state.pd_detokenize_errors += 1
+                    req_state.pd_detokenize_status = (
+                        "cancelled"
+                        if isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+                        else "error"
+                    )
+                    raise
                 finally:
-                    req_state.pd_detokenize_ns += monotonic_ns() - detokenize_start
+                    detokenize_end = monotonic_ns()
+                    detokenize_duration = detokenize_end - detokenize_start
+                    req_state.pd_detokenize_ns += detokenize_duration
+                    if len(req_state.pd_detokenize_ranges) < 64:
+                        req_state.pd_detokenize_ranges.append(
+                            {
+                                "start_ns": detokenize_start,
+                                "end_ns": detokenize_end,
+                                "duration_ns": detokenize_duration,
+                                "execution_id": engine_core_output.pd_execution_id,
+                                "output_batch_id": engine_core_output.output_batch_id,
+                                "status": (
+                                    req_state.pd_detokenize_status
+                                    if detokenize_error is not None
+                                    else "ok"
+                                ),
+                                "error_type": (
+                                    type(detokenize_error).__name__
+                                    if detokenize_error is not None
+                                    else None
+                                ),
+                                "thread_id": get_ident(),
+                                "native_tid": get_native_id(),
+                            }
+                        )
+                    else:
+                        req_state.pd_detokenize_ranges_dropped += 1
                     req_state.pd_detokenize_calls += 1
                     req_state.pd_detokenize_tokens += len(new_token_ids)
+                    if detokenize_error is not None:
+                        self._emit_request_terminal(
+                            req_state,
+                            "cancelled"
+                            if type(detokenize_error).__name__ == "CancelledError"
+                            or isinstance(detokenize_error, GeneratorExit)
+                            else "error",
+                            error_type=type(detokenize_error).__name__,
+                        )
                 if stop_string:
                     finish_reason = FinishReason.STOP
                     stop_reason = stop_string
@@ -845,19 +930,34 @@ class OutputProcessor:
                     else:
                         req_state.input_chunk_queue = None
                 else:
-                    self._emit_request_terminal(req_state, str(finish_reason))
-                    self._finish_request(req_state)
-                    if not engine_core_output.finished:
-                        # If req not finished in EngineCore, but Detokenizer
-                        # detected stop string, abort needed in EngineCore.
-                        reqs_to_abort.append(req_id)
-
-                    # Track per-request stats
-                    self._update_stats_from_finished(
-                        req_state, finish_reason, iteration_stats
+                    self._emit_request_terminal(
+                        req_state, str(finish_reason), finish=False
                     )
-                    if self.tracing_enabled:
-                        self.do_tracing(engine_core_output, req_state, iteration_stats)
+                    try:
+                        self._finish_request(req_state)
+                        if not engine_core_output.finished:
+                            # Detokenizer stop strings can finish before EngineCore.
+                            reqs_to_abort.append(req_id)
+
+                        # Keep official statistics at their original terminal endpoint.
+                        self._update_stats_from_finished(
+                            req_state, finish_reason, iteration_stats
+                        )
+                        if self.tracing_enabled:
+                            self.do_tracing(
+                                engine_core_output, req_state, iteration_stats
+                            )
+                    except BaseException as exc:
+                        req_state.pd_terminal_status = (
+                            "cancelled"
+                            if type(exc).__name__ == "CancelledError"
+                            or isinstance(exc, GeneratorExit)
+                            else "error"
+                        )
+                        req_state.pd_batch.update(error_type=type(exc).__name__)
+                        raise
+                    finally:
+                        self._finish_pd_request(req_state)
 
         return OutputProcessorOutput(
             request_outputs=request_outputs,
@@ -887,18 +987,58 @@ class OutputProcessor:
 
     @staticmethod
     def _emit_request_terminal(
-        req_state: RequestState, status: str, error_type: str | None = None
+        req_state: RequestState,
+        status: str,
+        error_type: str | None = None,
+        *,
+        finish: bool = True,
     ) -> None:
         if req_state.pd_terminal_emitted:
             return
         req_state.pd_terminal_emitted = True
-        diag.emit(
-            "frontend_request_terminal", **req_state.pd_identity, status=status,
-            error_type=error_type, detokenize_duration_ns=req_state.pd_detokenize_ns,
-            detokenize_calls=req_state.pd_detokenize_calls,
-            detokenize_input_tokens=req_state.pd_detokenize_tokens,
+        req_state.pd_terminal_status = status
+        owner = req_state.pd_batch
+        owner.add_stage(
+            "detokenize",
+            duration_ns=req_state.pd_detokenize_ns
+            if req_state.pd_detokenize_calls
+            else None,
+            calls=req_state.pd_detokenize_calls,
+            status=req_state.pd_detokenize_status
+            if req_state.pd_detokenize_calls
+            else "skipped",
+            exceptions=req_state.pd_detokenize_errors,
+            input_tokens=req_state.pd_detokenize_tokens,
+            ranges=req_state.pd_detokenize_ranges,
+            dropped_ranges=req_state.pd_detokenize_ranges_dropped,
+            complete=not req_state.pd_detokenize_ranges_dropped,
+            range_source="incremental_detokenizer_update",
+            range_timing_scope="per_call_inside_request_terminal_cumulative",
+            source="request_state_terminal_cumulative",
+            timing_scope="terminal_cumulative_outside_official_first_token_endpoint",
+        )
+        owner.update(
+            terminal={
+                "status": status,
+                "error_type": error_type,
+                "detokenize_duration_ns": req_state.pd_detokenize_ns,
+                "detokenize_calls": req_state.pd_detokenize_calls,
+                "detokenize_input_tokens": req_state.pd_detokenize_tokens,
+                "source": "request_state",
+            },
+            error_type=error_type,
             native_stats_available=req_state.stats is not None,
-            source="request_state",
+        )
+        if finish:
+            OutputProcessor._finish_pd_request(req_state)
+
+    @staticmethod
+    def _finish_pd_request(req_state: RequestState) -> None:
+        status = req_state.pd_terminal_status
+        req_state.pd_batch.finish(
+            status=status,
+            complete=status not in ("error", "abort", "cancelled"),
+            completion="request_state_terminal",
         )
 
     def _finish_request(self, req_state: RequestState) -> None:

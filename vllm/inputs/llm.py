@@ -100,6 +100,9 @@ class _PromptOptions(TypedDict):
     Optional cache salt to be used for prefix caching.
     """
 
+    pd_tokenization: NotRequired[dict[str, Any]]
+    """Internal per-prompt tokenizer boundary, preserved through rendering."""
+
 
 class TextPrompt(_PromptOptions):
     """Schema for a text prompt."""

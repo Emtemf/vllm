@@ -60,8 +60,8 @@ from vllm.v1.kv_cache_interface import (
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
-from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics import pd_diagnostics as diag
+from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     KV_FETCH_COMPLETED_WAITING,
     KV_FETCH_IN_PROGRESS,
@@ -593,37 +593,79 @@ class Scheduler(SchedulerInterface):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         execution_id = diag.new_id("execution")
         transfer = self.vllm_config.kv_transfer_config
-        self.kv_cache_manager.pd_stage_ns.clear()
-        self._pd_external_lookup_ns = 0
-        with diag.scope(
-            execution_id=execution_id, engine_id=self._pd_engine_id,
+        summary = diag.current_batch()
+        owned = summary is None
+        if owned:
+            summary = diag.Batch("core_summary", scope="execution")
+        identity = dict(
+            request_id=None,
+            observation_id=None,
+            external_req_id=None,
+            parent_request_id=None,
+            api_request_id=None,
+            prompt_index=None,
+            execution_id=execution_id,
+            request_ids=[],
+            engine_id=self._pd_engine_id,
+            batch_shared=True,
             dp_rank=self.parallel_config.data_parallel_index,
             kv_role=transfer.kv_role if transfer is not None else None,
             role="unknown",
-        ), diag.span("scheduler_schedule") as timing:
-            start_ns = time.monotonic_ns()
+        )
+        summary.update(**identity)
+        self.kv_cache_manager.pd_stage_ns.clear()
+        self._pd_external_lookup_ns = 0
+        self._pd_external_lookup_calls = 0
+        start_ns = time.monotonic_ns()
+        status = "ok"
+        error_type = None
+        with diag.scope(**identity), diag.collect(summary):
             try:
                 output = self._schedule(throttle_prefills)
-                timing.update(
+                summary.update(
                     request_ids=list(output.num_scheduled_tokens),
                     num_scheduled_tokens=dict(output.num_scheduled_tokens),
                     total_num_scheduled_tokens=output.total_num_scheduled_tokens,
                     no_forward=output.total_num_scheduled_tokens == 0,
-                    has_kv_connector_metadata=output.kv_connector_metadata is not None,
                 )
                 return output
+            except BaseException as exc:
+                status = (
+                    "cancelled"
+                    if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                    or type(exc).__name__ == "CancelledError"
+                    else "error"
+                )
+                error_type = type(exc).__name__
+                raise
             finally:
-                elapsed = time.monotonic_ns() - start_ns
+                end_ns = time.monotonic_ns()
+                elapsed = end_ns - start_ns
                 measured = sum(self.kv_cache_manager.pd_stage_ns.values())
-                timing.update(
-                    manager_ranges_ns=dict(self.kv_cache_manager.pd_stage_ns),
-                    external_lookup_ns=self._pd_external_lookup_ns,
-                    other_ns=elapsed - measured - self._pd_external_lookup_ns,
-                    other_source=(
+                summary.add_stage(
+                    "schedule",
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    status=status,
+                    error_type=error_type,
+                )
+                summary.add_stage(
+                    "other",
+                    duration_ns=elapsed - measured - self._pd_external_lookup_ns,
+                    source=(
                         "schedule_minus_nonoverlapping_manager_and_external_lookup_ranges"
                     ),
-                    hash_source="request_hash_cumulative_not_subtracted_from_schedule",
+                    timing_scope="schedule_residual",
                 )
+                for stage in ("lookup", "alloc"):
+                    if stage not in self.kv_cache_manager.pd_stage_ns and (
+                        stage != "lookup" or not self._pd_external_lookup_calls
+                    ):
+                        summary.add_stage(stage, calls=0, status="skipped")
+                if owned or status != "ok":
+                    summary.finish(
+                        status=status, error_type=error_type, complete=status == "ok"
+                    )
 
     def _schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
@@ -1012,18 +1054,35 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
+                        lookup_start = time.monotonic_ns()
+                        lookup_status = "ok"
+                        lookup_error = None
                         try:
-                            with diag.span(
-                                "scheduler_external_lookup",
-                                request_id=request.request_id,
-                            ) as lookup_timing:
-                                ext_tokens, load_kv_async = (
-                                    self.connector.get_num_new_matched_tokens(
-                                        request, block_aligned_local
-                                    )
+                            ext_tokens, load_kv_async = (
+                                self.connector.get_num_new_matched_tokens(
+                                    request, block_aligned_local
                                 )
+                            )
+                        except BaseException as exc:
+                            lookup_status = (
+                                "cancelled"
+                                if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                                or type(exc).__name__ == "CancelledError"
+                                else "error"
+                            )
+                            lookup_error = type(exc).__name__
+                            raise
                         finally:
-                            self._pd_external_lookup_ns += lookup_timing["duration_ns"]
+                            lookup_end = time.monotonic_ns()
+                            self._pd_external_lookup_ns += lookup_end - lookup_start
+                            self._pd_external_lookup_calls += 1
+                            diag.current_batch().add_stage(
+                                "lookup",
+                                start_ns=lookup_start,
+                                end_ns=lookup_end,
+                                status=lookup_status,
+                                error_type=lookup_error,
+                            )
                         if request.skip_reading_prefix_cache:
                             ext_tokens, load_kv_async = 0, False
 
@@ -1109,19 +1168,6 @@ class Scheduler(SchedulerInterface):
                         connector_prefix_cache_hits = 0
                         num_computed_tokens = 0
                         load_kv_async = False
-                    diag.emit(
-                        "request_cache_lookup", request_id=request.request_id,
-                        num_prompt_tokens=request.num_prompt_tokens,
-                        num_local_cached_tokens=num_new_local_computed_tokens,
-                        num_external_cached_tokens=num_external_computed_tokens,
-                        num_prompt_uncached_tokens=max(
-                            request.num_prompt_tokens - num_computed_tokens, 0
-                        ),
-                        status="lookup_complete", local_source="hbm",
-                        external_source=(
-                            "connector" if num_external_computed_tokens else None
-                        ),
-                    )
 
                     # Skip request with pending mm encoding prefetches
                     if self._ec_transfer_pending(request, num_computed_tokens):
@@ -1616,37 +1662,41 @@ class Scheduler(SchedulerInterface):
             request = self.requests[request_id]
             request.pd_execution_id = scheduler_output.pd_execution_id
             request.pd_executions += 1
-            if (scheduled_tokens > 0
-                    and request.num_computed_tokens >= request.num_prompt_tokens):
+            if (
+                scheduled_tokens > 0
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
                 request.pd_decode_steps += 1
-            request.pd_emit_hash_ranges()
-            members.append({
-                "request_id": request_id,
-                "scheduled_tokens": scheduled_tokens,
-                "num_computed_tokens_before": request.num_computed_tokens,
-                "num_output_tokens": request.num_output_tokens,
-                "num_prompt_tokens": request.num_prompt_tokens,
-                "num_tokens": request.num_tokens,
-                "is_prefill_chunk": (
-                    request.num_computed_tokens + scheduled_tokens
-                    < request.num_tokens + request.num_output_placeholders
-                ),
-                "prefill_tokens_remaining_before": max(
-                    request.num_prompt_tokens - request.num_computed_tokens, 0
-                ),
-                "num_spec_tokens": len(scheduled_spec_decode_tokens.get(request_id, ())),
-                "execution_participation": request.pd_executions,
-                "hash_duration_ns_cumulative": request.pd_hash_duration_ns,
-                "hash_calls_cumulative": request.pd_hash_calls,
-                "hash_blocks_cumulative": request.pd_hash_blocks,
-            })
-        diag.emit(
-            "scheduler_execution", request_ids=list(num_scheduled_tokens),
-            members=members, no_forward=total_num_scheduled_tokens == 0,
+            members.append(
+                {
+                    "request_id": request_id,
+                    "observation_id": request.pd_identity.get("observation_id"),
+                    "engine_id": self._pd_engine_id,
+                    "scheduled_tokens": scheduled_tokens,
+                    "num_computed_tokens_before": request.num_computed_tokens,
+                    "num_output_tokens": request.num_output_tokens,
+                    "num_prompt_tokens": request.num_prompt_tokens,
+                    "num_tokens": request.num_tokens,
+                    "is_prefill_chunk": (
+                        request.num_computed_tokens + scheduled_tokens
+                        < request.num_tokens + request.num_output_placeholders
+                    ),
+                    "prefill_tokens_remaining_before": max(
+                        request.num_prompt_tokens - request.num_computed_tokens, 0
+                    ),
+                    "num_spec_tokens": len(
+                        scheduled_spec_decode_tokens.get(request_id, ())
+                    ),
+                    "execution_participation": request.pd_executions,
+                }
+            )
+        diag.current_batch().update(
+            request_ids=list(num_scheduled_tokens),
+            members=members,
+            no_forward=total_num_scheduled_tokens == 0,
             finished_request_ids=list(scheduler_output.finished_req_ids),
             preempted_request_ids=[request.request_id for request in preempted_reqs],
         )
-        self.kv_cache_manager.pd_resource_snapshot(num_scheduled_tokens)
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -2727,6 +2777,13 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            transfer = self.vllm_config.kv_transfer_config
+            request.pd_identity = {
+                **request.pd_identity,
+                "engine_id": self._pd_engine_id,
+                "dp_rank": self.parallel_config.data_parallel_index,
+                "kv_role": transfer.kv_role if transfer is not None else None,
+            }
             request.pd_queue_transition("queued")
             if request.resumable:
                 request.streaming_queue = deque()
@@ -2874,12 +2931,6 @@ class Scheduler(SchedulerInterface):
         blocks = self.kv_cache_manager.pop_blocks_for_free(request)
         if blocks:
             self.deferred_frees.append((self.sched_step_seq, blocks))
-            diag.emit(
-                "kv_cache_deferred_release", request_id=request.request_id,
-                execution_id=request.pd_execution_id, lifecycle="fence_pending",
-                block_references=len(blocks), fence_seq=self.sched_step_seq,
-                processed_step_seq=self.processed_step_seq,
-            )
 
     def _free_cow_retained_blocks(
         self, blocks: list[KVCacheBlock], fence_seq: int
@@ -2889,12 +2940,6 @@ class Scheduler(SchedulerInterface):
         """
         if not self.defer_block_free or fence_seq <= self.processed_step_seq:
             self.kv_cache_manager.block_pool.free_blocks(blocks)
-            diag.emit(
-                "kv_cache_deferred_release", lifecycle="cow_retention_released",
-                block_references=len(blocks), fence_seq=fence_seq,
-                processed_step_seq=self.processed_step_seq,
-            )
-            self.kv_cache_manager.pd_resource_snapshot(())
             return
         self.deferred_frees.append((fence_seq, blocks[::-1]))
 
@@ -2912,12 +2957,6 @@ class Scheduler(SchedulerInterface):
             _, blocks = self.deferred_frees.popleft()
             # Free in reverse order so that the tail blocks are evicted first.
             self.kv_cache_manager.block_pool.free_blocks(reversed(blocks))
-            diag.emit(
-                "kv_cache_deferred_release", lifecycle="fence_released",
-                block_references=len(blocks), fence_seq=fence,
-                processed_step_seq=self.processed_step_seq,
-            )
-            self.kv_cache_manager.pd_resource_snapshot(())
 
     def get_num_unfinished_requests(self) -> int:
         if self._pause_state == PauseState.PAUSED_ALL:
@@ -3098,6 +3137,8 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        for request in self.requests.values():
+            request.pd_queue_transition("finished", completion="shutdown")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

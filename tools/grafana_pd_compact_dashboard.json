@@ -1,0 +1,1768 @@
+{
+  "id": null,
+  "uid": "pd-compact-schema2",
+  "title": "P/D Compact TTFT · schema 2 · static snapshot",
+  "description": "Static canonical L1–L4 hierarchy and complete captured field evidence. Shared batch and overlapping timing scopes are non-additive; missing values remain null.",
+  "schemaVersion": 41,
+  "version": 1,
+  "editable": true,
+  "tags": [
+    "vllm",
+    "pd",
+    "compact",
+    "schema2",
+    "snapshot"
+  ],
+  "timezone": "browser",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "refresh": "",
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "Canonical hierarchy and captured evidence · static snapshot",
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 4
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**Static diagnostic snapshot.** The time picker does not filter these rows. Select Request → Side; the global table shows every canonical L1–L4 node, while Parent Id controls only the child browser. API Server, EngineCore and Worker are L1 groups. Native phases are L4 children of put; native calls and totals remain evidence metadata. Shared batch, execution, rank and task samples retain their full identities and must not be attributed as per-request time. Parent/child ranges, parallel ranks, associated stages and native totals can overlap: **do not sum them into TTFT**. Official TTFT is shown only when first_token_observed is true. The field evidence table includes every captured stage, associated stage, counter, official field and native call/total without aggregation; raw values and source observations are inspectable. Missing, skipped, event, group and association durations remain null (—); zero is a captured value. Synthetic inputs remain diagnostic examples, not performance measurements."
+      }
+    },
+    {
+      "id": 20,
+      "type": "table",
+      "title": "Global L1–L4 hierarchy · every canonical node",
+      "description": "Direct l1/l2/l3/l4 ancestry from /nodes; independent of Parent Id. All canonical stages and states are retained. Shared batch and overlapping ranges are non-additive. Native call IDs and totals are evidence metadata, not an L5 tree level. Null durations remain missing; inspect source_observations or row_evidence for provenance. Queue intervals are associated with the execution ending the wait, not time inside that execution. Hash/detokenize ranges retain explicit execution identity; unassigned intervals remain request-level.",
+      "datasource": {
+        "type": "marcusolsson-json-datasource",
+        "uid": "${DS_PD_JSON_API}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 24,
+        "h": 15
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "method": "GET",
+          "urlPath": "/nodes",
+          "params": [
+            [
+              "request_key",
+              "${request_key}"
+            ],
+            [
+              "side",
+              "${side}"
+            ]
+          ],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "l1",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.l1) ? $r.l1 : null })]"
+            },
+            {
+              "name": "l2",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.l2) ? $r.l2 : null })]"
+            },
+            {
+              "name": "l3",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.l3) ? $r.l3 : null })]"
+            },
+            {
+              "name": "l4",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.l4) ? $r.l4 : null })]"
+            },
+            {
+              "name": "label",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.label) ? $r.label : null })]"
+            },
+            {
+              "name": "level",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.level) ? $r.level : null })]"
+            },
+            {
+              "name": "stage",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.stage) ? $r.stage : null })]"
+            },
+            {
+              "name": "duration_ms",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.duration_ms) ? $r.duration_ms : null })]"
+            },
+            {
+              "name": "duration_ns",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.duration_ns) ? $r.duration_ns : null })]"
+            },
+            {
+              "name": "state",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.state) ? $r.state : null })]"
+            },
+            {
+              "name": "status",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.status) ? $r.status : null })]"
+            },
+            {
+              "name": "completion",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.completion) ? $r.completion : null })]"
+            },
+            {
+              "name": "request_key",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.request_key) ? $r.request_key : null })]"
+            },
+            {
+              "name": "side",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.side) ? $r.side : null })]"
+            },
+            {
+              "name": "scope",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.scope) ? $r.scope : null })]"
+            },
+            {
+              "name": "execution_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.execution_id) ? $r.execution_id : null })]"
+            },
+            {
+              "name": "task_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.task_id) ? $r.task_id : null })]"
+            },
+            {
+              "name": "tp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.tp_rank) ? $r.tp_rank : null })]"
+            },
+            {
+              "name": "pp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.pp_rank) ? $r.pp_rank : null })]"
+            },
+            {
+              "name": "dp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.dp_rank) ? $r.dp_rank : null })]"
+            },
+            {
+              "name": "rank",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { ($exists($r.rank) and $r.rank != null) ? $string($r.rank) : null })]"
+            },
+            {
+              "name": "local_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.local_rank) ? $r.local_rank : null })]"
+            },
+            {
+              "name": "global_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.global_rank) ? $r.global_rank : null })]"
+            },
+            {
+              "name": "engine_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.engine_id) ? $r.engine_id : null })]"
+            },
+            {
+              "name": "request_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.request_id) ? $r.request_id : null })]"
+            },
+            {
+              "name": "worker_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.worker_id) ? $r.worker_id : null })]"
+            },
+            {
+              "name": "process_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.process_id) ? $r.process_id : null })]"
+            },
+            {
+              "name": "call_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.call_id) ? $r.call_id : null })]"
+            },
+            {
+              "name": "call_index",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.call_index) ? $r.call_index : null })]"
+            },
+            {
+              "name": "native_total",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { ($exists($r.native_total) and $r.native_total != null) ? $string($r.native_total) : null })]"
+            },
+            {
+              "name": "repository",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.repository) ? $r.repository : null })]"
+            },
+            {
+              "name": "node_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.node_id) ? $r.node_id : null })]"
+            },
+            {
+              "name": "parent_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.parent_id) ? $r.parent_id : null })]"
+            },
+            {
+              "name": "source_observations",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { ($exists($r.source_observations) and $r.source_observations != null) ? $string($r.source_observations) : null })]"
+            },
+            {
+              "name": "row_evidence",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $string($r) })]"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "—",
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_ns"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ns"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "native_total"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "source_observations"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "row_evidence"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 21,
+      "type": "table",
+      "title": "Execution and rank evidence · full identities · non-additive",
+      "description": "Canonical execution, task and rank samples, retaining full execution_id without process-specific parsing. Shared batch rows can be associated with several requests; parallel ranks and parent ranges must never be summed. This view retains nullable ranks and all canonical context; use column filters to inspect an execution or rank. Queue intervals are associated with the execution ending the wait, not time inside that execution. Hash/detokenize ranges retain explicit execution identity; unassigned intervals remain request-level.",
+      "datasource": {
+        "type": "marcusolsson-json-datasource",
+        "uid": "${DS_PD_JSON_API}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 19,
+        "w": 24,
+        "h": 12
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "method": "GET",
+          "urlPath": "/nodes",
+          "params": [
+            [
+              "request_key",
+              "${request_key}"
+            ],
+            [
+              "side",
+              "${side}"
+            ]
+          ],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "execution_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.execution_id) ? $r.execution_id : null })]"
+            },
+            {
+              "name": "task_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.task_id) ? $r.task_id : null })]"
+            },
+            {
+              "name": "tp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.tp_rank) ? $r.tp_rank : null })]"
+            },
+            {
+              "name": "pp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.pp_rank) ? $r.pp_rank : null })]"
+            },
+            {
+              "name": "dp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.dp_rank) ? $r.dp_rank : null })]"
+            },
+            {
+              "name": "rank",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { ($exists($r.rank) and $r.rank != null) ? $string($r.rank) : null })]"
+            },
+            {
+              "name": "local_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.local_rank) ? $r.local_rank : null })]"
+            },
+            {
+              "name": "global_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.global_rank) ? $r.global_rank : null })]"
+            },
+            {
+              "name": "l1",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.l1) ? $r.l1 : null })]"
+            },
+            {
+              "name": "l2",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.l2) ? $r.l2 : null })]"
+            },
+            {
+              "name": "l3",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.l3) ? $r.l3 : null })]"
+            },
+            {
+              "name": "l4",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.l4) ? $r.l4 : null })]"
+            },
+            {
+              "name": "label",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.label) ? $r.label : null })]"
+            },
+            {
+              "name": "stage",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.stage) ? $r.stage : null })]"
+            },
+            {
+              "name": "scope",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.scope) ? $r.scope : null })]"
+            },
+            {
+              "name": "duration_ms",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.duration_ms) ? $r.duration_ms : null })]"
+            },
+            {
+              "name": "duration_ns",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.duration_ns) ? $r.duration_ns : null })]"
+            },
+            {
+              "name": "state",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.state) ? $r.state : null })]"
+            },
+            {
+              "name": "status",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.status) ? $r.status : null })]"
+            },
+            {
+              "name": "completion",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.completion) ? $r.completion : null })]"
+            },
+            {
+              "name": "request_key",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.request_key) ? $r.request_key : null })]"
+            },
+            {
+              "name": "side",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.side) ? $r.side : null })]"
+            },
+            {
+              "name": "engine_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.engine_id) ? $r.engine_id : null })]"
+            },
+            {
+              "name": "request_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.request_id) ? $r.request_id : null })]"
+            },
+            {
+              "name": "worker_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.worker_id) ? $r.worker_id : null })]"
+            },
+            {
+              "name": "process_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.process_id) ? $r.process_id : null })]"
+            },
+            {
+              "name": "call_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.call_id) ? $r.call_id : null })]"
+            },
+            {
+              "name": "call_index",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.call_index) ? $r.call_index : null })]"
+            },
+            {
+              "name": "native_total",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { ($exists($r.native_total) and $r.native_total != null) ? $string($r.native_total) : null })]"
+            },
+            {
+              "name": "node_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.node_id) ? $r.node_id : null })]"
+            },
+            {
+              "name": "parent_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $exists($r.parent_id) ? $r.parent_id : null })]"
+            },
+            {
+              "name": "source_observations",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { ($exists($r.source_observations) and $r.source_observations != null) ? $string($r.source_observations) : null })]"
+            },
+            {
+              "name": "row_evidence",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($[($exists(execution_id) and execution_id != null) or ($exists(task_id) and task_id != null) or ($exists(tp_rank) and tp_rank != null) or ($exists(pp_rank) and pp_rank != null) or ($exists(dp_rank) and dp_rank != null) or ($exists(rank) and rank != null) or ($exists(local_rank) and local_rank != null) or ($exists(global_rank) and global_rank != null)], function($r) { $string($r) })]"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "—",
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_ns"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ns"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "native_total"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "source_observations"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "row_evidence"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 22,
+      "type": "table",
+      "title": "Captured field evidence · all stages, counters, official and native fields",
+      "description": "One row per captured field from /observations, including stages, associated_stages, counters, every official statistic and native totals/calls. No sums, pivoting, deduplication or business-node invention. Value is JSON text so booleans, zero, strings and structured payloads are inspectable; absent values remain null. Official raw evidence does not override the first_token_observed guard on the official summary. Unit, duration and scope are separate; shared batch and overlapping timings are non-additive. Inspect source_observations and row_evidence for complete captured context.",
+      "datasource": {
+        "type": "marcusolsson-json-datasource",
+        "uid": "${DS_PD_JSON_API}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 31,
+        "w": 24,
+        "h": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "method": "GET",
+          "urlPath": "/observations",
+          "params": [
+            [
+              "request_key",
+              "${request_key}"
+            ],
+            [
+              "side",
+              "${side}"
+            ]
+          ],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "group",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.group) ? $r.group : null })]"
+            },
+            {
+              "name": "field",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.field) ? $r.field : null })]"
+            },
+            {
+              "name": "stage",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.stage) ? $r.stage : null })]"
+            },
+            {
+              "name": "value",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { ($exists($r.value) and $r.value != null) ? $string($r.value) : null })]"
+            },
+            {
+              "name": "unit",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.unit) ? $r.unit : null })]"
+            },
+            {
+              "name": "duration_ns",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.duration_ns) ? $r.duration_ns : null })]"
+            },
+            {
+              "name": "duration_ms",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.duration_ms) ? $r.duration_ms : null })]"
+            },
+            {
+              "name": "state",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.state) ? $r.state : null })]"
+            },
+            {
+              "name": "status",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.status) ? $r.status : null })]"
+            },
+            {
+              "name": "completion",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.completion) ? $r.completion : null })]"
+            },
+            {
+              "name": "request_key",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.request_key) ? $r.request_key : null })]"
+            },
+            {
+              "name": "side",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.side) ? $r.side : null })]"
+            },
+            {
+              "name": "scope",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.scope) ? $r.scope : null })]"
+            },
+            {
+              "name": "execution_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.execution_id) ? $r.execution_id : null })]"
+            },
+            {
+              "name": "task_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.task_id) ? $r.task_id : null })]"
+            },
+            {
+              "name": "tp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.tp_rank) ? $r.tp_rank : null })]"
+            },
+            {
+              "name": "pp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.pp_rank) ? $r.pp_rank : null })]"
+            },
+            {
+              "name": "dp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.dp_rank) ? $r.dp_rank : null })]"
+            },
+            {
+              "name": "rank",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { ($exists($r.rank) and $r.rank != null) ? $string($r.rank) : null })]"
+            },
+            {
+              "name": "local_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.local_rank) ? $r.local_rank : null })]"
+            },
+            {
+              "name": "global_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.global_rank) ? $r.global_rank : null })]"
+            },
+            {
+              "name": "engine_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.engine_id) ? $r.engine_id : null })]"
+            },
+            {
+              "name": "request_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.request_id) ? $r.request_id : null })]"
+            },
+            {
+              "name": "worker_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.worker_id) ? $r.worker_id : null })]"
+            },
+            {
+              "name": "process_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.process_id) ? $r.process_id : null })]"
+            },
+            {
+              "name": "event",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.event) ? $r.event : null })]"
+            },
+            {
+              "name": "record_index",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.record_index) ? $r.record_index : null })]"
+            },
+            {
+              "name": "call_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.call_id) ? $r.call_id : null })]"
+            },
+            {
+              "name": "call_index",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.call_index) ? $r.call_index : null })]"
+            },
+            {
+              "name": "source_observations",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { ($exists($r.source_observations) and $r.source_observations != null) ? $string($r.source_observations) : null })]"
+            },
+            {
+              "name": "row_evidence",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $string($r) })]"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "—",
+          "custom": {
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "value"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_ns"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ns"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "source_observations"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "row_evidence"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Canonical nodes · select a label for children",
+      "datasource": {
+        "type": "marcusolsson-json-datasource",
+        "uid": "${DS_PD_JSON_API}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 47,
+        "w": 24,
+        "h": 13
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "method": "GET",
+          "urlPath": "/nodes",
+          "params": [
+            [
+              "request_key",
+              "${request_key}"
+            ],
+            [
+              "side",
+              "${side}"
+            ],
+            [
+              "parent_id",
+              "${parent_id}"
+            ]
+          ],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "label",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.label) ? $r.label : null })]"
+            },
+            {
+              "name": "level",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.level) ? $r.level : null })]"
+            },
+            {
+              "name": "state",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.state) ? $r.state : null })]"
+            },
+            {
+              "name": "duration_ms",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.duration_ms) ? $r.duration_ms : null })]"
+            },
+            {
+              "name": "scope",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.scope) ? $r.scope : null })]"
+            },
+            {
+              "name": "execution_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.execution_id) ? $r.execution_id : null })]"
+            },
+            {
+              "name": "task_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.task_id) ? $r.task_id : null })]"
+            },
+            {
+              "name": "tp_rank",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.tp_rank) ? $r.tp_rank : null })]"
+            },
+            {
+              "name": "status",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.status) ? $r.status : null })]"
+            },
+            {
+              "name": "completion",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.completion) ? $r.completion : null })]"
+            },
+            {
+              "name": "child_count",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.child_count) ? $r.child_count : null })]"
+            },
+            {
+              "name": "repository",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.repository) ? $r.repository : null })]"
+            },
+            {
+              "name": "source_observations",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { ($exists($r.source_observations) and $r.source_observations != null) ? $string($r.source_observations) : null })]"
+            },
+            {
+              "name": "request_key",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.request_key) ? $r.request_key : null })]"
+            },
+            {
+              "name": "node_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.node_id) ? $r.node_id : null })]"
+            },
+            {
+              "name": "parent_id",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.parent_id) ? $r.parent_id : null })]"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "—"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "label"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Children",
+                    "url": "/d/${__dashboard.uid}?var-request_key=${request_key:percentencode}&var-side=${side:percentencode}&var-parent_id=${__data.fields.node_id:percentencode}"
+                  },
+                  {
+                    "title": "Return to L1 groups",
+                    "url": "/d/${__dashboard.uid}?var-request_key=${request_key:percentencode}&var-side=${side:percentencode}&var-parent_id=__root"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "duration_ms"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "ms"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "source_observations"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 180
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "request_key"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "node_id"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "parent_id"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": true
+              }
+            ]
+          }
+        ]
+      },
+      "description": "Parent Id filters only this child browser. The global table above retains all canonical nodes. Native phases are L4 children of put; native calls and totals remain metadata. Missing durations stay null and overlapping timings are non-additive."
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Selected side official statistics · never summed across P/D",
+      "datasource": {
+        "type": "marcusolsson-json-datasource",
+        "uid": "${DS_PD_JSON_API}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 60,
+        "w": 24,
+        "h": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "method": "GET",
+          "urlPath": "/requests",
+          "params": [
+            [
+              "request_key",
+              "${request_key}"
+            ],
+            [
+              "side",
+              "${side}"
+            ]
+          ],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "display",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.display) ? $r.display : null })]"
+            },
+            {
+              "name": "side",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.side) ? $r.side : null })]"
+            },
+            {
+              "name": "official_state",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.official_state) ? $r.official_state : null })]"
+            },
+            {
+              "name": "first_token_observed",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.first_token_observed) ? $r.first_token_observed : null })]"
+            },
+            {
+              "name": "ttft_ms",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.ttft_ms) ? $r.ttft_ms : null })]"
+            },
+            {
+              "name": "e2e_ms",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.e2e_ms) ? $r.e2e_ms : null })]"
+            },
+            {
+              "name": "decode_ms",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.decode_ms) ? $r.decode_ms : null })]"
+            },
+            {
+              "name": "input_tokens",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.input_tokens) ? $r.input_tokens : null })]"
+            },
+            {
+              "name": "output_tokens",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.output_tokens) ? $r.output_tokens : null })]"
+            },
+            {
+              "name": "cached_tokens",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.cached_tokens) ? $r.cached_tokens : null })]"
+            },
+            {
+              "name": "official",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { ($exists($r.official) and $r.official != null) ? $string($r.official) : null })]"
+            },
+            {
+              "name": "official_source_observations",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { ($exists($r.official_source_observations) and $r.official_source_observations != null) ? $string($r.official_source_observations) : null })]"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "—"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "official"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "official_source_observations"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "json-view"
+                }
+              },
+              {
+                "id": "custom.inspect",
+                "value": true
+              },
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          }
+        ]
+      },
+      "description": "Selected side official summary from a single unambiguous lifecycle. TTFT requires first_token_observed=true; missing/ambiguous values remain null. Every raw official field, including timestamps and counters, is also available in the captured field evidence table without aggregation."
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Explicit HTTP / request links · click target",
+      "datasource": {
+        "type": "marcusolsson-json-datasource",
+        "uid": "${DS_PD_JSON_API}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 66,
+        "w": 24,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "method": "GET",
+          "urlPath": "/links",
+          "params": [
+            [
+              "request_key",
+              "${request_key}"
+            ]
+          ],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "kind",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.kind) ? $r.kind : null })]"
+            },
+            {
+              "name": "producer",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.producer_engine_id) ? $r.producer_engine_id & ' / ' & $r.producer_request_id : null })]"
+            },
+            {
+              "name": "consumer",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.consumer_engine_id) ? $r.consumer_engine_id & ' / ' & $r.consumer_request_id : null })]"
+            },
+            {
+              "name": "source_request_key",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.source_request_key) ? $r.source_request_key : null })]"
+            },
+            {
+              "name": "target_request_key",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.target_request_key) ? $r.target_request_key : null })]"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "—"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "target_request_key"
+            },
+            "properties": [
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "Linked request",
+                    "url": "/d/${__dashboard.uid}?var-request_key=${__value.raw:percentencode}&var-parent_id=__root"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Quality evidence",
+      "datasource": {
+        "type": "marcusolsson-json-datasource",
+        "uid": "${DS_PD_JSON_API}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 71,
+        "w": 24,
+        "h": 5
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "method": "GET",
+          "urlPath": "/quality",
+          "params": [
+            [
+              "request_key",
+              "${request_key}"
+            ]
+          ],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "kind",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.kind) ? $r.kind : null })]"
+            },
+            {
+              "name": "record_index",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.record_index) ? $r.record_index : null })]"
+            },
+            {
+              "name": "candidate_count",
+              "type": "number",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $exists($r.candidate_count) ? $r.candidate_count : null })]"
+            }
+          ]
+        }
+      ],
+      "options": {
+        "showHeader": true
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "—"
+        },
+        "overrides": []
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PD_JSON_API",
+        "label": "Rows datasource",
+        "type": "datasource",
+        "query": "marcusolsson-json-datasource",
+        "current": {
+          "text": "PD Compact Rows",
+          "value": "pd-compact-rows"
+        }
+      },
+      {
+        "name": "request_key",
+        "label": "Request Key",
+        "type": "query",
+        "datasource": {
+          "type": "marcusolsson-json-datasource",
+          "uid": "${DS_PD_JSON_API}"
+        },
+        "refresh": 2,
+        "sort": 0,
+        "multi": false,
+        "includeAll": false,
+        "query": {
+          "refId": "A",
+          "experimentalVariableTextField": "__text",
+          "experimentalVariableValueField": "__value",
+          "method": "GET",
+          "urlPath": "/requests",
+          "params": [],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "__text",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $r.display })]"
+            },
+            {
+              "name": "__value",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $r.request_key })]"
+            }
+          ]
+        }
+      },
+      {
+        "name": "side",
+        "label": "Side",
+        "type": "query",
+        "datasource": {
+          "type": "marcusolsson-json-datasource",
+          "uid": "${DS_PD_JSON_API}"
+        },
+        "refresh": 2,
+        "sort": 0,
+        "multi": false,
+        "includeAll": false,
+        "query": {
+          "refId": "A",
+          "experimentalVariableTextField": "__text",
+          "experimentalVariableValueField": "__value",
+          "method": "GET",
+          "urlPath": "/sides",
+          "params": [
+            [
+              "request_key",
+              "${request_key}"
+            ]
+          ],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "__text",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $r.side })]"
+            },
+            {
+              "name": "__value",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $r.side })]"
+            }
+          ]
+        }
+      },
+      {
+        "name": "parent_id",
+        "label": "Parent Id",
+        "type": "query",
+        "datasource": {
+          "type": "marcusolsson-json-datasource",
+          "uid": "${DS_PD_JSON_API}"
+        },
+        "refresh": 2,
+        "sort": 0,
+        "multi": false,
+        "includeAll": false,
+        "query": {
+          "refId": "A",
+          "experimentalVariableTextField": "__text",
+          "experimentalVariableValueField": "__value",
+          "method": "GET",
+          "urlPath": "/node_options",
+          "params": [
+            [
+              "request_key",
+              "${request_key}"
+            ],
+            [
+              "side",
+              "${side}"
+            ]
+          ],
+          "headers": [],
+          "body": "",
+          "queryParams": "",
+          "cacheDurationSeconds": 0,
+          "fields": [
+            {
+              "name": "__text",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $r.path })]"
+            },
+            {
+              "name": "__value",
+              "type": "string",
+              "language": "jsonata",
+              "jsonPath": "[$map($, function($r) { $r.node_id })]"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  }
+}

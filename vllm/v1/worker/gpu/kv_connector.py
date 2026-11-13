@@ -118,18 +118,23 @@ class ActiveKVConnector(KVConnector):
         assert load_kwargs is not None
         self._pending_load_kwargs = None
         # TODO: sort out KV Connectors' use of forward_context
-        with diag.scope(**self._pd_context), diag.span(
-            "kv.load_submit", completion="submission_return_not_transfer_completion"
+        with (
+            diag.scope(**self._pd_context),
+            diag.span(
+                "kv.load_submit", completion="submission_return_not_transfer_completion"
+            ),
         ):
             if is_forward_context_available():
                 self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)
             else:
                 with set_forward_context(None, self.vllm_config):
-                    self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)
+                    self.kv_connector.start_load_kv(
+                        get_forward_context(), **load_kwargs
+                    )
 
     def finish_forward(self) -> None:
         if not self._disabled:
-            with diag.scope(**self._pd_context), diag.span("kv.finish_forward"):
+            with diag.scope(**self._pd_context):
                 self.kv_connector.finish_forward()
 
     def reset_capture_state(self) -> None:
@@ -145,7 +150,7 @@ class ActiveKVConnector(KVConnector):
         output = KVConnectorOutput()
         with diag.scope(**self._pd_context), diag.span("kv.save_wait"):
             self.kv_connector.wait_for_save()
-        with diag.scope(**self._pd_context), diag.span("kv.transfer_results"):
+        with diag.scope(**self._pd_context):
             transfer_results = self.kv_connector.get_transfer_results(finished_req_ids)
             diag.emit(
                 "kv.completion_observed",

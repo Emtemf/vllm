@@ -8,407 +8,285 @@ vLLM exposes a rich set of metrics to support observability and capacity plannin
 - Prioritize Prometheus integrations, as this is what we expect to be used in production environments.
 - Offer logging support (i.e. printing metrics to the info log) for ad-hoc testing, debugging, development, and exploratory use cases.
 
-## P/D diagnostic evidence
+## Compact P/D diagnostic evidence (schema 2)
 
-The paired P/D diagnostic implementation emits `[PD_DIAG]` JSON observations
-through the INFO logger. Original model, scheduler, and cache behavior and
-native metric formulas are preserved. Additional IDs, counters, spans, and
-logging are diagnostic observations with overhead, not zero-cost instrumentation
-or complete TTFT accounting. This is separate from Prometheus aggregation and
-does not enable device profiling or add device synchronization.
+This isolated cutover on `feature/pd-ttft-compact-v032` emits `[PD_DIAG]`
+JSON records with `version: 2`. The original model, scheduling, cache behavior,
+exceptions, cancellation and official statistics remain unchanged. Diagnostics
+have overhead; they do not establish additive TTFT attribution or NPU performance.
+The ongoing schema-1 integration, its working directories, bundles, Grafana on
+3032 and rows API on 8765 must remain untouched. The compact readers reject
+schema 1, mixed-version input and old leaf-event records, without reconstruction.
 
-Each observation includes process/clock identity and a unique record ID.
-Execution IDs link scheduler batches to workers; request and task links retain
-shared work rather than attributing a whole batch to every member. Shared batch
-and parallel TP ranges are not per-request additive latency. Dense DP replicas
-use their preserved `data_parallel_index`, including after the local parallel
-rank has been reset for an independent engine.
+### Retained tree and identity
 
-API observation supports root-path mounts, token-ID-only generated responses,
-and delayed closure of resumable input. Request summaries preserve the native
-timing formulas. `first_token_observed=false` marks a terminal output with no
-generated token: its native first-output timestamp is not proof of a first
-token. Request/report/Grafana display TTFT must be null in that case, even when
-the original native TTFT field is nonzero; retain the original field as evidence.
+The report's `dashboard.nodes` is the sole tree used by HTML, request export and
+Grafana. Each request/side has three L1 groups:
 
-To inspect collected observations with the container's existing Python (no uv
-or vLLM import is required by these standalone converters):
+- **API Server:** req_resolve, render, tokenize, add_request, detokenize.
+- **EngineCore:** schedule with lookup, alloc, other; request queue and hash are
+  associated cumulative observations, retained once rather than copied per step.
+- **Worker:** load_kv (submit, wait_for_transfer), forward, wait_for_save
+  (build_key, lookup, prepare, sync, put), sampling. Pool tasks preserve their
+  actual save_submit, save, load and save_wait scope separately.
+
+Execute/sample entries, execution IDs, ranks, task IDs, request generations and
+native calls remain distinct samples. Shared batch/task durations are never
+divided among members or added across TP ranks. Stage `duration_ns` is the sum
+of actual repeated calls, not the first-to-last envelope. Real zero remains
+measured zero. Missing, skipped, fused, invalid and not-started stages have null
+display durations. Groups, positions and association links are not timers.
+`status`, `complete`/`completion`, exceptions, timing scope and bounded-detail
+drops remain visible; truncated evidence is incomplete.
+
+An HTTP `api_summary` can finish without an engine request. Its req_resolve,
+render and tokenize stages stay on an observation-only entry, with explicit links
+to engine_submission/engine_input and request children. They are not cloned into
+each child's request timers. The saved `pd_identity` on EngineCoreRequest carries
+the API observation identity into Core membership and terminal records. Workers
+join through the unique Core execution_id and its explicit members, never by
+global request-ID matching. P and D associate only through explicit producer and
+consumer engine/request identities. Filenames, thread ownership, nearby logs and
+similar timestamps do not establish request or side identity.
+
+Official API fields stay under `official` in their original units/formulas.
+Side-specific display chooses a unique official summary, never sums P/D. When
+`first_token_observed` is false or missing, displayed TTFT stays null even if the
+original native TTFT field is nonzero. Terminal cumulative detokenize is outside
+the official first-token endpoint. An unavailable authoritative add_request total
+remains missing. Receive-task submit and wait_for_transfer measure actual calls;
+transfer_envelope_ns and request_generation closure are separate evidence, not a
+synthetic pure-wait duration or a request sum.
+
+### Native Mooncake evidence
+
+Keep complete `[BatchPutTiming]` and `[BatchUpsertTiming]` lines alongside Python
+summaries. Each matched PUT call has exactly four native children:
+start_batch_put, submit_transfers, wait_transfers and finalize_batch_put. Native
+total is outer-range metadata on that call, never a fifth phase. `normal_full`,
+`prefer_same_node_full` and `prefer_same_node_not_started` remain distinct. An
+incomplete/not-started record may have no phase/total durations; none are invented.
+
+Matching requires a retained native_call boundary, native TID, source wall-clock
+start/end and UTC offset. Glog local time is converted with the producer's offset,
+including printed timestamp precision; the reporting host's timezone is unused.
+The same original source file is required unless native host/PID/run are explicit
+and agree. Available submitted keys/bytes must agree. Overlapping candidates,
+multiple native samples per call, missing offsets, wrong threads/windows or count
+mismatches remain unassigned quality evidence. Preserve rotated process logs and
+do not provide both stdout and file copies of the same native lines.
+
+### 每请求诊断日志量（按实际调用计数）
+
+以下估算只计算 schema 2 的 `[PD_DIAG]`、Mooncake `[BatchPutTiming]` 和
+`[BatchUpsertTiming]` 诊断记录。假设 INFO 日志已开启、生命周期正常收尾、每个进程的
+原始输出只采集一次；不包含 access log、常规服务 INFO/WARNING、异常 traceback、
+启动/模型加载日志。这里的一“行”指一次诊断 logger 输出，既不是一个树节点，也不是一次
+stage 调用。`Batch.add_stage()` 的重复调用累加到同一 summary；`Batch.finish()` 幂等，
+不会因为同一对象重复 finish 而增加行数。
+
+先按实际 producer 定义变量；所有变量都是采集范围内的记录/调用次数：
+
+| 变量 | 实际 producer 与计数规则 |
+| --- | --- |
+| `H` | `PDRequestMiddleware.__call__`：每次匹配的 `/v1/chat/completions` 或 `/v1/completions` HTTP 生命周期，1 条 `api_summary(scope=http)`。请求在校验阶段被拒绝也可以只有这一条。 |
+| `U` | `_api_submission`：每次提交生命周期 1 条 `api_summary(scope=engine_submission)`；流式输入使用 `scope=engine_input`，按实际进入次数计。 |
+| `Q` | `RequestState` / `OutputProcessor._finish_pd_request`：每个已创建且收尾的引擎请求状态 1 条 `api_summary(scope=request)`，其中 detokenize 是累计值。 |
+| `T` | `Request.pd_queue_transition("finished")`：每个收尾的 Core 请求 1 条 `core_summary(scope=request)`，保留 queue/hash 等关联证据。 |
+| `Nc` | `EngineCore._pd_schedule` / `Scheduler.schedule`：每次真实调度执行 1 条 `core_summary(scope=execution)`；正常 EngineCore 路径复用同一个 Batch，不再多发一条 Scheduler summary。空调度、失败调度也按实际进入并收尾计。 |
+| `Er`, `Sr` | rank `r` 上 `pd_execution`、`pd_sample` 包装的实际入口次数：分别产生 `worker_summary(phase=execute)`、`worker_summary(phase=sample)`。 |
+| `Tr` | Pool rank `r` 上 `diagnostics.Task.finish` 的实际 task summary 数，包括提交、准备、后台 save/load、最终 `save_wait` 等各自已有 scope。 |
+| `Br` | Pool `diagnostics.completion` 在没有 active Task 时发出的 `pool_task(scope=bookkeeping, operation=store_completion)` 数。active Task 内的 completion 放入 `completions` 数组，不额外发一行。 |
+| `L` | hybrid connector 的 `pd_transfer_summary(scope=link)` 数：P 的 `request_finished_all_groups` 发 producer offer，D 的 `build_connector_meta` 发 consumer link，均按实际触发计。 |
+| `Dr`, `Gr` | D rank `r` 的 `_pd_finish_task`：每个处理并收尾的 receive task 1 条 `scope=task`；一个 request_generation 在 pending 归零且 final task 已入队时另发 1 条 `scope=request_generation`。 |
+| `W` | 所有采集进程实际输出的原生 `Client::BatchPut` / `Client::BatchUpsert` timing 行数；按 native batch call 计，不按 key、block、stage 或 Python task 计。 |
+
+跨全部相关 rank 的诊断 stdout 总量为：
+
+```text
+Npython = H + U + Q + T + Nc + sum_r(Er + Sr + Tr + Br + Dr + Gr) + L
+Ndiag   = Npython + W
+```
+
+没有 Pool 时令 `Tr=Br=0`；没有 hybrid receive 时令 `Dr=Gr=L=0`；没有实际原生写
+timing 输出时令 `W=0`。Pool 和 hybrid 是按启用路径加上的项，不能假定每个请求都走两者。
+原生 `LogBatchWriteTiming` 一次输出包含四个 phase 和 total，一次调用仍是 **1 行**，
+不是 5 行；转发重载不重复输出。prefer-same-node 校验未开始的错误分支也输出 1 条
+`phase_status=not_started`，不制造 phase 时长。native READ 的调用明细在 D task
+的 `native_calls` 数组内，本节这两个原生 timing marker 不为 READ 另发一行。
+
+**9 步、TP8、PP1 的具体例子。** 设一个 HTTP 对应一次提交、一个引擎请求，正常收尾，
+所以 `H=U=Q=T=1`；`Nstep=9` 指这个请求实际参与的 9 次 Core execution，
+`Nc=9`，8 个 TP rank 各进入 execute 9 次。对于每步都进入独立 sample 的正常路径，
+`Er=Sr=9`，不启用 Pool/hybrid、不发生原生写时：
+
+```text
+Ndiag = 4 + 9 + 8 * (9 + 9) = 157 行
+      = API 3 + Core 请求终态 1 + Core execution 9 + Worker 144
+```
+
+这是该假设下完整生命周期的粗估，不能理解为每请求固定 157 行。若这 9 步只有 `s` 次
+进入 sample，公式是 `4 + 9 + 8*(9+s)`；例如 `s=0` 是 85 行，`s=1` 是
+93 行，`s=9` 是 157 行。`EngineCore.step` 只有在 execute 返回 `None` 时才调用
+`sample_tokens`；sample 即便没有可采样 token，只要进入包装器仍有一条 summary。
+DeepSeek 的 MTP1、`enforce_eager=true`、block size 128 本身不额外乘行数：一次入口内
+的重复 forward/sampling 调用合并到 stage；它们会影响实际步数、task 数和 native call 数。
+9 只是这里的输入例子，不能由 block size、模型名或 speculative token 数直接推成固定步数。
+DP2 中一个请求路由到其中一个 replica，**不再乘 2**；另一 replica 的独立请求或对齐/
+空执行日志若也进入同一 stdout，要另按其实际记录计入，不能归给本请求。
+
+仅一个 Worker rank 的独立文件，在上述 sample 全进入的例子中是 `9+9=18` 条
+`worker_summary`；它不会自动含有另外七个 rank 的 126 条。若采集工具恰好将 API、
+Core 和该 rank 合并到一个文件，则此例是 `3+1+9+18=31` 条；真正数量取决于文件
+包含哪些进程，不能把“一个文件”默认当成“全 TP”。一个 Core execution 或 Worker
+summary 可以关联同批多个请求，stdout 中仍只有原来的一条。给每个请求展示同一共享
+记录后再相加会重复计数；吞吐容量估算应按唯一原始记录/`record_id` 去重。
+
+**启用 Pool 的加法。** 单请求、每 rank 工作相同的简化情况下，设每 rank 有
+`Tload` 个 load/load_submit scope、`Tsubmit` 个 save_submit scope、`Tsave` 个后台
+save scope、`Tprep` 个其它准备 scope、`Twait` 个最终 save_wait scope、`B` 个独立
+bookkeeping scope，以及实际 `Kput` 次有 timing 输出的原生 Put/Upsert。则在基础量上加：
+
+```text
+Npool = 8 * (Tload + Tsubmit + Tsave + Tprep + Twait + B + Kput)
+Ndiag = Nbase + Npool
+```
+
+例如选择普通非 layerwise 路径，并明确假设 9 步每 rank 各有一个 load scope（允许
+skipped）、一个 save_submit、一个后台 save，且每个 save 恰有一次原生写，则
+`Tload=Tsubmit=Tsave=Kput=9`、`Tprep=Twait=B=0`：新增
+`8*(9+9+9+9)=288` 行，总计 `157+288=445` 行。若每个 save 实际有两次原生写，
+其它条件相同，则 `Kput=18`，总计 517 行。两者是带条件的容量例子，不是对当前模型/
+部署的实测或上界。命中缓存、无可保存请求、异步 load、分组写入和不同后端都会改变这些项。
+`KVPoolWorker.start_load_kv` 的 skip 在已进入的 scope 内仍输出 1 条，
+`KVPoolWorker.wait_for_save` 无任务时也保留 save_submit；“没有数据传输”不能直接令
+Pool 行数归零。layerwise dispatcher 将同一执行的多个 layer 合到 task，通常在实际
+final layer 收尾；不能直接按层数乘 `Tr`。不过它内部每次真实原生写仍计入 `W`，
+另有实际准备和最终 `save_wait` scope，不能把一个 task 当成只发生一次写入。
+
+**D 侧与后续 decode。** 不使用 Pool 的 hybrid 例子：P 有上面的 9 步，D 再参与 1 步，
+两侧各有独立的 HTTP/提交/引擎请求/Core 终态，TP8、PP1，且每步都 sample；再假设
+P offer 和 D consumer link 各 1 条，每个 D rank 只有一个 receive task、一个正常闭合
+的 request_generation，实际没有 Put/Upsert：
+
+```text
+P/D 基础量 = 2*4 + (9+1)*(1+2*8) = 178
+hybrid 增量 = 2 + 8*(1+1) = 18
+P/D 合计 = 196 行
+```
+
+若两侧不是各自经过 HTTP，必须用实际 `H/U/Q/T` 替换，不强凑 8 条固定项。receive
+task 可以因分段、offset、远端划分而多于一个；generation 可以跨执行，不能每步重复加
+一次闭合 summary，也不能把一个请求的多个 generation 强行合成一个。后续每增加一个
+正常 execute+sample decode execution，TP8/PP1 基础量再加 `1+8+8=17` 行；执行
+没有 sample 时加 9 行。Pool/task/native 的增量仍另计，输出 token 数与 execution 数
+并非一一对应，尤其启用 MTP 时。保留日志直到后台任务收尾；HTTP 返回或首 token 出现
+时，生命周期总量可能尚未全部打印。
+
+取消、错误或 skipped 不改变“一个已进入并收尾的 scope 一条”的规则，但会改变走到的
+scope 数：校验拒绝可只有 HTTP；提交失败可能没有请求终态；调度错误可能没有 Worker；
+Worker execute 错误可能没有 sample。Pool 中未处理的已排队工作可以在清理时发
+`not_processed`/incomplete；D generation 没有 final task 或尚有 pending 时不会闭合。
+进程强退、日志过滤或截断也可能缺记录。因此上述成功路径数字不能充当异常路径的最低量
+或完整性检查。`request_id` 字符串过滤会漏掉 `request_id=null`、`request_ids`、
+`members`、execution 关联的 Worker 和不带 request ID 的原生行，统计应保留完整原始流。
+
+**字节数。** 当前没有覆盖这个完整请求路径的可信实日志/代表性序列化分布，因此不承诺
+“每行几 KB”或“每请求固定多少 KB”。实际文件体积按采集后的行文本计算：
+
+```text
+Bdiag = sum_i len((formatted_diagnostic_line_i + actual_line_ending_i).encode("utf-8"))
+```
+
+其中须包括 Python logger 或 glog 的真实前缀、JSON、换行；若计算整个服务日志文件，
+还要加所有非诊断行。仅 Python payload 的编码使用 `_write` 中的
+`json.dumps(values, separators=(",", ":"))`；不能据此漏掉日志前缀。`Batch` 的
+128 个 stage/link 上限、Pool 的 128 个 member/completion 和 64 个 native-call detail
+上限、D 的 64 个 READ detail 上限只限制保留条目数，截断有 dropped/incomplete 标记。
+ID/异常文本长度、batch 的 `request_ids`/`num_scheduled_tokens`、members 和关联数组
+都会改变长度；这些有界明细不代表每行恒定字节数或所有字段都有统一字节上限。
+
+已有的 **synthetic accumulator demo** 仅对同一 helper 中 20 次 forward + 20 次
+sampling 做过对比：schema 1 为 40 行/16,790 bytes，schema 2 为 2 行/1,198 bytes。
+它不是完整请求，不能拿 1,198 bytes 乘上此处请求数当成部署容量，也不是 TTFT/吞吐/
+NPU 开销的测量。部署容量先用这里的条件行数规划，再从完整原始采集计算上式。
+
+### Standalone conversion
+
+All tools use only the Python standard library, without importing torch or the
+vLLM runtime. Supply each original log once. Output parent directories must exist.
 
 ```bash
-cd /vllm-workspace/vllm
 PD_PYTHON=/usr/local/python3.12.16/bin/python
-mkdir -p /vllm-workspace/pd-metrics-output
-"$PD_PYTHON" tools/pd_metrics_report.py prefill.log decode.log -o /vllm-workspace/pd-metrics-output/report.json &&
-"$PD_PYTHON" tools/pd_metrics_report.py prefill.log decode.log -o /vllm-workspace/pd-metrics-output/report.html --html &&
-"$PD_PYTHON" tools/pd_request_json.py prefill.log decode.log -o /vllm-workspace/pd-metrics-output/requests.json &&
-"$PD_PYTHON" tools/pd_grafana_json.py /vllm-workspace/pd-metrics-output/report.json -o /vllm-workspace/pd-metrics-output/rows.json
+PD_OUTPUT=/vllm-workspace/pd-compact-output
+mkdir -p "$PD_OUTPUT"
+"$PD_PYTHON" tools/pd_metrics_report.py prefill.log decode.log -o "$PD_OUTPUT/report.json" --html &&
+"$PD_PYTHON" tools/pd_request_json.py prefill.log decode.log -o "$PD_OUTPUT/requests.json" &&
+"$PD_PYTHON" tools/pd_grafana_json.py "$PD_OUTPUT/report.json" -o "$PD_OUTPUT/rows.json"
 ```
 
-For Grafana rows only, convert raw logs in one command without intermediate files:
+Alternatively, use `pd_grafana_json.py --logs prefill.log decode.log -o rows.json`.
+The export contains `nodes`, `requests`, `observations`, `tasks`, `pd_transfers`
+and `quality`, plus explicit transport links. Request JSON is always an array of
+schema-2 request/observation objects containing the same canonical nodes. Report
+HTML is auxiliary and written beside report JSON. Invalid or absent diagnostic
+records exit 2 before output writes; a pre-existing file may still be stale.
+Stop on failure. Supplying P alone does not synthesize D.
+
+### Isolated Grafana snapshot
+
+The source delivery includes `tools/grafana_rows_api.py`,
+`tools/grafana_pd_compact_dashboard.json` and
+`tools/deploy_pd_compact_dashboard.py`. These replace no live integration assets.
 
 ```bash
-"$PD_PYTHON" tools/pd_grafana_json.py --logs prefill.log decode.log -o rows.json
+"$PD_PYTHON" tools/grafana_rows_api.py "$PD_OUTPUT/rows.json" --host 127.0.0.1 --port 8766
+# In another terminal, prepare independent data/log/provisioning directories:
+"$PD_PYTHON" tools/deploy_pd_compact_dashboard.py "$PD_OUTPUT/grafana" --api-url http://127.0.0.1:8766 --plugins /path/to/existing/grafana/plugins
 ```
 
-Malformed diagnostic records or logs without diagnostic records cause exit code 2
-before writing output. The existing report-JSON input remains supported.
+Start the existing Grafana binary using the generated `grafana.ini` and its normal
+homepath. It binds to loopback port **3033** with independent data and log paths.
+The generator starts/stops no services. JSON API plugin
+`marcusolsson-json-datasource` must already be available. For remote/container
+Grafana choose an API URL reachable by that Grafana server; loopback names its
+own container/host. Do not point the original API at the new output.
 
-### 已有日志：一步生成 Grafana JSON
+The adapter loads once at startup; restart only the isolated adapter after new
+conversion. `/requests`, `/sides?request_key=KEY`,
+`/node_options?request_key=KEY&side=P` and
+`/nodes?request_key=KEY&side=P&parent_id=__root` implement Request → Side →
+Parent/node drilldown. A node label opens its children; Parent node → L1 groups
+returns to the three roots. The links panel navigates HTTP observations to actual
+requests. Official statistics select one side. Empty arrays mean no evidence,
+not measured zero. The snapshot is not filtered by Grafana's time picker.
 
-在可以读取本次 P/D 日志的机器执行；不要求 NPU，也不导入 vLLM、torch
-或 numpy。将 `pd_grafana_json.py` 和同版本 `pd_metrics_report.py` 放在同一
-目录。转换不会采集远程日志或重启服务，不需要手动 grep 或拼接文件。
+### Deterministic synthetic smoke input
 
 ```bash
-/usr/local/python3.12.16/bin/python \
-  /vllm-workspace/vllm/tools/pd_grafana_json.py \
-  --logs log_prefill.log log_decode.log \
-  -o rows.json
+"$PD_PYTHON" tools/pd_compact_fixture.py "$PD_OUTPUT/fixture"
+"$PD_PYTHON" tools/pd_metrics_report.py "$PD_OUTPUT/fixture/synthetic-P.log" "$PD_OUTPUT/fixture/synthetic-D.log" -o "$PD_OUTPUT/report.json" --html
+"$PD_PYTHON" tools/pd_grafana_json.py "$PD_OUTPUT/report.json" -o "$PD_OUTPUT/rows.json"
 ```
 
-将两个日志名替换成实际路径；只有 P 日志就只传 P 文件，有多个 Worker 日志
-就继续列在 `--logs` 后。相对路径按当前目录解释，输出父目录需存在。
-成功输出 `N requests; M observations -> rows.json`；N/M 来自实际日志。
-已有同名结果会被覆盖。当前入口不生成 report.json 或 requests.json。
+This deterministic fixture exercises explicit P/D links, HTTP observation-only
+bridges, mixed requests, execute/sample ranks, repeated/zero/skipped/error stages,
+request-generation/task separation, bounded drops and native matching/mismatch.
+It is **SYNTHETIC**, not inference, throughput, TTFT or a real D production run.
+`tests/tools/test_pd_compact.py` covers the reader/export/adapter contracts and
+actual CLI outputs. Parent release verification must separately exercise the
+isolated Grafana/API surfaces. CPU synthetic checks do not validate native C++
+execution, NPU serving, model output, or distributed performance.
 
-```bash
-/usr/local/python3.12.16/bin/python -c 'import json; d=json.load(open("rows.json")); print({k:len(d[k]) for k in ("requests","observations","tasks","hbm","pd_transfers","quality")})'
-```
-
-- `No module named pd_metrics_report`：配套模块未放在脚本同目录。
-- `No diagnostic records found`：日志没有可识别打点，核对 `[PD_DIAG]`、
-  服务是否在代码更新后重启、是否收集了正确进程的日志。
-- `Invalid diagnostic records`：按报错文件和行号检查截断或损坏记录。
-- `quality` 多或字段为 null：核查缺失日志及身份关联证据，不补零。
-
-无打点或非法打点以 2 退出、不写新结果；旧 rows.json 仍可能存在，失败后
-不要继续使用旧文件。只提供 P 日志不会得到 D 的完整数据。
-
-rows.json 是数据文件，不是 dashboard 导入文件。把它交给现有 rows HTTP API，
-让 API 改读该路径并重启，再刷新 Grafana。API 若只在启动时加载数据，每次转换
-新日志后均需重启。Grafana 服务端必须能访问 API；跨容器不能照抄 loopback 地址。
-
-The HTML report starts with five non-additive mainline groups:
-
-1. API input: req_resolve, render, tokenize, input assembly, registration, send.
-2. EngineCore receipt, initialization/block hash, input queue residence,
-   scheduler queue/schedule, and execute submission.
-3. Worker input_prepare, forward, logits, sample, draft, output_build, and KV
-   load/save entry points.
-4. EngineCore result collection, scheduler update, output queue, and send.
-5. API output receipt and the official endpoint.
-
-These are process-owned navigation groups, not five latency totals or dozens
-of additive TTFT components. Core return traffic is not placed inside API
-output processing. A single step × TP table shows shared schedule details,
-Worker stages, and horizontal `wait_for_save` columns for Pool queue/key/lookup/
-prepare/sync work and Mooncake put start/submit/wait/finalize. Save tasks must
-have one explicit execution and a unique matching Worker lifecycle/rank before
-their values enter that row. Neither tasks nor native phases are added to the
-connector boundary.
-Missing stage timing is distinct from a task with no work.
-Request-level detokenizer is supplemental work outside the official endpoint,
-not a sixth stage or part of stage five; it is never copied into TP rows.
-
-`engine_input_received` marks successful input decoding;
-`engine_request_init` spans the original preprocessing call. Input queue
-positions pair by complete host/PID/run identity and `input_message_id`.
-Older evidence without a message ID can pair only a unique request-ID pair;
-repeated streaming/resume handoffs remain ambiguous rather than being zipped
-or matched by proximity. Output queue positions pair by the same clock domain
-and `output_batch_id`. Queue residence uses explicit `queue_enter_ns` and
-`queue_exit_ns`, not log-emission timestamps or time blocked on an empty get.
-Missing, inverted, incomplete, or ambiguous pairs remain unknown, not zero.
-
-`engine_output_send` measures the shared batch's encoding and host send call;
-it does not establish transport completion. The optional `output_batch_id`
-links Core output positions/send to `api_output_received` and
-`api_output_endpoint` as identity evidence only. Old outputs lacking the ID
-remain usable without an invented batch or latency. `api_output_received`
-preserves the handler's actual local acquisition boundary in `received_ns`,
-separate from emission time. API endpoint
-`iteration_timestamp` reuses the existing `IterationStats` wall timestamp;
-it is not subtracted from monotonic clocks or used to redefine native TTFT.
-The emitter's `timestamp_ns` is process-local monotonic evidence, not a
-cross-host timeline.
-
-`engine_batch_enqueued` and `engine_batch_dequeued` retain execution-position
-evidence but are not timers. Even historical records with tiny pass-span
-durations are displayed as instantaneous positions, not latency. Business
-aliases retain their real source events: req_build is the single `input_process`
-assembly timer, req_send is `engine_submit`, and req_resolve is `api_resolve`.
-Registration and ID-link positions use `frontend_request_registered` and
-`request_id_link`, not invented `req_register` or `events` timers. req_resolve
-measures ASGI ingress to the typed handler, usually outside the official request
-start; it is not labeled model/business validation. No renamed-timer
-compatibility layer is introduced.
-
-Each request has one request-level row, followed by its compute step rows.
-The TP column starts inside the Worker header. Request/step identity and non-TP
-cells merge across each step's Worker rows. Explicit `no_forward` rounds without
-a measured forward remain in collapsed maintenance evidence; no duration cutoff
-is used, and short measured forward calls remain visible. Assembly and send are
-timers; instantaneous ID matching/registration stay in raw evidence, not columns.
-
-The primary table omits preprocessing initialization, input-queue residence,
-output send timing, and Mamba-state copy. These observations remain available
-in raw evidence; hiding a column does not remove instrumentation. Initialization
-and output send are host-call timers, and input-queue residence is an interval,
-not an instantaneous event. The per-step `block hash` column measures actual
-hash computation with explicit execution identity, not queue time or a request
-cumulative value. It is separate from the schedule header: hashes may be computed
-during output update. Initial prompt hashes normally precede the first schedule
-and have no execution identity. Missing per-step ranges display as no step record,
-not measured zero or proof that hash computation did not run.
-
-The second-level `schedule` header spans `local lookup / external lookup /
-alloc / other` alongside its batch total. In multi-request batches, local lookup and
-allocation cells list request-specific `scheduler_kv_range` values, with the
-batch aggregate in the tooltip. Only hash ranges with an original execution ID
-enter the step column; request cumulative hash stays in raw evidence.
-These detail columns are not promised to form an additive decomposition.
-
-`wait_for_save` is shown on the Worker TP row as the connector boundary. It is
-not an additive breakdown of asynchronous Pool work: after save submission, a
-background task continues in its own process/thread lifecycle. The same TP row
-shows enqueue, queue wait, build_key, lookup, prepare, sync, Python put, native
-phase1–4, keys/MiB, status, and task ID under nested headers. Submission tasks
-fill enqueue only, without missing placeholders in backend columns. Native
-split scopes merge by their unique `pool_native_call` boundary. Within each
-task, phases accumulate over distinct calls, with call count and per-call values
-in tooltips; repeated same-phase evidence stays unknown. Totals with different
-scope are not added. `no_task` means no save work, not failed request association.
-Unbound or cross-step tasks remain in collapsed evidence. Load entry timing does
-not prove transfer completion, and missing independent transfer-wait timings
-are not inferred. The ordinary-step control flow is displayed above the table:
-EngineCore schedules and dispatches execute, conditionally dispatches sampling,
-then updates from the result. Batch-queue execution may overlap steps; column
-order is not a universal timeline. Worker execute/sample interval coverage
-remains separate from request TTFT and is not a request residual.
-
-The request and step columns stay fixed during horizontal scrolling. The request
-selector filters rows; detailed provenance and raw JSON are collapsed last.
-Prefill-only logs are supported: omit `decode.log` to inspect P without D.
-Explicit lifecycle and transport links establish request association. Ambiguous
-reused IDs remain visible candidates and do not contribute durations to a request.
-Scheduler and mixed-task work stays shared; TP rows are never summed.
-Missing, zero, skipped, and fused observations are displayed distinctly.
-Derived dashboard fields do not change the source schema-v1 observations.
-
-`scheduler_external_lookup` measures the existing connector call, including
-attempts that cannot yet be scheduled. Each schedule summary retains its
-`external_lookup_ns` and excludes it from `other_ns`. Request hash ranges remain
-request-level unless an explicit execution identity is present; truncated ranges
-are marked incomplete. Engine `update_from_output`, released-request save fences,
-and P/D metadata/preparation/reformat boundaries are displayed separately.
-
-The report also reads `[BatchPutTiming]` and `[BatchUpsertTiming]` text records.
-For each whole-key native put, the paired Ascend code emits `pool_native_call`
-with its task identity, native TID, wall-clock start/end, source UTC offset, and
-submitted keys/bytes. The report requires the same input source and thread, one
-matching wall-clock call interval, and agreement with any native keys/bytes.
-Glog timestamp precision is respected; a timestamp bucket overlapping multiple
-calls remains ambiguous. The source offset is used, not the reporting machine's
-timezone. Matching phases appear in the original save task's put cells.
-
-Thread ownership alone cannot select a put or request. Logs lacking a usable
-call boundary remain in collapsed pending evidence, not a detached main-table
-native row or a guessed task. The `phase1_only`, `prefer_same_node_remaining`,
-and `normal_full` scopes stay distinct; the remaining-path total excludes phase 1.
-
-For raw-log inspection:
-
-```bash
-grep -E '"event":"(scheduler_external_lookup|engine_scheduler_update|request_hash_ranges|pool_save_fence)"' prefill.log
-grep -E '"event":"pd_transfer_(meta_fetch|prepare|reformat|batch_finished|task_finished)"' decode.log
-grep -E 'Batch(Put|Upsert)Timing|"native_tid":' prefill.log
-```
-
-The report does not add parallel TP intervals, subtract clocks from different
-processes, or treat submitted bytes as measured wire traffic. Missing evidence
-remains unknown. CPU regression checks do not establish NPU performance or
-distributed serving correctness; validate the paired build on the target stack.
-
-Request exports are available through `tools/pd_request_json.py` (raw logs to
-request JSON) and `tools/pd_grafana_json.py` (raw logs or report JSON to dashboard rows).
-Terminal `scheduler_queue_summary.decode_steps` counts decode scheduling
-iterations, including MTP iterations; observed execution counts are separate.
-`request_cache_lookup` reports effective HBM/connector hit boundaries, not
-successful KV loading. Request block references measure referenced capacity,
-not exclusive physical HBM allocation. P/D native batch timings and the
-first-to-last-batch request-generation envelope have separate scopes;
-submitted/succeeded/failed byte classifications are not measured wire bytes.
-Missing or conflicting evidence remains null with an explicit state.
-
-The report and request converters accept one or more original log paths, not
-report JSON or shell glob strings. Expand globs in Bash and use each original
-file once; do not also input a concatenated copy. The Grafana converter accepts
-exactly one **report JSON**, not raw logs or request JSON. Output directories
-must already exist. Report conversion writes parse errors to its JSON and exits
-with status 2 if any record is invalid; request conversion rejects invalid
-records before writing output. Stop the pipeline on either failure and inspect
-the original file/line instead of serving a stale rows file. Request JSON is
-one object for one request and an array for zero or multiple requests.
-
-P and D official summaries stay separate, including when explicit transport
-links associate them with one request. The report retains `native_summaries`;
-request JSON retains `request_summary_by_side.p/d`; Grafana rows retain
-`native_summary_by_side.P/D` and `p_ttft_ms`, `d_ttft_ms`, `p_e2e_ms`,
-`d_e2e_ms`, and side-specific token fields. Generic single-summary fields remain
-null when several summaries are present. Do not pick the first summary or add
-P and D TTFT/E2E into client latency. Missing role evidence remains unknown;
-the CLI does not accept a side manifest or infer side from filenames. Keep a
-collection manifest for the operator's deployment-side provenance.
-
-### Linux log capture
-
-On **each** container, retain the existing model, network and KV launch options.
-Set `PD_SIDE=P` on P and `PD_SIDE=D` on D. Replace only `PD_START_SCRIPT` with
-the existing serving startup script; this example runs that script in the
-foreground with its child API/Core/Worker output captured together:
-
-```bash
-set -o pipefail
-PD_SIDE=P
-PD_START_SCRIPT=/absolute/path/to/your/existing-start.sh
-PD_CAPTURE=/vllm-workspace/pd-metrics-logs/$PD_SIDE/$(date -u +%Y%m%dT%H%M%SZ)
-mkdir -p "$PD_CAPTURE"
-{
-  printf 'side=%s\nhost=%s\nstart_utc=%s\n' "$PD_SIDE" "$(hostname)" "$(date -u +%FT%TZ)"
-  printf 'source_timezone=%s\n' "$(date +%z)"
-  git -C /vllm-workspace/vllm rev-parse HEAD
-  git -C /vllm-workspace/vllm-ascend rev-parse HEAD
-  /usr/local/python3.12.16/bin/python -m pip show mooncake-transfer-engine
-} > "$PD_CAPTURE/manifest.txt"
-export VLLM_LOGGING_LEVEL=INFO PYTHONUNBUFFERED=1 GLOG_logtostderr=1
-bash "$PD_START_SCRIPT" 2>&1 | tee "$PD_CAPTURE/serving.log"
-```
-
-Start capture before startup and send the real request through the deployment's
-existing P/D entrypoint from another terminal. Keep capture through request
-termination and asynchronous save completion. The emitter uses INFO logging;
-there is no extra `PD_DIAG` enable flag. A custom logging configuration must
-retain that logger. `GLOG_logtostderr=1` requests native glog on stderr; if the
-launch script overrides logging, collect its actual native files too. A script
-that daemonizes or starts workers in other containers requires those workers'
-own complete log streams; this pipeline alone cannot capture detached output.
-
-For an already-running Docker service, capture from its Linux host using its
-actual container name, separately for P and D:
-
-```bash
-PD_CONTAINER=your-existing-p-container
-PD_CAPTURE=./pd-metrics-logs/P
-mkdir -p "$PD_CAPTURE"
-docker logs --timestamps --since 30m --follow "$PD_CONTAINER" > "$PD_CAPTURE/serving.log" 2>&1
-```
-
-Stop following only after the request and save work finish. Docker logs cover
-container stdout/stderr, not arbitrary files. Ascend's default file-handler
-directory is `~/ascend/log/vllm_ascend`, configurable by `ascend_log_path`;
-preserve the original and rotated files if that handler is active. Do not feed
-both file and stdout copies of the same native timing records. Preserve full
-lines, original source files, timezone and host/PID/TID/run identities. In
-particular, `pool_native_call` and matching `[BatchPutTiming]` /
-`[BatchUpsertTiming]` must remain in the same input source; filtering down to
-`[PD_DIAG]` alone loses native details. Copy P and D logs to one analysis host
-without overwriting their separate directories, then run the conversions above
-with the actual collected paths. Shared batch durations are never divided by
-member count; parallel TP and overlapping stages are never summed or subtracted
-from another process/host clock.
-
-### Grafana snapshot hand-off
-
-`rows.json` contains `requests`, `observations`, `tasks`, `hbm`, `pd_transfers`
-and `quality` arrays. It is a diagnostic snapshot, not Prometheus time-series
-data, and the Grafana time picker does not filter it. The companion delivery
-assets are outside this source repository: `ttft-patches/grafana_rows_api.py`,
-`ttft-patches/grafana_pd_request_dashboard.json`, and
-`ttft-patches/grafana-demo/README.md`. Stage the first two on Linux, for example
-under `/vllm-workspace/pd-grafana`, before starting the read-only adapter:
-
-```bash
-/usr/local/python3.12.16/bin/python /vllm-workspace/pd-grafana/grafana_rows_api.py /vllm-workspace/pd-metrics-output/rows.json --host 127.0.0.1 --port 8765
-```
-
-The adapter loads once at startup; restart it after regenerating rows. In a
-second terminal, `curl -fsS http://127.0.0.1:8765/requests` retrieves the request
-keys. Use `curl -fsS --get --data-urlencode 'request_key=KEY_FROM_REQUESTS'
-http://127.0.0.1:8765/observations` for one request; the other five endpoint
-names match the arrays above. An empty array means no rows for that scope,
-not measured zero. Install Grafana JSON API plugin
-`marcusolsson-json-datasource` (demo: 1.4.4 on Grafana OSS 12.0.2), create that
-datasource with the adapter base URL, import the delivered dashboard JSON, and
-select it in **Rows datasource**, then choose **Request**. For container/remote
-Grafana, configure an address reachable from the Grafana server; its loopback
-is not the analysis host's loopback. See the companion delivery guide for Linux
-Docker startup and exact import/query steps.
-
-The supplied sample log, sample JSON and portable Grafana screenshots are
-**synthetic demo data**, not Linux/NPU inference measurements. Keep the demo's
-synthetic labels; use a separately named dashboard for collected real logs and
-record their manifest. Null/missing evidence must remain null throughout
-Grafana queries and transformations. A rendered dashboard does not establish
-NPU execution or distributed inference correctness.
-
-### Paired P/D container deployment
-
-Use `tools/deploy_pd_metrics_d.sh` on both P and D. Copy it outside the two
-source roots, for example `/vllm-workspace/deploy_pd_metrics_d.sh`, before
-deployment so source checkout cannot remove the rollback entrypoint. Stop
-serving and transfer-client workers through the normal supervisor first;
-leave the independent shared `mooncake_master` running.
-
-Use the final verified and published 40-character core commit supplied with the
-release, for both the downloaded script and the explicit source override:
-
-```bash
-PD_RELEASE_CORE=FINAL_VERIFIED_PUBLISHED_40_CHARACTER_CORE_SHA
-curl -fL "https://raw.githubusercontent.com/Emtemf/vllm/$PD_RELEASE_CORE/tools/deploy_pd_metrics_d.sh" -o /vllm-workspace/deploy_pd_metrics_d.sh &&
-PD_DEPLOY_CORE_PIN="$PD_RELEASE_CORE" \
-PD_DEPLOY_ASCEND_PIN=afdbf1e3e3057b32cfe22075244e552a25113330 \
-bash /vllm-workspace/deploy_pd_metrics_d.sh --apply
-```
-
-The default interpreter is `/usr/local/python3.12.16/bin/python`; Git and the
-interpreter's existing pip/packaging are required, not uv. The existing editable
-roots must be `/vllm-workspace/vllm` and `/vllm-workspace/vllm-ascend`, or supplied
-through `--vllm-dir` and `--ascend-dir`. Existing compiled extensions and editable
-registration are preserved; vLLM and Ascend are not rebuilt or reinstalled.
-
-The script's committed default core pin is
-`f8b9de31a9e3a1b8ad76dee78917534121be39d1`, and its imagebase Ascend pin is
-`afdbf1e3e3057b32cfe22075244e552a25113330`. These identities alone do not prove
-publication or final release validation. The final release command must use
-`PD_DEPLOY_CORE_PIN` for the newer verified commit; do not pull a newer branch
-and then apply an older default. It fetches missing history before checking
-both approved baselines, refuses unrelated or dirty trees, saves source identity
-and wheel copies, then switches to detached commits. The original branch tips
-remain available for rollback.
-
-Compatible `mooncake-transfer-engine==0.3.13` diagnostic wheels are discovered
-under known Mooncake build directories and `/vllm-workspace` staging. Distinct
-valid builds are ambiguous; identical copies are deduplicated. The candidate
-must contain Ascend transport, store, master and `BatchPutTiming`. If it already
-matches the installed payload, it also provides exact rollback. Otherwise the
-script locates the exact original wheel or downloads the image's official
-Huawei wheel over verified HTTPS and compares its payload with the installed
-files before accepting it. Optional `--wheel` and `--backup-wheel` select explicit
-files. If P's build directory is not mounted on D, copy the built `.whl` from
-`/data/y00624827/Mooncake-wheelbase/mooncake-wheel/dist/` into
-`/vllm-workspace/wheels/` on D. No compatible artifact means no cutover.
-
-`--check` performs no Git fetch, checkout, installation or data-file writes;
-it may validate an absent original wheel through an in-memory HTTPS download.
-`--apply` installs only the saved Mooncake wheel through the selected
-interpreter's `-m pip install --no-index --force-reinstall --no-deps`.
-Keep the printed state directory and rollback command. Rollback restores the
-recorded source branches/commits and exact prior wheel payload; changed source
-or saved wheel state is refused. No mode stops or restarts services. Restart
-each service with its existing launch command after successful deployment,
-complete a real request, and collect full API/core/worker logs from both sides.
-CPU checks do not establish Linux/NPU serving or model correctness.
-
+Capture real logs on each deployment with the existing launch command and
+`VLLM_LOGGING_LEVEL=INFO PYTHONUNBUFFERED=1 GLOG_logtostderr=1`. Retain complete
+API/Core/Worker and native streams until asynchronous tasks finish, with a
+collection manifest containing branch/base/commit, host, source timezone and
+wheel identity. Do not filter to `[PD_DIAG]` alone or overwrite P with D logs.
+`tools/deploy_pd_metrics_d.sh` belongs to the ongoing integration's pinned
+deployment workflow; it is not a compact release deployment script. A compact
+source/wheel deployment requires the separately verified matched release bundle
+and target-stack validation, with no service restart implied by conversion.
 
 ## Background
 

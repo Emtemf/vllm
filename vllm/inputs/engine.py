@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, NotRequired, TypeAlias, assert_never
+from typing import TYPE_CHECKING, Any, Literal, NotRequired, TypeAlias, assert_never
 
 from typing_extensions import TypedDict
 
@@ -25,6 +25,9 @@ class _InputOptions(TypedDict):
 
     cache_salt: NotRequired[str]
     """Optional cache salt to be used for prefix caching."""
+
+    pd_tokenization: NotRequired[dict[str, Any]]
+    """Explicit process-local tokenizer boundary, carried independently per input."""
 
 
 class TokensInput(_InputOptions):
@@ -254,6 +257,9 @@ class EncoderDecoderInput(TypedDict):
 
     arrival_time: NotRequired[float]
     """The time when the input was received (before rendering)."""
+
+    pd_tokenization: NotRequired[dict[str, Any]]
+    """Boundary of the last actual encoder/decoder tokenizer to finish."""
 
 
 SingletonInput: TypeAlias = DecoderOnlyEngineInput | MultiModalEncDecInput

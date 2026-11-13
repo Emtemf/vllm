@@ -3,7 +3,7 @@
 
 import itertools
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import wraps
 from typing import Literal, overload
@@ -27,8 +27,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
-from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.metrics import pd_diagnostics as diag
+from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
@@ -40,17 +40,7 @@ def _pd_range(stage: str):
     def decorate(method):
         @wraps(method)
         def observed(self, *args, **kwargs):
-            request = (
-                args[0] if args else kwargs.get("request", kwargs.get("request_id"))
-            )
-            request_id = (
-                request
-                if isinstance(request, str)
-                else getattr(request, "request_id", None)
-            )
             outer = self._pd_range_depth == 0
-            if outer and stage in ("free", "detach_for_deferred_free"):
-                self.pd_resource_snapshot((request_id,))
             self._pd_range_depth += 1
             start_ns = time.monotonic_ns()
             status = "ok"
@@ -61,7 +51,12 @@ def _pd_range(stage: str):
                     status = "unavailable"
                 return result
             except BaseException as exc:
-                status = "error"
+                status = (
+                    "cancelled"
+                    if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                    or type(exc).__name__ == "CancelledError"
+                    else "error"
+                )
                 error_type = type(exc).__name__
                 raise
             finally:
@@ -71,34 +66,15 @@ def _pd_range(stage: str):
                     self.pd_stage_ns[stage] = (
                         self.pd_stage_ns.get(stage, 0) + end_ns - start_ns
                     )
-                    diag.emit(
-                        "scheduler_kv_range",
-                        stage=stage,
-                        request_id=request_id,
-                        start_ns=start_ns,
-                        end_ns=end_ns,
-                        duration_ns=end_ns - start_ns,
-                        status=status,
-                        error_type=error_type,
-                    )
-                    if stage == "alloc":
-                        self.pd_resource_snapshot((request_id,))
-                    if stage in ("free", "detach_for_deferred_free"):
-                        diag.emit(
-                            "kv_cache_release",
-                            request_id=request_id,
-                            lifecycle=stage,
+                    batch = diag.current_batch()
+                    if batch is not None and stage in ("lookup", "alloc"):
+                        batch.add_stage(
+                            stage,
+                            start_ns=start_ns,
+                            end_ns=end_ns,
                             status=status,
-                            references_detached=status == "ok",
-                            # Other requests/cache may retain the same pages.
-                            physical_pages_released=None,
+                            error_type=error_type,
                         )
-                        self.pd_resource_snapshot(())
-                        if not isinstance(request, str) and request.is_finished():
-                            for group_id in range(self.num_kv_cache_groups):
-                                self._pd_request_peak_pages.pop(
-                                    (request_id, group_id), None
-                                )
 
         return observed
 
@@ -277,9 +253,6 @@ class KVCacheManager:
         self.kv_cache_config = kv_cache_config
         self._pd_range_depth = 0
         self.pd_stage_ns: dict[str, int] = {}
-        self._pd_worker_layouts: list[dict] = []
-        self._pd_peak_used_pages = 0
-        self._pd_request_peak_pages: dict[tuple[str, int], int] = {}
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -339,121 +312,6 @@ class KVCacheManager:
             num_hits=num_hits,
             preempted=request.num_preemptions > 0,
         )
-
-    def pd_configure(self, configs: list[KVCacheConfig]) -> None:
-        """Snapshot real worker specs before the scheduler simplifies them."""
-        self._pd_worker_layouts = []
-        for index, config in enumerate(configs):
-            groups = []
-            for group_id, group in enumerate(config.kv_cache_groups):
-                spec = group.kv_cache_spec
-                layer_specs = getattr(spec, "kv_cache_specs", None)
-                page_bytes = (
-                    sum(layer.page_size_bytes for layer in layer_specs.values())
-                    if layer_specs is not None
-                    else spec.page_size_bytes * len(group.layer_names)
-                )
-                groups.append({
-                    "group_id": group_id, "page_bytes": page_bytes,
-                    "host_resident": group.host_resident,
-                    "block_size_tokens": spec.block_size,
-                })
-            # Tensor descriptions alias one backing allocation per residency
-            # domain; summing each tensor.size would count overlays repeatedly.
-            device_sizes = {
-                tensor.size for tensor in config.kv_cache_tensors
-                if not tensor.host_resident
-            }
-            layout = {
-                "worker_config_index": index, "groups": groups,
-                "configured_device_backing_bytes": (
-                    next(iter(device_sizes)) if len(device_sizes) == 1
-                    else (0 if not device_sizes else None)
-                ),
-                "device_allocation_measured_bytes": None,
-                "num_pool_pages_including_null": config.num_blocks,
-                "source": "executor_worker_kv_cache_config",
-            }
-            backing_bytes = layout["configured_device_backing_bytes"]
-            layout["physical_pool_slot_bytes"] = (
-                backing_bytes // config.num_blocks
-                if backing_bytes is not None and config.num_blocks > 0
-                and backing_bytes % config.num_blocks == 0 else None
-            )
-            self._pd_worker_layouts.append(layout)
-            diag.emit("kv_cache_layout", **layout)
-
-    def pd_resource_snapshot(self, request_ids: Iterable[str]) -> None:
-        """Observe references and physical pool slots without summing aliases."""
-        try:
-            free = self.block_pool.get_num_free_blocks()
-            used = self.kv_cache_config.num_blocks - free - 1
-            self._pd_peak_used_pages = max(self._pd_peak_used_pages, used)
-            diag.emit(
-                "kv_cache_pool", free_pages=free,
-                unavailable_unique_pages=used, reserved_null_pages=1,
-                peak_unavailable_unique_pages=self._pd_peak_used_pages,
-                cached_unique_pages=len(self.block_pool.cached_block_hashes_by_block),
-                configured_pool_pages=self.kv_cache_config.num_blocks,
-                device_allocation_measured_bytes=None,
-                source="device_block_pool",
-            )
-            for layout in self._pd_worker_layouts:
-                slot_bytes = layout["physical_pool_slot_bytes"]
-                diag.emit(
-                    "kv_cache_physical_use",
-                    worker_config_index=layout["worker_config_index"],
-                    unavailable_unique_pages=used,
-                    physical_pool_slot_bytes=slot_bytes,
-                    occupied_pool_slot_bytes=used * slot_bytes if slot_bytes is not None else None,
-                    peak_occupied_pool_slot_bytes=(
-                        self._pd_peak_used_pages * slot_bytes
-                        if slot_bytes is not None else None
-                    ),
-                    configured_device_backing_bytes=layout["configured_device_backing_bytes"],
-                    device_allocation_measured_bytes=None,
-                    source="unique_device_pool_slots_times_configured_slot_bytes",
-                )
-            for request_id in request_ids:
-                blocks = self.coordinator.get_blocks(request_id)
-                groups = []
-                for group_id, group_blocks in enumerate(blocks):
-                    pages = {id(block): block for block in group_blocks if not block.is_null}
-                    peak_key = (request_id, group_id)
-                    peak_pages = max(
-                        self._pd_request_peak_pages.get(peak_key, 0), len(pages)
-                    )
-                    self._pd_request_peak_pages[peak_key] = peak_pages
-                    groups.append({
-                        "group_id": group_id,
-                        "referenced_unique_pages": len(pages),
-                        "peak_referenced_unique_pages": peak_pages,
-                        "shared_pages": sum(block.ref_cnt > 1 for block in pages.values()),
-                        "reference_slots": sum(not block.is_null for block in group_blocks),
-                    })
-                for layout in self._pd_worker_layouts:
-                    references = []
-                    for group in groups:
-                        spec = layout["groups"][group["group_id"]]
-                        references.append({
-                            **group, "page_bytes": spec["page_bytes"],
-                            "host_resident": spec["host_resident"],
-                            "request_referenced_bytes": (
-                                group["referenced_unique_pages"] * spec["page_bytes"]
-                            ),
-                            "peak_request_referenced_bytes": (
-                                group["peak_referenced_unique_pages"] * spec["page_bytes"]
-                            ),
-                        })
-                    diag.emit(
-                        "kv_cache_request", request_id=request_id,
-                        worker_config_index=layout["worker_config_index"],
-                        groups=references, source="allocated_block_references",
-                        physical_allocation_bytes=None,
-                    )
-        except Exception:
-            # Observability must not turn bookkeeping into an inference failure.
-            diag.emit("kv_cache_observation_incomplete", complete=False)
 
     @_pd_range("lookup")
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:

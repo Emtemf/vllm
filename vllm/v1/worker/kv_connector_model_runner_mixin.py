@@ -60,10 +60,9 @@ class KVConnectorModelRunnerMixin:
             kv_connector = get_kv_transfer_group()
             context = getattr(kv_connector, "_pd_deferred_context", None)
             try:
-                with diag.scope(**(context or {})), diag.span(
-                    "kv.save_wait", deferred=True
-                ):
-                    kv_connector.wait_for_save()
+                with diag.scope(**(context or {})):
+                    with diag.span("kv.save_wait", deferred=True):
+                        kv_connector.wait_for_save()
                     kv_connector.clear_connector_metadata()
             finally:
                 kv_connector._pd_deferred_context = None

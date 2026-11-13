@@ -5,6 +5,7 @@ import os
 import socket
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping
+from contextlib import contextmanager
 from copy import copy
 from typing import Any
 
@@ -68,6 +69,57 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
+
+
+@contextmanager
+def _api_submission(request_id: str, *, stream_input: bool = False):
+    """Close only this frontend lifecycle, never await later request evidence."""
+    frontend = diag.current_batch()
+    submission_id = diag.new_id("api_submission")
+    owner = diag.Batch(
+        "api_summary",
+        scope="engine_input" if stream_input else "engine_submission",
+        external_req_id=request_id,
+        submission_id=submission_id,
+        official_status="pending",
+        request_completion="pending",
+    )
+    if frontend is not None:
+        frontend.add_link(
+            "engine_input" if stream_input else "engine_submission",
+            submission_id=submission_id,
+            external_req_id=request_id,
+        )
+        owner.add_link(
+            "frontend",
+            observation_id=diag.current().get("observation_id"),
+            submission_id=diag.current().get("submission_id"),
+        )
+    status = "accepted"
+    error_type = None
+    try:
+        with diag.scope(submission_id=submission_id), diag.collect(owner):
+            yield owner
+    except BaseException as exc:
+        status = (
+            "cancelled"
+            if isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+            else "rejected"
+            if isinstance(exc, (VLLMClientError, GracefulHTTPError))
+            else "error"
+        )
+        error_type = type(exc).__name__
+        raise
+    finally:
+        if status == "accepted" and owner.fields.get("input_status") is not None:
+            status = owner.fields["input_status"]
+            error_type = owner.fields.get("input_error_type")
+        owner.finish(
+            status=status,
+            complete=status == "accepted",
+            error_type=error_type,
+            completion="input_closed" if stream_input else "submission_returned",
+        )
 
 
 class InputStreamError(Exception):
@@ -407,166 +459,261 @@ class AsyncLLM(EngineClient):
         kv_hints: KvHintsEnvelope | None = None,
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
-        diag.emit("engine_add_request", external_req_id=request_id)
-        if self.errored:
-            raise EngineDeadError()
+        with _api_submission(request_id) as submission:
+            if self.errored:
+                raise EngineDeadError()
 
-        if trace_headers and self.observability_config.otlp_traces_endpoint is None:
-            log_tracing_disabled_warning()
-            trace_headers = None
+            if trace_headers and self.observability_config.otlp_traces_endpoint is None:
+                log_tracing_disabled_warning()
+                trace_headers = None
 
-        is_pooling = isinstance(params, PoolingParams)
+            is_pooling = isinstance(params, PoolingParams)
 
-        if (
-            self.vllm_config.cache_config.kv_sharing_fast_prefill
-            and not is_pooling
-            and params.prompt_logprobs
-        ):
-            raise VLLMValidationError(
-                "--kv-sharing-fast-prefill produces incorrect logprobs for "
-                "prompt tokens, please disable it when the requests need "
-                "prompt logprobs"
-            )
+            if (
+                self.vllm_config.cache_config.kv_sharing_fast_prefill
+                and not is_pooling
+                and params.prompt_logprobs
+            ):
+                raise VLLMValidationError(
+                    "--kv-sharing-fast-prefill produces incorrect logprobs for "
+                    "prompt tokens, please disable it when the requests need "
+                    "prompt logprobs"
+                )
 
-        if isinstance(prompt, AsyncGenerator):
-            if reasoning_ended is not None or reasoning_parser_kwargs is not None:
-                raise NotImplementedError
+            if isinstance(prompt, AsyncGenerator):
+                if reasoning_ended is not None or reasoning_parser_kwargs is not None:
+                    raise NotImplementedError
 
-            # Streaming input case.
-            return await self._add_streaming_input_request(
-                request_id,
-                prompt,
-                params,
-                arrival_time,
-                lora_request,
-                tokenization_kwargs,
-                trace_headers,
-                priority,
-                data_parallel_rank,
-                session_id,
-                kv_hints,
-            )
+                # Streaming input case.
+                return await self._add_streaming_input_request(
+                    request_id,
+                    prompt,
+                    params,
+                    arrival_time,
+                    lora_request,
+                    tokenization_kwargs,
+                    trace_headers,
+                    priority,
+                    data_parallel_rank,
+                    session_id,
+                    kv_hints,
+                )
 
-        # Convert Input --> Request.
-        if isinstance(prompt, EngineCoreRequest):
-            logger.warning_once(
-                "Passing EngineCoreRequest to AsyncLLM.generate() and .add_requests() "
-                "is deprecated and will be removed in the future. You should "
-                "instead pass the outputs of Renderer.render_cmpl() or "
-                "Renderer.render_chat()."
-            )
-
-            request = prompt
-            if request_id != request.request_id:
+            # Convert Input --> Request.
+            if isinstance(prompt, EngineCoreRequest):
                 logger.warning_once(
-                    "AsyncLLM.add_request() was passed a request_id parameter that "
-                    "does not match the EngineCoreRequest.request_id attribute. The "
-                    "latter will be used, and the former will be ignored."
+                    "Passing EngineCoreRequest to AsyncLLM.generate() "
+                    "and .add_requests() "
+                    "is deprecated and will be removed in the future. You should "
+                    "instead pass the outputs of Renderer.render_cmpl() or "
+                    "Renderer.render_chat()."
                 )
-            request_params = request.params
-            if isinstance(request_params, SamplingParams):
-                # This request object is owned by the engine from here on.
-                self.input_processor.apply_watermarking(
-                    request_params,
-                    self.input_processor.resolve_watermarking(request_params),
-                )
-        else:
-            if isinstance(prompt, dict) and "type" in prompt:
-                # Rendered EngineInput; no blocking preprocessing needed.
-                request = self.input_processor.process_inputs(
-                    request_id,
-                    prompt,
-                    params,
-                    supported_tasks=await self.get_supported_tasks(),
-                    arrival_time=arrival_time,
-                    lora_request=lora_request,
-                    tokenization_kwargs=tokenization_kwargs,
-                    trace_headers=trace_headers,
-                    priority=priority,
-                    data_parallel_rank=data_parallel_rank,
-                    session_id=session_id,
-                    kv_hints=kv_hints,
-                )
+
+                request = prompt
+                request.pd_identity = {
+                    key: submission.fields[key]
+                    for key in (
+                        "observation_id",
+                        "external_req_id",
+                        "api_request_id",
+                        "submission_id",
+                        "parent_request_id",
+                        "prompt_index",
+                        "choice_index",
+                    )
+                    if submission.fields.get(key) is not None
+                } or None
+                if request_id != request.request_id:
+                    logger.warning_once(
+                        "AsyncLLM.add_request() was passed a request_id parameter that "
+                        "does not match the EngineCoreRequest.request_id "
+                        "attribute. The "
+                        "latter will be used, and the former will be ignored."
+                    )
+                request_params = request.params
+                if isinstance(request_params, SamplingParams):
+                    # This request object is owned by the engine from here on.
+                    self.input_processor.apply_watermarking(
+                        request_params,
+                        self.input_processor.resolve_watermarking(request_params),
+                    )
             else:
-                # Raw prompts require tokenization and possibly multimodal
-                # processing, which must not block the event loop.
-                request = await self.input_processor.process_inputs_async(
-                    request_id,
-                    prompt,
-                    params,
-                    supported_tasks=await self.get_supported_tasks(),
-                    arrival_time=arrival_time,
-                    lora_request=lora_request,
-                    tokenization_kwargs=tokenization_kwargs,
-                    trace_headers=trace_headers,
-                    priority=priority,
-                    data_parallel_rank=data_parallel_rank,
-                    session_id=session_id,
-                    kv_hints=kv_hints,
+                if isinstance(prompt, dict) and "type" in prompt:
+                    # Rendered EngineInput; no blocking preprocessing needed.
+                    request = self.input_processor.process_inputs(
+                        request_id,
+                        prompt,
+                        params,
+                        supported_tasks=await self.get_supported_tasks(),
+                        arrival_time=arrival_time,
+                        lora_request=lora_request,
+                        tokenization_kwargs=tokenization_kwargs,
+                        trace_headers=trace_headers,
+                        priority=priority,
+                        data_parallel_rank=data_parallel_rank,
+                        session_id=session_id,
+                        kv_hints=kv_hints,
+                    )
+                else:
+                    # Raw prompts require tokenization and possibly multimodal
+                    # processing, which must not block the event loop.
+                    request = await self.input_processor.process_inputs_async(
+                        request_id,
+                        prompt,
+                        params,
+                        supported_tasks=await self.get_supported_tasks(),
+                        arrival_time=arrival_time,
+                        lora_request=lora_request,
+                        tokenization_kwargs=tokenization_kwargs,
+                        trace_headers=trace_headers,
+                        priority=priority,
+                        data_parallel_rank=data_parallel_rank,
+                        session_id=session_id,
+                        kv_hints=kv_hints,
+                    )
+                prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+
+            if reasoning_ended is not None:
+                request.reasoning_ended = reasoning_ended
+            if reasoning_parser_kwargs is not None:
+                request.reasoning_parser_kwargs = reasoning_parser_kwargs
+
+            self.input_processor.assign_request_id(request)
+
+            # We start the output_handler on the first call to add_request() so
+            # we can call __init__ before the event loop, which enables us
+            # to handle startup failure gracefully in the OpenAI server.
+            self._run_output_handler()
+
+            # Create a new output collector for the request.
+            queue = RequestOutputCollector(params.output_kind, request.request_id)
+
+            # Use cloned params that may have been updated in process_inputs()
+            params = request.params
+
+            if is_pooling or params.n == 1:
+                await self._add_request(
+                    request, prompt_text, None, 0, queue, owner=submission
                 )
-            prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+                return queue
 
-        if reasoning_ended is not None:
-            request.reasoning_ended = reasoning_ended
-        if reasoning_parser_kwargs is not None:
-            request.reasoning_parser_kwargs = reasoning_parser_kwargs
+            parent_params = params
+            assert isinstance(parent_params, SamplingParams)
 
-        self.input_processor.assign_request_id(request)
+            # Fan out child requests (for n>1).
+            parent_request = ParentRequest(request)
+            child_requests: list[EngineCoreRequest] = []
+            for idx in range(parent_params.n):
+                request_id, child_params = parent_request.get_child_info(idx)
+                child_request = request if idx == parent_params.n - 1 else copy(request)
+                child_request.request_id = request_id
+                child_request.sampling_params = child_params
+                child_request.pd_identity = {
+                    **(request.pd_identity or {}),
+                    "parent_request_id": parent_request.request_id,
+                    "choice_index": idx,
+                }
+                child_requests.append(child_request)
+                submission.add_link(
+                    "request_child",
+                    request_id=request_id,
+                    parent_request_id=parent_request.request_id,
+                    external_req_id=child_request.external_req_id,
+                    choice_index=idx,
+                )
 
-        # We start the output_handler on the first call to add_request() so
-        # we can call __init__ before the event loop, which enables us
-        # to handle startup failure gracefully in the OpenAI server.
-        self._run_output_handler()
+            self.check_admission(parent_params.n, parent_request.request_id)
+            accounted: dict[str, int] = {}
+            try:
+                for idx, child_request in enumerate(child_requests):
+                    self.output_processor.add_request(
+                        child_request, prompt_text, parent_request, idx, queue
+                    )
 
-        # Create a new output collector for the request.
-        queue = RequestOutputCollector(params.output_kind, request.request_id)
-
-        # Use cloned params that may have been updated in process_inputs()
-        params = request.params
-
-        if is_pooling or params.n == 1:
-            await self._add_request(request, prompt_text, None, 0, queue)
+                for child_request in child_requests:
+                    await self._send_engine_request(
+                        child_request, submission, accounted=accounted
+                    )
+                    if self.log_requests:
+                        logger.info("Added request %s.", child_request.request_id)
+            except BaseException as exc:
+                self._record_pd_failure(parent_request.request_id, exc)
+                await self.abort(parent_request.request_id, internal=True)
+                raise
             return queue
 
-        parent_params = params
-        assert isinstance(parent_params, SamplingParams)
-
-        # Fan out child requests (for n>1).
-        parent_request = ParentRequest(request)
-        child_requests: list[EngineCoreRequest] = []
-        for idx in range(parent_params.n):
-            request_id, child_params = parent_request.get_child_info(idx)
-            child_request = request if idx == parent_params.n - 1 else copy(request)
-            child_request.request_id = request_id
-            child_request.sampling_params = child_params
-            child_requests.append(child_request)
-            diag.emit(
-                "request_child_link", request_id=request_id,
-                parent_request_id=parent_request.request_id,
-                external_req_id=child_request.external_req_id, choice_index=idx,
-            )
-
-        self.check_admission(parent_params.n, parent_request.request_id)
+    async def _send_engine_request(
+        self,
+        request: EngineCoreRequest,
+        owner: diag.Batch | None,
+        *,
+        accounted: dict[str, int] | None = None,
+    ) -> None:
+        """Close the explicit input's tokenizer-to-IPC range at await return."""
+        boundary = getattr(request, "pd_tokenization", None) or {}
+        valid_domain = all(
+            boundary.get(key) == value for key, value in diag.clock_domain().items()
+        )
+        start = boundary.get("end_ns") if valid_domain else None
+        true_boundary = start is not None and boundary.get("status") == "ok"
+        reason = boundary.get("reason")
+        if start is None:
+            start = time.monotonic_ns()
+            reason = "foreign_clock_domain" if boundary else "no_tokenizer_boundary"
+        scope = (
+            "tokenizer_end_to_ipc_await_return"
+            if true_boundary
+            else "alternative_boundary_to_ipc_await_return"
+        )
+        status, error_type = "ok", None
         try:
-            for idx, child_request in enumerate(child_requests):
-                self.output_processor.add_request(
-                    child_request, prompt_text, parent_request, idx, queue
-                )
-
-            for child_request in child_requests:
-                with diag.span(
-                    "engine_submit", request_id=child_request.request_id,
-                    external_req_id=child_request.external_req_id,
-                    parent_request_id=parent_request.request_id,
-                    source="engine_core_add_request_async",
-                ):
-                    await self.engine_core.add_request_async(child_request)
-                if self.log_requests:
-                    logger.info("Added request %s.", child_request.request_id)
-        except BaseException:
-            await self.abort(parent_request.request_id, internal=True)
+            await self.engine_core.add_request_async(request)
+        except BaseException as exc:
+            status = (
+                "cancelled"
+                if isinstance(exc, (asyncio.CancelledError, GeneratorExit))
+                else "error"
+            )
+            error_type = type(exc).__name__
             raise
-        return queue
+        finally:
+            end = time.monotonic_ns()
+            if owner is not None:
+                boundary_id = boundary.get("boundary_id", request.request_id)
+                # n>1 children share preparation. Retain each full range as
+                # evidence, but charge only the union to the submission total.
+                charged_start = max(start, (accounted or {}).get(boundary_id, start))
+                if accounted is not None:
+                    accounted[boundary_id] = end
+                owner.add_stage(
+                    "add_request",
+                    start_ns=charged_start,
+                    end_ns=end,
+                    status=status,
+                    error_type=error_type,
+                    source="AsyncLLM.engine_core.add_request_async",
+                    timing_scope=scope,
+                    aggregation="union_per_input_boundary",
+                    boundary_status=boundary.get("status", "missing"),
+                    reason=reason,
+                )
+                owner.add_link(
+                    "add_request_send",
+                    request_id=request.request_id,
+                    boundary_source=boundary.get("source", "send_entry"),
+                    boundary_id=boundary_id,
+                    start_ns=start,
+                    end_ns=end,
+                    duration_ns=end - start,
+                    accounted_start_ns=charged_start,
+                    accounted_duration_ns=end - charged_start,
+                    timing_scope=scope,
+                    status=status,
+                    error_type=error_type,
+                    boundary_status=boundary.get("status", "missing"),
+                    reason=reason,
+                    shared_preparation=accounted is not None,
+                )
 
     async def _add_request(
         self,
@@ -575,7 +722,18 @@ class AsyncLLM(EngineClient):
         parent_req: ParentRequest | None,
         index: int,
         queue: RequestOutputCollector,
+        *,
+        owner: diag.Batch | None,
     ):
+        if getattr(request, "pd_tokenization", None) is None:
+            request.pd_tokenization = {
+                **diag.clock_domain(),
+                "boundary_id": diag.new_id("request_ready"),
+                "end_ns": time.monotonic_ns(),
+                "status": "missing",
+                "reason": "no_tokenizer_boundary",
+                "source": "local_registration_entry",
+            }
         if parent_req is None and not self.output_processor.has_request(
             request.request_id
         ):
@@ -585,12 +743,11 @@ class AsyncLLM(EngineClient):
         self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
-        with diag.span(
-            "engine_submit", request_id=request.request_id,
-            external_req_id=request.external_req_id,
-            source="engine_core_add_request_async",
-        ):
-            await self.engine_core.add_request_async(request)
+        try:
+            await self._send_engine_request(request, owner)
+        except BaseException as exc:
+            self._record_pd_failure(request.request_id, exc)
+            raise
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
@@ -641,50 +798,66 @@ class AsyncLLM(EngineClient):
         queue = RequestOutputCollector(sampling_params.output_kind, internal_req_id)
 
         async def handle_inputs():
-            cancelled = False
-            errored = False
-            any_added = False
-            try:
-                async for input_chunk in input_stream:
-                    sp = input_chunk.sampling_params
-                    if sp:
-                        self._validate_streaming_input_sampling_params(sp)
-                    else:
-                        sp = sampling_params
-                    # TODO(nick): Avoid re-validating reused sampling parameters
-                    req = self.input_processor.process_inputs(
-                        request_id=internal_req_id,
-                        prompt=input_chunk.prompt,
-                        params=sp,
-                        resumable=True,
-                        **inputs,  # type: ignore[arg-type]
-                    )
-                    req.external_req_id = request_id
-                    if req.prompt_embeds is not None:
-                        raise VLLMValidationError(
-                            "prompt_embeds not supported for streaming inputs"
+            with _api_submission(request_id, stream_input=True) as input_batch:
+                cancelled = False
+                errored = False
+                any_added = False
+                try:
+                    async for input_chunk in input_stream:
+                        sp = input_chunk.sampling_params
+                        if sp:
+                            self._validate_streaming_input_sampling_params(sp)
+                        else:
+                            sp = sampling_params
+                        # TODO(nick): Avoid re-validating reused sampling parameters
+                        req = self.input_processor.process_inputs(
+                            request_id=internal_req_id,
+                            prompt=input_chunk.prompt,
+                            params=sp,
+                            resumable=True,
+                            **inputs,  # type: ignore[arg-type]
                         )
-                    prompt_text, _, _ = extract_prompt_components(
-                        self.model_config, input_chunk.prompt
+                        req.external_req_id = request_id
+                        if req.prompt_embeds is not None:
+                            raise VLLMValidationError(
+                                "prompt_embeds not supported for streaming inputs"
+                            )
+                        prompt_text, _, _ = extract_prompt_components(
+                            self.model_config, input_chunk.prompt
+                        )
+                        await self._add_request(
+                            req, prompt_text, None, 0, queue, owner=input_batch
+                        )
+                        any_added = True
+                except (asyncio.CancelledError, GeneratorExit) as error:
+                    cancelled = True
+                    input_batch.update(
+                        input_status="cancelled",
+                        input_error_type=type(error).__name__,
                     )
-                    await self._add_request(req, prompt_text, None, 0, queue)
-                    any_added = True
-            except (asyncio.CancelledError, GeneratorExit):
-                cancelled = True
-            except Exception as error:
-                # Wrap in InputStreamError so generate() can propagate it
-                # without wrapping in EngineGenerateError.
-                queue.put(InputStreamError(error))
-                errored = True
-            finally:
-                queue._input_stream_task = None
-                if not cancelled:
-                    if any_added:
-                        # Send empty final request to indicate that inputs have
-                        # finished. Don't send if cancelled (session was aborted).
-                        await self._add_request(final_req, None, None, 0, queue)
-                    elif not errored:
-                        queue.put(STREAM_FINISHED)
+                except Exception as error:
+                    # Wrap in InputStreamError so generate() can propagate it
+                    # without wrapping in EngineGenerateError.
+                    queue.put(InputStreamError(error))
+                    errored = True
+                    input_batch.update(
+                        input_status="error",
+                        input_error_type=type(error).__name__,
+                    )
+                finally:
+                    queue._input_stream_task = None
+                    if not cancelled:
+                        if any_added:
+                            # Send empty final request to indicate that inputs have
+                            # finished. Don't send if cancelled (session was aborted).
+                            # The final signal has no tokenizer; its earlier
+                            # validation time must not charge stream-input waits.
+                            final_req.pd_tokenization = None
+                            await self._add_request(
+                                final_req, None, None, 0, queue, owner=input_batch
+                            )
+                        elif not errored:
+                            queue.put(STREAM_FINISHED)
 
         # Ensure output handler is running.
         self._run_output_handler()
@@ -794,8 +967,9 @@ class AsyncLLM(EngineClient):
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
         # we abort the request if we end up here.
-        except (asyncio.CancelledError, GeneratorExit):
+        except (asyncio.CancelledError, GeneratorExit) as exc:
             if q is not None:
+                self._record_pd_failure(q.request_id, exc)
                 await self.abort(q.request_id, internal=True)
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
@@ -816,6 +990,7 @@ class AsyncLLM(EngineClient):
         # Error from input stream generator - propagate directly.
         except InputStreamError as e:
             if q is not None:
+                self._record_pd_failure(q.request_id, e.cause)
                 await self.abort(q.request_id, internal=True)
             if self.log_requests:
                 logger.info("Request %s failed (input error): %s.", request_id, e)
@@ -824,6 +999,7 @@ class AsyncLLM(EngineClient):
         # Unexpected error in the generate() task (possibly recoverable).
         except Exception as e:
             if q is not None:
+                self._record_pd_failure(q.request_id, e)
                 await self.abort(q.request_id, internal=True)
             if self.log_requests:
                 try:
@@ -865,41 +1041,10 @@ class AsyncLLM(EngineClient):
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
                     outputs = await engine_core.get_output_async()
-                    received_ns = time.monotonic_ns()
                     num_outputs = len(outputs.outputs)
                     iteration_stats = (
                         IterationStats() if (log_stats and num_outputs) else None
                     )
-
-                    # These boundaries are shared by the whole output batch,
-                    # not the request whose context created this background task.
-                    batch_fields = {
-                        "output_batch_id": getattr(outputs, "output_batch_id", None),
-                        "request_ids": list(
-                            dict.fromkeys(
-                                [out.request_id for out in outputs.outputs]
-                                + sorted(outputs.finished_requests or ())
-                            )
-                        ),
-                        "execution_id": getattr(outputs, "execution_id", None),
-                        "batch_shared": True,
-                        "request_id": None,
-                        "observation_id": None,
-                        "external_req_id": None,
-                        "parent_request_id": None,
-                        "api_request_id": None,
-                        "prompt_index": None,
-                    }
-                    diag.emit(
-                        "api_output_received", received_ns=received_ns, **batch_fields
-                    )
-
-                    if iteration_stats is not None:
-                        diag.emit(
-                            "api_output_endpoint",
-                            iteration_timestamp=iteration_stats.iteration_timestamp,
-                            **batch_fields,
-                        )
 
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
@@ -954,7 +1099,27 @@ class AsyncLLM(EngineClient):
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
 
-        self.output_handler = asyncio.create_task(output_handler())
+        # The first caller does not own this long-lived shared task.
+        with diag.collect(None), diag.scope(**dict.fromkeys(diag.current())):
+            self.output_handler = asyncio.create_task(output_handler())
+
+    def _record_pd_failure(self, request_id: str, error: BaseException) -> None:
+        """Close existing request owners before the original abort removes them."""
+        status = (
+            "cancelled"
+            if isinstance(error, (asyncio.CancelledError, GeneratorExit))
+            else "error"
+        )
+        parent = self.output_processor.parent_requests.get(request_id)
+        request_ids = tuple(parent.child_requests) if parent else (request_id,)
+        for internal_id in request_ids:
+            state = self.output_processor.request_states.get(internal_id)
+            if state is not None:
+                self.output_processor._emit_request_terminal(
+                    state,
+                    status,
+                    error_type=type(error).__name__,
+                )
 
     async def abort(
         self, request_id: str | Iterable[str], internal: bool = False
@@ -1090,8 +1255,9 @@ class AsyncLLM(EngineClient):
 
         # If the request is disconnected by the client, generate()
         # is cancelled. So, we abort the request if we end up here.
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             if q is not None:
+                self._record_pd_failure(q.request_id, exc)
                 await self.abort(q.request_id, internal=True)
             if self.log_requests:
                 logger.info("Request %s aborted.", request_id)
@@ -1112,6 +1278,7 @@ class AsyncLLM(EngineClient):
         # Unexpected error in the generate() task (possibly recoverable).
         except Exception as e:
             if q is not None:
+                self._record_pd_failure(q.request_id, e)
                 await self.abort(q.request_id, internal=True)
             if self.log_requests:
                 logger.info("Request %s failed.", request_id)

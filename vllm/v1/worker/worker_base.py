@@ -56,21 +56,24 @@ def pd_execution_context(owner: Any, scheduler_output: Any) -> dict[str, Any]:
 
 def pd_execution(method):
     """Retain explicit execution identity across the execute/sample split."""
+
     @wraps(method)
     def wrapped(self, scheduler_output, *args, **kwargs):
         dummy_run = kwargs.get("dummy_run", args[1] if len(args) > 1 else False)
         if dummy_run:
             with diag.scope(dummy_run=True):
                 return method(self, scheduler_output, *args, **kwargs)
-        # Ascend overrides call the shared implementation; observe the outer
-        # runner once while retaining the actual inner business spans.
+        # An Ascend override can enter the shared method on the same call.
         if getattr(self, "_pd_executing", False):
             return method(self, scheduler_output, *args, **kwargs)
         context = pd_execution_context(self, scheduler_output)
         self._pd_execution_context = context
         self._pd_executing = True
         try:
-            with diag.scope(**context), diag.span("runner.execute"):
+            with (
+                diag.scope(**context),
+                diag.batch("worker_summary", phase="execute", **context),
+            ):
                 return method(self, scheduler_output, *args, **kwargs)
         except BaseException:
             self._pd_execution_context = None
@@ -83,6 +86,7 @@ def pd_execution(method):
 
 def pd_sample(method):
     """Restore the originating execute identity, including deferred MTP work."""
+
     @wraps(method)
     def wrapped(self, *args, **kwargs):
         if getattr(self, "_pd_sampling", False):
@@ -90,7 +94,10 @@ def pd_sample(method):
         context = getattr(self, "_pd_execution_context", None)
         self._pd_sampling = True
         try:
-            with diag.scope(**(context or {})), diag.span("runner.sample_tokens"):
+            with (
+                diag.scope(**(context or {})),
+                diag.batch("worker_summary", phase="sample", **(context or {})),
+            ):
                 return method(self, *args, **kwargs)
         finally:
             self._pd_sampling = False
@@ -431,7 +438,7 @@ class WorkerWrapperBase:
         context = pd_execution_context(self.worker, scheduler_output)
         self._pd_worker_context = context
         try:
-            with diag.scope(**context), diag.span("worker.execute"):
+            with diag.scope(**context):
                 self._apply_mm_cache(scheduler_output)
                 return self.worker.execute_model(scheduler_output)
         except BaseException:
@@ -443,7 +450,7 @@ class WorkerWrapperBase:
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         context = getattr(self, "_pd_worker_context", None)
         try:
-            with diag.scope(**(context or {})), diag.span("worker.sample_tokens"):
+            with diag.scope(**(context or {})):
                 return self.worker.sample_tokens(grammar_output)
         finally:
             self._pd_worker_context = None
